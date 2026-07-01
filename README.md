@@ -8,10 +8,6 @@ How to install:
 
 2. Run StreamScribe. It should automatically detect the models in your Documents folder. If you are subject to Netskope, the initial download from Huggingface will fail, and StreamScribe will download the models from my R2 mirror instead. 
 
-2a. In the unlikely event that my R2 mirror fails, you can install the models manually. To do this, download [huggingface.zip]([url](https://drive.google.com/file/d/1FEYUV3K7HahZ4SMAfoJsC2MZaAeUC5d3/view?usp=drive_link)) and put it in your Documents folder. Unzip the file. You only have to do it once. You can delete the zip file once the huggingface folder has extracted into /Documents.
-
-3. To ensure full functionality, please check the “Skip TLS certificate check” box in the bottom left of StreamScribe. This will avoid SSL errors commonly caused by Netskope.
-
 4. Set your “Cookies” selector to whichever browser you use most. This allows StreamScribe to borrow your YouTube cookies to avoid automatic bot detection. For most users, this will be Chrome. On your first transcription run, StreamScribe will prompt for keychain access so it can borrow the cookies - please enter your password and choose “Always allow”. 
 
 6. You are all set and ready to start transcribing! If you encounter issues with the application, please contact Jamie Forte (jforte@omc.com) for help troubleshooting.
@@ -32,5 +28,3 @@ Other helpful notes/tips:
 - If you encounter performance issues, you can increase your MLX buffer cache limit to 1024 MB or greater in Settings.
 - If StreamScribe randomly stops working one day, it may be because YouTube changed how their backend works. To fix this, click the “Update yt-dlp Now” button in the bottom left.
 You can also export transcribed videos along with their transcripts using the button in the bottom left of the transcript export window. This can be useful for downloading YouTube and other videos. 
-
-_Disclaimer: This app was 100% vibe-coded in Claude, primarily using Opus 4.7. I am not a software development professional, and none of my code should be considered representative of coding best-practices._
