@@ -10,7 +10,7 @@ How to install:
 
 4. Set your “Cookies” selector to whichever browser you use most. This allows StreamScribe to borrow your YouTube cookies to avoid automatic bot detection. For most users, this will be Chrome. On your first transcription run, StreamScribe will prompt for keychain access so it can borrow the cookies - please enter your password and choose “Always allow”. 
 
-6. You are all set and ready to start transcribing! If you encounter issues with the application, please contact Jamie Forte (jforte@omc.com) for help troubleshooting.
+6. You are all set and ready to start transcribing! If the probe fails to identify content at first, wait a little bit and retry - it should start working after a short duration following initial start up.
 
 How to use:
 
