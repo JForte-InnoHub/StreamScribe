@@ -37,8 +37,6 @@ final class UpdateChecker: ObservableObject {
 
     private static let repoOwner = "JForte-InnoHub"
     private static let repoName = "StreamScribe"
-    private static let checkIntervalHours: Double = 24
-
     private static let lastCheckKey = "updateChecker.lastCheckDate"
     private static let skippedVersionKey = "updateChecker.skippedVersion"
 
@@ -58,6 +56,17 @@ final class UpdateChecker: ObservableObject {
     /// Check button if non-nil. Cleared at the start of each check.
     @Published var lastCheckError: String?
 
+    /// Result message for MANUAL checks (menu item / Settings button)
+    /// when there's nothing to update or the check failed. Automatic
+    /// launch checks stay silent in these cases — nobody wants an
+    /// "up to date!" alert on every launch — but a user who clicked
+    /// "Check for Updates" deserves a definitive answer, and silence
+    /// reads as "the feature is broken." The app shows this in a
+    /// simple alert; dismissing sets it back to nil. When an update
+    /// IS found, this stays nil and the regular update alert takes
+    /// over instead.
+    @Published var manualCheckResult: String?
+
     // MARK: - Public API
 
     /// Currently-running version, read from the bundle Info.plist.
@@ -67,16 +76,22 @@ final class UpdateChecker: ObservableObject {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
     }
 
-    /// Check on app launch. No-ops if the last check was less than
-    /// `checkIntervalHours` ago — keeps the GitHub API call out of the
-    /// hot launch path on subsequent same-day launches.
-    func checkOnLaunchIfDue() async {
-        if let last = UserDefaults.standard.object(forKey: Self.lastCheckKey) as? Date {
-            let hoursSinceLastCheck = Date().timeIntervalSince(last) / 3600.0
-            if hoursSinceLastCheck < Self.checkIntervalHours {
-                return
-            }
-        }
+    /// Check on app launch — every launch, no throttle. The check is a
+    /// single lightweight GET (~1KB JSON) that runs off the main
+    /// actor after launch, so there's no startup cost to the user.
+    /// The "skip this version" preference is still honored: a user
+    /// who explicitly skipped a release isn't re-alerted for that
+    /// same release every launch — but the moment a NEWER release
+    /// ships, the alert fires again. Users who chose "Later" get
+    /// re-notified on the next launch, which is the point of "Later."
+    ///
+    /// (This used to be throttled to one check per 24h; removed so
+    /// users hear about new versions on their next launch rather
+    /// than up to a day later. GitHub's unauthenticated rate limit
+    /// is 60 requests/hour per source IP — one call per app launch
+    /// stays comfortably inside that even behind a shared corporate
+    /// NAT, unless dozens of users relaunch within the same hour.)
+    func checkOnLaunch() async {
         await check(force: false)
     }
 
@@ -126,6 +141,9 @@ final class UpdateChecker: ObservableObject {
             print("[UpdateChecker] check failed: \(error.localizedDescription)")
             lastCheckError = error.localizedDescription
             updateAvailable = nil
+            if force {
+                manualCheckResult = "Update check failed: \(error.localizedDescription)"
+            }
             return
         }
 
@@ -144,6 +162,9 @@ final class UpdateChecker: ObservableObject {
         } else {
             print("[UpdateChecker] up-to-date (running \(currentVersion), latest \(release.version))")
             updateAvailable = nil
+            if force {
+                manualCheckResult = "You're up to date. StreamScribe \(currentVersion) is the latest version."
+            }
         }
     }
 

@@ -334,14 +334,14 @@ struct StreamScribeApp: App {
                 .environmentObject(notificationService)
                 .frame(minWidth: 900, minHeight: 600)
                 .task {
-                    // Fire-and-forget launch-time update check. The
-                    // 24h throttle inside UpdateChecker means subsequent
-                    // launches in the same day skip the actual network
-                    // round-trip, so this is genuinely cheap most of the
-                    // time. The first launch of each day takes ~200-500
-                    // ms (GitHub API round-trip) — happens during ContentView
-                    // appearance, doesn't block the window from showing.
-                    await updateChecker.checkOnLaunchIfDue()
+                    // Fire-and-forget launch-time update check — runs
+                    // on EVERY launch (no throttle) so users hear
+                    // about new versions at the earliest opportunity.
+                    // The ~200-500 ms GitHub round-trip happens during
+                    // ContentView appearance and doesn't block the
+                    // window from showing; the alert appears if a
+                    // newer version exists.
+                    await updateChecker.checkOnLaunch()
                 }
                 .task {
                     // Backfill the first-time-setup flag for existing
@@ -404,6 +404,28 @@ struct StreamScribeApp: App {
                     }
                 } message: { release in
                     Text("StreamScribe \(release.version) is available. You're running \(updateChecker.currentVersion).\n\n\(release.body)")
+                }
+                // Result alert for MANUAL update checks (app-menu item
+                // or Settings button) when there's no update or the
+                // check failed. Without this, clicking "Check for
+                // Updates" while already current does nothing visible
+                // — which reads as broken. Automatic launch checks
+                // never populate manualCheckResult, so this alert
+                // can't fire on startup.
+                .alert(
+                    "Software Update",
+                    isPresented: Binding(
+                        get: { updateChecker.manualCheckResult != nil },
+                        set: { isPresented in
+                            if !isPresented { updateChecker.manualCheckResult = nil }
+                        }
+                    )
+                ) {
+                    Button("OK", role: .cancel) {
+                        updateChecker.manualCheckResult = nil
+                    }
+                } message: {
+                    Text(updateChecker.manualCheckResult ?? "")
                 }
                 // Clear-cache confirmation alert. Routed via @State binding
                 // toggled from the Debug menu's "Clear Model Cache…" item.
@@ -481,6 +503,24 @@ struct StreamScribeApp: App {
                 }
             }
             CommandGroup(after: .appInfo) {
+                Divider()
+                // App update check. Standard macOS placement — right
+                // under "About <App>" in the app menu, where Sparkle-
+                // based apps put "Check for Updates…". Uses the same
+                // forced check as the Settings button (ignores the
+                // skip-version preference — a user explicitly asking
+                // wants a definitive answer). If an update exists,
+                // the standard update alert fires via the existing
+                // `updateAvailable` binding; if not, the check is
+                // silent aside from the console log. The item shows
+                // a checking state and disables while in flight so
+                // rapid re-clicks don't stack requests.
+                Button(updateChecker.isChecking
+                       ? "Checking for Updates…"
+                       : "Check for StreamScribe Updates…") {
+                    Task { await updateChecker.checkNow() }
+                }
+                .disabled(updateChecker.isChecking)
                 Divider()
                 Button(updateMenuTitle) {
                     Task { await toolManager.updateYTDlpNow() }
@@ -691,8 +731,18 @@ struct StreamScribeApp: App {
             // the same engine instance the rest of the app uses so
             // the button operates on the live session's transcript,
             // not a phantom empty instance.
+            //
+            // **Belt-and-suspenders injection.** Both an
+            // environmentObject AND a custom EnvironmentKey inject
+            // the same engine. SettingsView reads via the custom key
+            // (which gracefully returns nil if injection ever fails);
+            // the environmentObject remains for any legacy code path
+            // that might still expect it. If either mechanism breaks
+            // in a future macOS SwiftUI regression, the other keeps
+            // the Settings window operational.
             SettingsView()
                 .environmentObject(transcriptionEngine)
+                .environment(\.engineInstance, transcriptionEngine)
         }
     }
 
