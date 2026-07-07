@@ -199,6 +199,7 @@ final class VoiceprintService: ObservableObject {
         https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Executive.json
         https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Governors.json
         https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Media.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Other.json
         """
 
     /// Parsed list of URLs from `r2URLsRaw`. Splits on newlines,
