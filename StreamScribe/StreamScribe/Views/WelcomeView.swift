@@ -18,6 +18,21 @@ import SwiftUI
 /// dimensions if content grows.
 struct WelcomeView: View {
     @EnvironmentObject private var toolManager: ToolManager
+
+    /// `NotificationService` is injected so the Notifications card's
+    /// toggle can call `requestAuthorization()` on Continue. Same
+    /// singleton instance the rest of the app uses; sees status
+    /// changes immediately via the @Published `isAuthorized` flag.
+    @EnvironmentObject private var notificationService: NotificationService
+
+    /// Whether to request system notification permission when the user
+    /// clicks Continue. Default ON because most users benefit from
+    /// keyword-hit alerts during long live transcriptions (otherwise
+    /// they have to keep the app window visible to know when a
+    /// flagged term appeared). Users on metered or quiet-mode
+    /// preferences can flip it off here. Idempotent — clicking with
+    /// authorization already granted does nothing.
+    @State private var enableNotificationsOnContinue: Bool = true
     @Environment(\.dismiss) private var dismiss
 
     @AppStorage("hasCompletedFirstTimeSetup")
@@ -32,6 +47,22 @@ struct WelcomeView: View {
     /// also offers a "skip" option for users who already have other
     /// auth flows worked out and don't want to grant cookie access.
     @State private var selectedBrowser: CookieBrowser = .chrome
+
+    /// Whether to kick off downloads of the recommended models when the
+    /// user clicks Continue. Default ON because:
+    ///   - These are the default engines (Parakeet TDT-CTC 1.1B for
+    ///     transcription, FluidAudio for diarization); without them,
+    ///     the first session blocks on a multi-minute download
+    ///   - The download runs in the background — sheet dismisses
+    ///     immediately, user sees progress in the sidebar
+    ///   - Users on metered or corporate networks who don't want this
+    ///     can flip it off here, or skip the welcome flow entirely
+    ///
+    /// Skipped automatically if the models are already on disk (e.g.
+    /// the user reset the welcome sheet via the Debug menu after
+    /// downloading earlier). Same idempotency guarantee that
+    /// `downloadXModel` calls have themselves.
+    @State private var downloadModelsOnContinue: Bool = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -107,6 +138,87 @@ struct WelcomeView: View {
             .cornerRadius(10)
             .padding(.horizontal, 24)
             .padding(.top, 20)
+            .padding(.bottom, 8)
+
+            // Models setup card. Mirrors the cookies card visually
+            // (rounded gray panel, header label, description, control)
+            // so the welcome flow feels like a single coherent
+            // checklist. Differs in mechanics: clicking Continue with
+            // this toggle on fires background downloads of the default
+            // engines — no system prompt, no per-model decision, no
+            // blocking wait. Progress is visible in the main sidebar
+            // after the sheet dismisses.
+            VStack(alignment: .leading, spacing: 14) {
+                Label("Models", systemImage: "cube.box.fill")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+
+                Text("StreamScribe needs a transcription model and a speaker diarization model. The recommended defaults are downloaded once and reused across sessions:")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Bulleted list of what gets fetched. Each row has the
+                // model name + the size + a one-line "what it does"
+                // so users on metered connections can make an
+                // informed decision about whether to defer the download.
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .top, spacing: 6) {
+                        Text("•").foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Parakeet TDT-CTC 1.1B").font(.callout).fontWeight(.medium)
+                            Text("Speech-to-text with native punctuation. ~2 GB.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    HStack(alignment: .top, spacing: 6) {
+                        Text("•").foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("FluidAudio").font(.callout).fontWeight(.medium)
+                            Text("Identifies different speakers. ~250 MB.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.leading, 4)
+
+                Toggle("Download now (recommended)", isOn: $downloadModelsOnContinue)
+                    .toggleStyle(.checkbox)
+                    .font(.callout)
+            }
+            .padding(20)
+            .background(Color.gray.opacity(0.06))
+            .cornerRadius(10)
+            .padding(.horizontal, 24)
+            .padding(.bottom, 16)
+
+            // Notifications card. Mirrors the cookies/models cards
+            // visually so the welcome flow reads as a unified
+            // checklist. Permission is opt-in here rather than at
+            // first-keyword-hit because asking later (mid-session,
+            // when the user might be busy following along) hits a
+            // worse moment — they'd see the system prompt, lose
+            // focus on the transcript, and possibly miss the very
+            // event the notification was about. Asking up-front
+            // sidesteps that.
+            VStack(alignment: .leading, spacing: 14) {
+                Label("Notifications", systemImage: "bell.badge.fill")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+
+                Text("StreamScribe can send a system notification when a flagged keyword appears in the transcript — useful for long live sessions where you don't want to keep the window in focus the whole time.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle("Enable notifications", isOn: $enableNotificationsOnContinue)
+                    .toggleStyle(.checkbox)
+                    .font(.callout)
+            }
+            .padding(20)
+            .background(Color.gray.opacity(0.06))
+            .cornerRadius(10)
+            .padding(.horizontal, 24)
             .padding(.bottom, 16)
 
             // "Change later" note — sets expectations that this isn't
@@ -127,14 +239,22 @@ struct WelcomeView: View {
             // re-show next launch.
             HStack {
                 Button("Skip for Now") {
-                    completeSetup(applyingBrowser: false)
+                    completeSetup(
+                        applyingBrowser: false,
+                        applyingDownloads: false,
+                        applyingNotifications: false
+                    )
                 }
                 .controlSize(.large)
 
                 Spacer()
 
                 Button("Continue") {
-                    completeSetup(applyingBrowser: true)
+                    completeSetup(
+                        applyingBrowser: true,
+                        applyingDownloads: downloadModelsOnContinue,
+                        applyingNotifications: enableNotificationsOnContinue
+                    )
                 }
                 .controlSize(.large)
                 .buttonStyle(.borderedProminent)
@@ -142,10 +262,13 @@ struct WelcomeView: View {
             }
             .padding(20)
         }
-        .frame(width: 480, height: 580)
+        .frame(width: 480, height: 960)
     }
 
-    /// Mark setup as complete and optionally apply the picked browser.
+    /// Mark setup as complete, optionally apply the picked browser,
+    /// optionally kick off model downloads, and optionally request
+    /// system notification permission.
+    ///
     /// Setting `cookieBrowser` triggers the existing `didSet` in
     /// ToolManager which primes Keychain/TCC/Firefox-cookie access
     /// asynchronously — that's where the user sees the "Always Allow"
@@ -153,9 +276,61 @@ struct WelcomeView: View {
     /// waiting for the prime to complete; the prompt appears over the
     /// main app window which is the right UX (the prompt is a system
     /// modal, not part of our flow).
-    private func completeSetup(applyingBrowser: Bool) {
+    ///
+    /// Model downloads, when `applyingDownloads` is true, run in
+    /// parallel `Task`s on the singleton ModelDownloadManager. The
+    /// downloads are independent — Parakeet doesn't depend on
+    /// FluidAudio or vice versa — so concurrent fetches halve the
+    /// wall-clock wait. Progress appears in the sidebar as soon as
+    /// the user dismisses this sheet; no blocking, no completion
+    /// callback needed at this layer.
+    ///
+    /// Notification authorization, when `applyingNotifications` is
+    /// true, fires a Task that calls `NotificationService.shared.
+    /// requestAuthorization()` — which surfaces the macOS system
+    /// permission prompt. The prompt appears over the main app
+    /// window after the sheet dismisses; identical UX to how Chrome
+    /// cookie access works. The function is idempotent: if the user
+    /// already authorized previously (the welcome flow can re-show
+    /// via the Debug menu), the call no-ops without re-prompting.
+    private func completeSetup(applyingBrowser: Bool, applyingDownloads: Bool, applyingNotifications: Bool) {
         if applyingBrowser && selectedBrowser != .none {
             toolManager.cookieBrowser = selectedBrowser
+        }
+        if applyingDownloads {
+            // Spawn one Task per model. ModelDownloadManager guards
+            // against double-downloads internally, so even if the user
+            // somehow re-triggered the welcome flow with downloads
+            // already in flight, the second call would no-op cleanly.
+            //
+            // Parakeet model identifier comes from
+            // TranscriptionEngine.defaultParakeetModel — sourcing from
+            // there ensures this welcome card always points at whatever
+            // we've currently shipped as the default (today
+            // TDT-CTC 1.1B), without WelcomeView holding its own
+            // hardcoded copy of the repo name that could drift.
+            Task {
+                await ModelDownloadManager.shared.downloadParakeetModel(
+                    repo: TranscriptionEngine.defaultParakeetModel
+                )
+            }
+            Task {
+                await ModelDownloadManager.shared.downloadFluidAudioModel()
+            }
+        }
+        if applyingNotifications {
+            // Fire-and-forget the auth request. The system prompt
+            // appears over the main app window after the sheet
+            // dismisses. We refresh status first in case auth was
+            // already granted in a previous run (welcome flow can
+            // re-show via Debug menu); the refresh + skip pattern
+            // mirrors what SidebarView does on its own auth toggle.
+            Task {
+                await notificationService.refreshAuthorizationStatus()
+                if !notificationService.isAuthorized {
+                    await notificationService.requestAuthorization()
+                }
+            }
         }
         hasCompletedFirstTimeSetup = true
         dismiss()

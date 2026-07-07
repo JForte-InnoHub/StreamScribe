@@ -4,16 +4,18 @@ struct ExportSheet: View {
     @Binding var format: TranscriptFormat
     let onExport: () -> Void
     let onCancel: () -> Void
-    /// Triggered by the bottom-left "Export Media…" button. Parent resolves the
-    /// source (local file for imported transcriptions, cached mp4 for URL
-    /// transcriptions) and runs a save panel. Independent of the transcript
-    /// format selection above — media export is a separate flow that just
-    /// happens to share this window.
+
+    /// Fired when the user chooses "Export Media…" — saves the source
+    /// media file (mp4/m4a/etc.) alongside the transcript. The action
+    /// handler is provided by the parent (ContentView), which routes
+    /// to `TranscriptionEngine.playbackMediaURL` and drives NSSavePanel.
     let onExportMedia: () -> Void
-    /// Drives the enabled state of the media-export button. False when the
-    /// session has no playable media (URL transcription with video cache
-    /// disabled, or media cache was cleared mid-session). Disabling rather
-    /// than hiding keeps the bottom bar from reflowing.
+
+    /// Whether a media file is cached and available for export. Drives
+    /// the disabled state of the "Export Media…" button — if the
+    /// engine hasn't materialized a local media file yet (short live
+    /// sessions, remote-only sources), the button greys out with a
+    /// tooltip explaining why.
     let mediaAvailable: Bool
 
     var body: some View {
@@ -34,11 +36,16 @@ struct ExportSheet: View {
             }
 
             HStack {
+                // "Export Media…" is a separate action from format-
+                // based transcript export — it saves the source
+                // audio/video file. Placed left of Cancel so it's
+                // visible but not the primary action.
                 Button("Export Media…", action: onExportMedia)
                     .disabled(!mediaAvailable)
                     .help(mediaAvailable
-                          ? "Save a copy of the source video or audio for this transcription."
-                          : "No media is available to export. URL transcriptions require the video cache to be enabled in Settings.")
+                          ? "Save the source media file to disk."
+                          : "No media file cached for this session yet.")
+
                 Spacer()
                 Button("Cancel", role: .cancel, action: onCancel)
                     .keyboardShortcut(.cancelAction)

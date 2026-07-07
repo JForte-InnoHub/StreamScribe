@@ -175,40 +175,87 @@ actor AudioStreamExtractor {
         // every case explicitly — keeps the extractor decoupled from the StreamSource
         // case list, so adding a new yt-dlp-supported site (Apple Podcasts, SoundCloud,
         // future ones) is a one-line change in StreamSource.swift.
-        if source.requiresYTDlp {
-            if useFastDownload {
-                // Static-mode VOD path: download to a temp file with
-                // parallelism flags, then process the local file. The
-                // download phase is where the big speedup happens — see
-                // `downloadViaYTDlp` for the flag set.
-                print("[Extractor] Static-mode fast download via yt-dlp (parallel)…")
-                let downloaded = try await downloadViaYTDlp(url, source: source, ffmpegPath: ffmpeg)
-                self.tempDownloadedFile = downloaded
-                inputURL = downloaded.path
-                inputIsLocalFile = true
-                print("[Extractor] Download complete: \(downloaded.lastPathComponent)")
-            } else {
-                // Live-mode path: pipe yt-dlp's stdout directly into ffmpeg's
-                // stdin, with yt-dlp running with `-N 8` for concurrent
-                // fragment fetch. For genuine live streams this beats the
-                // per-connection CDN throttling on the catch-up window
-                // (segments already in the DVR window can be pulled in
-                // parallel; the live edge still arrives at 1× realtime by
-                // definition). For VOD-misclassified-as-Live (probe failed
-                // to determine duration), this gets the same speedup as the
-                // static-mode fast-download path without the up-front wait.
-                //
-                // Strict architectural improvement over the previous "resolve
-                // to direct URL, ffmpeg streams from it" path — yt-dlp's HLS
-                // handler is segment-aware and reorders fragments before
-                // emitting them on stdout, so we get parallel pulls without
-                // breaking the sequential-audio guarantee ffmpeg expects.
-                print("[Extractor] Live-mode pipe via yt-dlp (parallel fragments)…")
-                let pipe = try await streamViaYTDlpPipe(url, source: source, ffmpegPath: ffmpeg)
+        if source == .senateGov {
+            // Senate.gov path: resolve the page URL (or direct ISVP URL)
+            // to its underlying HLS m3u8 via our own extractor, then
+            // route through the .hls path. ~500 ms fast path vs ~6-9 s
+            // for the yt-dlp + URL-resolution fallback chain.
+            //
+            // On extractor failure (unknown committee, page structure
+            // change, etc.) fall back to yt-dlp's senategov extractor,
+            // which keeps pace with senate.gov's CDN changes better than
+            // our hardcoded mapping will.
+            do {
+                let resolved = try await SenateGovExtractor.resolve(url: url)
+                print("[Extractor] U.S. Senate: \(resolved.committee)/\(resolved.filename) → \(resolved.m3u8URL.absoluteString)")
+                inputURL = resolved.m3u8URL.absoluteString
+                inputIsLocalFile = false
+            } catch {
+                // Fall back to yt-dlp's senategov extractor. Log the
+                // direct-extractor failure so we can update the committee
+                // mapping if a real-world hearing surfaces a gap.
+                print("[Extractor] U.S. Senate direct extractor failed (\(error.localizedDescription)) — falling back to yt-dlp.")
+                print("[Extractor] Streaming pipe via yt-dlp (parallel fragments)…")
+                let pipe = try await streamViaYTDlpPipe(url, source: .unknown, ffmpegPath: ffmpeg)
                 ytDlpStdinPipe = pipe
                 inputURL = "-"
                 inputIsLocalFile = false
             }
+        } else if source == .criticalMention {
+            // Critical Mention path: the clip page is a hash-routed SPA
+            // that fetches the signed HLS stream URL via its own JS
+            // bundle. Our browser extractor watches for that URL and
+            // returns it. No yt-dlp involvement — there's no
+            // Critical Mention extractor in yt-dlp.
+            //
+            // Extractor failure (private clip, timeout, page structure
+            // change) has no yt-dlp fallback for this source. Surface
+            // the error to the user rather than trying an alternate
+            // path that would also fail.
+            do {
+                let resolved = try await CriticalMentionExtractor.resolve(url: url)
+                print("[Extractor] Critical Mention → \(resolved.m3u8URL.absoluteString)")
+                inputURL = resolved.m3u8URL.absoluteString
+                inputIsLocalFile = false
+            } catch {
+                print("[Extractor] Critical Mention extraction failed: \(error.localizedDescription)")
+                throw ExtractorError.ytDlpResolutionFailed("Critical Mention", error.localizedDescription)
+            }
+        } else if source.requiresYTDlp {
+            // Always use the streaming pipe path for yt-dlp sources,
+            // regardless of probed session mode. The old branch (when
+            // `useFastDownload` was true) downloaded the ENTIRE file to
+            // a temp location before ffmpeg read it — fine for short
+            // YouTube clips but catastrophic for long content like
+            // Senate hearings (50–100 min @ ~5 MB/min = 250–500 MB
+            // download before any transcription begins, so the user
+            // sees nothing happen for 5–15 minutes). The pipe path
+            // streams as fragments arrive, so the first transcribed
+            // segment appears within seconds.
+            //
+            // The miniplayer cache is preserved because it's built by
+            // ffmpeg's secondary output (see `startFFmpeg`'s cache
+            // output block) — that runs regardless of whether ffmpeg's
+            // input is a local file or stdin from the pipe. The
+            // miniplayer cache file grows in real time as audio flows
+            // through ffmpeg, so playback during transcription works
+            // the same way as the direct-HLS path that the user
+            // already sees "fires right away."
+            //
+            // `useFastDownload` parameter retained for API
+            // compatibility but no longer used by this code path —
+            // could be removed in a follow-up alongside
+            // `downloadViaYTDlp` if nothing else depends on them.
+            //
+            // Direct HLS sources (.hls, .directAudio) and local files
+            // still route through their respective branches below;
+            // they don't need yt-dlp at all and were never affected
+            // by the download-vs-stream choice.
+            print("[Extractor] Streaming pipe via yt-dlp (parallel fragments)…")
+            let pipe = try await streamViaYTDlpPipe(url, source: source, ffmpegPath: ffmpeg)
+            ytDlpStdinPipe = pipe
+            inputURL = "-"
+            inputIsLocalFile = false
         } else if source == .localFile {
             inputURL = url.path
             inputIsLocalFile = true
@@ -632,9 +679,32 @@ actor AudioStreamExtractor {
             }
 
             var args: [String] = []
-            if let browserArg = tools.cookieBrowser.ytDlpArgument {
-                args.append(contentsOf: ["--cookies-from-browser", browserArg])
-            }
+            // Warm-up speedup flags. Two effects:
+            //
+            //   - `--ignore-config`: skip the user's yt-dlp config
+            //     files (`~/.config/yt-dlp/config`, `~/.yt-dlp.conf`,
+            //     etc). Config parsing adds 100-500ms per invocation,
+            //     and any user preference baked into their config can
+            //     conflict with our explicit args (e.g. format
+            //     selectors, output templates). Since StreamScribe
+            //     specifies everything it needs on the command line,
+            //     the user's config can only hurt our invocations.
+            //
+            //   - `--no-mark-watched`: skip the network round-trip
+            //     that updates the user's watch history on the source
+            //     platform (mainly YouTube). One less HTTP request
+            //     per invocation. No-op on platforms without watch
+            //     tracking.
+            //
+            // Applied to every yt-dlp invocation in StreamScribe.
+            args.append(contentsOf: ["--ignore-config", "--no-mark-watched"])
+
+            // Session-cached cookies: browser extraction on first
+            // invocation, cheap jar reads after — see
+            // ToolManager.sessionCookieArguments.
+            args.append(contentsOf: ToolManager.shared.sessionCookieArguments(
+                browserArg: tools.cookieBrowser.ytDlpArgument
+            ))
             // Optional: skip TLS certificate validation. The toggle in
             // the Tools sidebar surfaces this for users on corporate
             // networks that do TLS interception with a private root
@@ -1069,8 +1139,16 @@ actor AudioStreamExtractor {
         }
 
         var args: [String] = []
-        if useCookies, let browserArg = tools.cookieBrowser.ytDlpArgument {
-            args.append(contentsOf: ["--cookies-from-browser", browserArg])
+        // Warm-up speedups — see download-path comment for the
+        // full explanation. Applied identically to keep yt-dlp's
+        // startup behavior consistent across all StreamScribe
+        // invocations.
+        args.append(contentsOf: ["--ignore-config", "--no-mark-watched"])
+
+        if useCookies {
+            args.append(contentsOf: ToolManager.shared.sessionCookieArguments(
+                browserArg: tools.cookieBrowser.ytDlpArgument
+            ))
         }
         // Optional --no-check-certificate; see download-path comment
         // for the rationale. Same toggle drives all yt-dlp
@@ -1154,6 +1232,29 @@ actor AudioStreamExtractor {
 
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
+        // Defense-in-depth against the read-only-filesystem fragment
+        // write bug. `--paths temp:<dir>` above should redirect all
+        // fragment scratch I/O, but yt-dlp's path-category handling
+        // has edge cases — newer versions categorize some HLS writes
+        // differently, and a small subset of streams use code paths
+        // that bypass `--paths` and fall back to writing relative-
+        // path files in the process CWD.
+        //
+        // When a .app bundle is launched from Finder, its CWD is `/`
+        // — the SIP-protected read-only system volume. Any relative-
+        // path write yt-dlp attempts hits EROFS and the whole stream
+        // fails with `unable to open for writing: [Errno 30] Read-
+        // only file system: '--Frag76'` (where the `--` prefix comes
+        // from yt-dlp's `<basename>-Frag<N>` naming convention with
+        // `-o -` making the basename literal `-`).
+        //
+        // Setting `currentDirectoryURL` to the scratch dir ensures
+        // any relative-path write lands somewhere writable regardless
+        // of yt-dlp's `--paths` handling. Harmless when `--paths`
+        // works correctly (all writes use absolute paths anyway);
+        // saves the session when it doesn't.
+        process.currentDirectoryURL = URL(fileURLWithPath: fragmentScratchDir)
 
         // Accumulate stderr into a buffer so the retry logic can inspect
         // it for the known error pattern after the process exits. Also
@@ -1320,9 +1421,9 @@ actor AudioStreamExtractor {
             //                     YouTube extraction fails with "No video formats
             //                     found" or "n challenge solving failed" warnings.
             var args: [String] = []
-            if let browserArg = tools.cookieBrowser.ytDlpArgument {
-                args.append(contentsOf: ["--cookies-from-browser", browserArg])
-            }
+            args.append(contentsOf: ToolManager.shared.sessionCookieArguments(
+                browserArg: tools.cookieBrowser.ytDlpArgument
+            ))
             // Optional --no-check-certificate; see download-path comment
             // above for the rationale. Same toggle drives all yt-dlp
             // invocations.
@@ -1419,7 +1520,14 @@ actor AudioStreamExtractor {
     /// yt-dlp is mandatory (throws on failure after fallback-to-PATH).
     /// Deno is best-effort (nil on failure — Twitter/non-YouTube sources
     /// don't need it). Cookie browser is always available (enum read).
-    private static func resolveYTDlpTools() async throws -> (
+    /// Resolve everything yt-dlp needs to launch: binary path, optional
+    /// deno path (for YouTube n-param challenges), cookie browser
+    /// config, TLS-check override, and the child environment for SSL
+    /// cert overrides. Internal so adjacent services (like
+    /// `VideoDownloadService` for the standalone video-download button)
+    /// can reuse the same resolution rather than duplicating cookie/
+    /// TLS/env logic.
+    static func resolveYTDlpTools() async throws -> (
         ytDlpPath: String,
         denoPath: String?,
         cookieBrowser: CookieBrowser,
@@ -1456,7 +1564,9 @@ actor AudioStreamExtractor {
     // MARK: - Tool discovery
 
     /// Path to the bundled ffmpeg binary. Throws if the bundle is missing it.
-    private static func requireFFmpegPath() throws -> String {
+    /// Internal so adjacent services (VideoDownloadService, etc.) can share
+    /// the same resolution logic instead of duplicating the PATH scan.
+    static func requireFFmpegPath() throws -> String {
         if let path = ToolManager.shared.ffmpegPath,
            FileManager.default.isExecutableFile(atPath: path) {
             return path

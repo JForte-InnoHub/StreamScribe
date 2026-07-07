@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 import UniformTypeIdentifiers
 
 /// User-managed find/replace dictionary applied to transcribed text.

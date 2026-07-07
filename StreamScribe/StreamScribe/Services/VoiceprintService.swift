@@ -42,11 +42,107 @@ final class VoiceprintService: ObservableObject {
     /// first successful load completes.
     @Published private(set) var templates: [Voiceprint] = []
 
+    /// Templates grouped by source category, preserving the order of
+    /// the source URLs in `r2URLs`. Populated by `refreshFromRemote`;
+    /// empty when we've only loaded from cache (categories aren't
+    /// persisted in the cache — see the comment in `saveToLocalCache`
+    /// for why).
+    ///
+    /// The UI renders this as separate collapsible sections when
+    /// non-empty. When empty (cache-only mode, or first-load-still-
+    /// in-flight), the UI falls back to a flat list of `templates`
+    /// so users always see what's loaded regardless of whether a
+    /// live refresh has completed.
+    @Published private(set) var categorizedTemplates: [CategoryGroup] = []
+
     /// Per-session map of FluidAudio cluster ID → identified speaker.
-    /// Populated by `identifyNewSpeakers` (automatic) and
-    /// `setManualIdentification` (user-driven). Cleared on session
-    /// start via `resetForNewSession()`.
+    /// Populated by `setManualIdentification` (user-driven cluster-level
+    /// reassignment via the "Identify Speaker" context menu). Cleared
+    /// on session start via `resetForNewSession()`.
+    ///
+    /// **Cluster-level is now manual-only.** Automatic identification
+    /// has moved to per-segment matching (see `segmentIdentifications`)
+    /// because the cluster-level approach couldn't disambiguate
+    /// diarizer-merged speakers — when LSEEND lumped Senator A and
+    /// Senator B into one cluster, the cluster's running-mean embedding
+    /// landed somewhere between them and matched neither well. Per-
+    /// segment matching catches the individual identities at segment
+    /// granularity.
     @Published private(set) var identifications: [String: Identification] = [:]
+
+    /// Names of speakers identified during the current transcription
+    /// session — union of every name assigned via automatic matching
+    /// (`identifySegment`), manual cluster-level identification
+    /// (`setManualIdentification`), and manual per-segment
+    /// identification (`setManualSegmentIdentification`).
+    ///
+    /// **Why session-scoped.** Context menus for speaker
+    /// identification used to render the ENTIRE voice-template
+    /// library (~660 templates), which broke NSMenu's tracking
+    /// (`didChangeSubmenu: rep returned item view with wrong item:`
+    /// spam) and made the menu unresponsive. The new UI shows only
+    /// speakers already used in this session directly in the menu —
+    /// a small, workable list — with an "Other speaker…" fallback
+    /// that opens a search sheet for the full library.
+    ///
+    /// **Persistence semantics.** Additive within a session; never
+    /// shrinks even when a user clears an identification. Full
+    /// reset only on `resetForNewSession`. So a user who assigns
+    /// "Elizabeth Warren" once, later clears that identification,
+    /// and then wants to re-identify a different segment as Warren
+    /// still sees her in the immediate menu without having to
+    /// re-search.
+    @Published private(set) var sessionSpeakerHistory: Set<String> = []
+
+    // MARK: - Cluster embedding aggregation
+    //
+    // Rather than matching each segment's embedding independently
+    // against the template library (which produced inconsistent
+    // "same speaker cluster gets identified as 3 different people"
+    // outcomes and false positives from short/noisy segments), we
+    // maintain a running average of each cluster's embeddings and
+    // match at the cluster level.
+    //
+    // **Why this works better:**
+    //   - **Trust diarization for grouping.** Diarization is more
+    //     accurate at "these audio moments belong to the same person"
+    //     than voiceprint matching is at "who is this person" — so
+    //     let diarization group first, then identify each group.
+    //   - **Better SNR at match time.** An average of 20 embeddings
+    //     has ~4.5x lower noise floor than a single embedding
+    //     (√20 ≈ 4.47). Weak matches on single noisy segments
+    //     disappear; strong matches on the aggregated cluster stay.
+    //   - **Consistent labeling.** If cluster 客 ID 5 gets matched to
+    //     "Todd Blanche," every segment in cluster 5 becomes Todd
+    //     Blanche automatically. No majority-vote smoothing needed.
+    //
+    // **Implementation as running totals** rather than a list of
+    // embeddings per cluster: constant memory per cluster (256 floats
+    // + 1 int), no allocation on each add, average is one division
+    // pass at match time. Trade-off is that we can't remove an
+    // embedding after the fact — fine because diarization rarely
+    // moves segments between clusters after they're assigned.
+    private var clusterEmbeddingSums: [String: [Float]] = [:]
+    private var clusterEmbeddingCounts: [String: Int] = [:]
+
+    /// Count of embeddings contributed to each cluster's running
+    /// total since the cluster was last identified. Used to decide
+    /// when to re-run identification — see `identifyCluster` gates.
+    private var clusterEmbeddingsSinceLastMatch: [String: Int] = [:]
+
+    /// Per-session map of segment UUID → identified speaker. Populated
+    /// by automatic per-segment matching (after WeSpeaker extraction
+    /// runs on a segment's audio) and by manual per-segment overrides.
+    /// Cleared on session start.
+    ///
+    /// **Why segment-level matters.** When the diarizer merges two
+    /// speakers into one cluster, the cluster has one ID ("Speaker 1")
+    /// but its segments individually contain different voices. Per-
+    /// segment matching identifies each segment from its own audio,
+    /// so a merged cluster produces segments with different identified
+    /// names — which the transcript view then groups by effective
+    /// name, visually splitting the merge.
+    @Published private(set) var segmentIdentifications: [UUID: Identification] = [:]
 
     /// State of the R2 refresh — drives the Settings UI to show
     /// loading spinners, error messages, etc.
@@ -84,8 +180,39 @@ final class VoiceprintService: ObservableObject {
     /// R2 URL for the combined voiceprints.json. Editable in Settings
     /// in case the user moves the file or has a private mirror.
     /// Default points at the production R2 bucket.
+    /// User-editable list of remote source URLs, ONE URL PER LINE.
+    /// Multi-line support was added so users can organize their
+    /// templates into separate JSON files by category (e.g.
+    /// `voiceprints-House.json`, `voiceprints-Senate.json`) and load
+    /// them all as a merged pool. Backward-compatible with the
+    /// original single-URL configuration: a value with no newlines
+    /// is treated as one URL.
+    ///
+    /// The AppStorage KEY stays `voiceprint.r2URL` (singular) even
+    /// though the value is now plural. Renaming the key would strand
+    /// existing users' customized value on upgrade. Existing single-
+    /// URL settings continue to work unchanged.
     @AppStorage("voiceprint.r2URL")
-    var r2URL: String = "https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints.json"
+    var r2URLsRaw: String = """
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-House.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Senate.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Executive.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Governors.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Media.json
+        """
+
+    /// Parsed list of URLs from `r2URLsRaw`. Splits on newlines,
+    /// trims whitespace, drops empty lines, and drops entries that
+    /// don't parse as URLs. Called on every refresh so mid-session
+    /// edits in Settings take effect on the next refresh without
+    /// requiring an app restart.
+    var r2URLs: [URL] {
+        r2URLsRaw
+            .split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .compactMap { URL(string: $0) }
+    }
 
     // MARK: - Types
 
@@ -94,6 +221,73 @@ final class VoiceprintService: ObservableObject {
         case loading
         case loaded(count: Int)
         case error(String)
+    }
+
+    /// A group of templates loaded from a single source URL.
+    /// The `name` derives from the URL filename: for a URL like
+    /// `.../voiceprints-House.json`, the category is "House".
+    /// Rendered as a collapsible section in the Settings UI.
+    struct CategoryGroup: Identifiable, Equatable {
+        var id: String { name }
+        let name: String
+        let templates: [Voiceprint]
+    }
+
+    /// Append a `?_ts=<epoch>` query parameter to force CDNs to
+    /// treat the request as a fresh URL, bypassing edge caches that
+    /// key on URL rather than headers. Used exclusively during
+    /// refresh — the resulting URL isn't stored, only requested.
+    ///
+    /// Cloudflare R2 (and most CDNs) fingerprint cached responses
+    /// by full URL including query string. Adding a unique timestamp
+    /// makes each refresh a cache miss at the edge, forcing R2 to
+    /// serve the latest object from origin. Trivial overhead —
+    /// milliseconds per request even on cache misses.
+    ///
+    /// If the URL already has query params, the timestamp gets
+    /// appended alongside. Never overwrites existing params.
+    private func bustCache(_ url: URL) -> URL {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false) ?? URLComponents()
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "_ts", value: String(Int(Date().timeIntervalSince1970))))
+        components.queryItems = items
+        return components.url ?? url
+    }
+
+    /// Derive a human-readable category name from a source URL.
+    ///
+    /// Recognized pattern: `voiceprints-<Category>.json` (or `_` in
+    /// place of `-`; case-insensitive on the `voiceprints` prefix).
+    /// Falls back to the URL's filename without extension for
+    /// URLs that don't fit the pattern — so users hosting their
+    /// files under different naming conventions still see something
+    /// meaningful.
+    ///
+    /// **Special case: `voiceprints.json` (no suffix).** Returns
+    /// "Uncategorized" so a single monolithic file doesn't produce
+    /// a section named "voiceprints" that looks like a bug.
+    static func categoryName(from url: URL) -> String {
+        let filename = url.lastPathComponent
+        let base = filename
+            .split(separator: ".")
+            .dropLast()
+            .joined(separator: ".")
+        guard !base.isEmpty else { return "Uncategorized" }
+
+        // Match the canonical pattern first.
+        let lowerBase = base.lowercased()
+        if lowerBase.hasPrefix("voiceprints") {
+            var suffix = String(base.dropFirst("voiceprints".count))
+            while let first = suffix.first, first == "-" || first == "_" || first == " " {
+                suffix.removeFirst()
+            }
+            if suffix.isEmpty {
+                return "Uncategorized"
+            }
+            return suffix
+        }
+        // Fallback for non-canonical filenames.
+        return base
     }
 
     /// One enrolled voice template. Matches the JSON shape produced
@@ -197,33 +391,186 @@ final class VoiceprintService: ObservableObject {
         return Identification(name: name, confidence: bestSimilarity, isManual: false)
     }
 
-    /// Run identification for a batch of cluster ID → embedding pairs,
-    /// updating the registry for any cluster that doesn't already have
-    /// a manual identification. Called from `TranscriptionEngine` after
-    /// each diarization pass; skips clusters with manual reassignments
-    /// to avoid clobbering user corrections.
-    func identifyNewSpeakers(_ clusterEmbeddings: [String: [Float]]) {
+    /// Run identification for a single segment. Updates
+    /// `segmentIdentifications` if a match exists above the low
+    /// threshold; leaves the registry unchanged otherwise. Skips
+    /// segments that already have a manual identification (user
+    /// corrections are sticky).
+    ///
+    /// Add a segment's embedding to its cluster's running average,
+    /// then (potentially) run cluster-level identification. This is
+    /// the primary automatic identification path — replaces the
+    /// older per-segment matching approach that produced inconsistent
+    /// identifications across segments in the same cluster.
+    ///
+    /// **What this does:**
+    ///   1. Adds the segment's embedding to `clusterEmbeddingSums[cluster]`
+    ///      (element-wise addition) and increments the count.
+    ///   2. Checks if the cluster is due for (re-)identification. If
+    ///      it is, computes the L2-normalized running average and
+    ///      matches against templates. Result goes in
+    ///      `identifications[cluster]`, applying to every segment
+    ///      in that cluster automatically via `displayInfo`.
+    ///
+    /// **Identification cadence:**
+    ///   - First identification at 3 accumulated embeddings — enough
+    ///     to be more robust than a single-segment match, low enough
+    ///     to identify short clusters.
+    ///   - Re-identify every 5 new embeddings after that — cheap
+    ///     (~1ms against 660 templates) but avoids re-matching on
+    ///     every single new segment. As more audio accumulates, the
+    ///     average stabilizes and identification becomes more
+    ///     reliable; re-matching lets us "upgrade" from an early
+    ///     tentative match to a stronger one.
+    ///
+    /// **Manual identification wins.** If the user has manually set a
+    /// cluster or per-segment ID, we still update the running total
+    /// (in case they clear the manual override later) but skip the
+    /// automatic identify step so we don't clobber their choice.
+    ///
+    /// **Segment ID parameter is unused for aggregation** but kept
+    /// in the signature for API compatibility with the older per-
+    /// segment path. Also lets us support per-segment manual
+    /// identifications as before if needed.
+    func identifySegment(segmentId: UUID, embedding: [Float], clusterId: String?) {
         guard isEnabled else { return }
 
-        for (clusterId, embedding) in clusterEmbeddings {
-            // Manual reassignments are sticky — don't let automatic
-            // matching override them. The user explicitly said "this
-            // cluster is Senator Warren"; we trust that over any
-            // cosine similarity outcome.
-            if let existing = identifications[clusterId], existing.isManual {
-                continue
-            }
+        // Add to cluster running total — always, regardless of
+        // manual override state. Keeps the average correct if the
+        // manual identification is later cleared.
+        if let clusterId {
+            addEmbeddingToCluster(clusterId: clusterId, embedding: embedding)
+        }
 
-            // Automatic identifications get re-run on every batch.
-            // This means if FluidAudio's cluster embedding drifts as
-            // more audio accumulates, the identification may switch.
-            // Usually a good thing — more audio = better embedding.
-            // The drift is bounded since FluidAudio keeps a running
-            // mean within each cluster.
-            if let id = identify(embedding: embedding) {
-                identifications[clusterId] = id
+        // Skip auto-identification if this cluster or segment is
+        // manually assigned. Per-segment manual takes precedence
+        // over per-cluster manual — the user explicitly told us
+        // "this one is different."
+        if let existing = segmentIdentifications[segmentId], existing.isManual { return }
+        if let clusterId,
+           let clusterIdent = identifications[clusterId], clusterIdent.isManual {
+            return
+        }
+
+        // Run identification for this cluster if it's due.
+        if let clusterId {
+            identifyCluster(clusterId: clusterId)
+        }
+    }
+
+    /// Add an embedding to the running total for a cluster. Element-
+    /// wise addition; count increments by 1. The `since-last-match`
+    /// counter also increments, driving when we re-run identification.
+    private func addEmbeddingToCluster(clusterId: String, embedding: [Float]) {
+        if var existingSum = clusterEmbeddingSums[clusterId] {
+            let limit = min(existingSum.count, embedding.count)
+            for i in 0..<limit {
+                existingSum[i] += embedding[i]
+            }
+            clusterEmbeddingSums[clusterId] = existingSum
+        } else {
+            // First embedding for this cluster — copy in as the sum.
+            clusterEmbeddingSums[clusterId] = embedding
+        }
+        clusterEmbeddingCounts[clusterId, default: 0] += 1
+        clusterEmbeddingsSinceLastMatch[clusterId, default: 0] += 1
+    }
+
+    /// Match a cluster's running-average embedding against templates
+    /// and store the result. Skips if:
+    ///   - Cluster has fewer than 3 embeddings (too little data for
+    ///     reliable matching)
+    ///   - Cluster was matched recently (fewer than 5 new embeddings
+    ///     since last match)
+    ///   - Cluster has a manual identification
+    ///
+    /// **Why gates instead of always matching:** matching is cheap
+    /// but not free (~1ms against ~660 templates for cosine similarity),
+    /// and the identity of a cluster stabilizes as more audio arrives.
+    /// Re-running every N embeddings gives us the benefit of refinement
+    /// without the cost of matching on every segment.
+    private func identifyCluster(clusterId: String) {
+        // Skip if user has locked this in.
+        if let existing = identifications[clusterId], existing.isManual { return }
+
+        guard let sum = clusterEmbeddingSums[clusterId],
+              let count = clusterEmbeddingCounts[clusterId],
+              count >= 3 else { return }
+
+        // Only match if enough new evidence has arrived since last
+        // match. Prevents re-matching on every single segment.
+        let sinceLastMatch = clusterEmbeddingsSinceLastMatch[clusterId, default: 0]
+        let previouslyIdentified = identifications[clusterId] != nil
+        if previouslyIdentified && sinceLastMatch < 5 { return }
+
+        // Compute running average and L2-normalize. Templates are
+        // also L2-normalized (see `refreshFromRemote`), so cosine
+        // similarity reduces to dot product.
+        let scale = 1.0 / Float(count)
+        var average = sum.map { $0 * scale }
+        var normSquared: Float = 0
+        for value in average { normSquared += value * value }
+        let norm = sqrt(normSquared)
+        if norm > 0 {
+            for i in 0..<average.count {
+                average[i] /= norm
             }
         }
+
+        // Match against templates. If the match hits our threshold,
+        // apply to the cluster. If not, leave the cluster
+        // unidentified (or keep its previous identification if any —
+        // don't overwrite with nil).
+        if let newMatch = identify(embedding: average) {
+            let previousName = identifications[clusterId]?.name
+            identifications[clusterId] = newMatch
+            sessionSpeakerHistory.insert(newMatch.name)
+            if previousName != newMatch.name {
+                print("[Voiceprint] Cluster \(clusterId) → \(newMatch.name) (conf \(String(format: "%.3f", newMatch.confidence)), \(count) segs)")
+            }
+        }
+
+        clusterEmbeddingsSinceLastMatch[clusterId] = 0
+    }
+
+    /// Force cluster identification on every cluster that has an
+    /// aggregated embedding, regardless of how many segments since
+    /// last match. Called at session end (static mode) or when the
+    /// user explicitly triggers a re-scan. Ensures short clusters
+    /// that never crossed the "5 new segments since last match"
+    /// threshold still get their final identification pass.
+    ///
+    /// Manual identifications are still respected — we don't
+    /// re-match clusters where the user has set a name.
+    func forceMatchAllPendingClusters() {
+        for clusterId in clusterEmbeddingCounts.keys {
+            // Temporarily bump the counter above the threshold so
+            // `identifyCluster` doesn't gate us out.
+            clusterEmbeddingsSinceLastMatch[clusterId] = 5
+            identifyCluster(clusterId: clusterId)
+        }
+    }
+
+    /// Manually identify a single segment. Used by the per-segment
+    /// "Identify These Segments" context menu — applies to all
+    /// segments in a visible group, which may be a subset of a
+    /// merged cluster.
+    func setManualSegmentIdentification(segmentId: UUID, name: String) {
+        segmentIdentifications[segmentId] = Identification(
+            name: name,
+            confidence: 1.0,
+            isManual: true
+        )
+        // Keep the name accessible in the context menu for the rest of
+        // this session — see sessionSpeakerHistory docstring.
+        sessionSpeakerHistory.insert(name)
+    }
+
+    /// Remove a per-segment identification, reverting that segment
+    /// to its cluster-level identification (manual cluster reassign,
+    /// or generic cluster ID).
+    func clearSegmentIdentification(segmentId: UUID) {
+        segmentIdentifications.removeValue(forKey: segmentId)
     }
 
     /// Manually assign a speaker to a cluster. Stored as `isManual=true`
@@ -235,6 +582,9 @@ final class VoiceprintService: ObservableObject {
             confidence: 1.0,
             isManual: true
         )
+        // Keep the name accessible in the context menu for the rest of
+        // this session — see sessionSpeakerHistory docstring.
+        sessionSpeakerHistory.insert(name)
     }
 
     /// Remove a manual identification for a cluster, reverting to
@@ -247,16 +597,73 @@ final class VoiceprintService: ObservableObject {
     /// Clear the entire registry. Called by `TranscriptionEngine` when
     /// a new session starts — without this, "Speaker 1" from session A
     /// would carry its identification into "Speaker 1" of session B
-    /// (different actual person, same cluster ID).
+    /// (different actual person, same cluster ID). Also clears per-
+    /// segment identifications since those are session-specific too.
     func resetForNewSession() {
         identifications.removeAll()
+        segmentIdentifications.removeAll()
+        sessionSpeakerHistory.removeAll()
+        clusterEmbeddingSums.removeAll()
+        clusterEmbeddingCounts.removeAll()
+        clusterEmbeddingsSinceLastMatch.removeAll()
     }
 
-    /// Look up the display info for a cluster ID. The transcript pane
-    /// uses this to decide what to show next to each speaker group.
-    /// Returns (displayName, isIdentified, isUncertain):
-    ///   - `isIdentified`: false → fall back to generic cluster ID
-    ///   - `isUncertain`: true → render in italics or with `?`
+    /// Look up the display info for a specific segment. The transcript
+    /// pane uses this for badge rendering and group construction.
+    ///
+    /// **Precedence:**
+    ///   1. Segment-level manual identification (most specific user action)
+    ///   2. Cluster-level manual identification (broad user action)
+    ///   3. Segment-level automatic identification (matcher's per-segment guess)
+    ///   4. Cluster ID (fallback — diarizer's raw label)
+    ///
+    /// Note: the engine's `speakerNames[clusterId]` rename takes
+    /// priority above ALL of these — that's applied in the engine's
+    /// `displayName(for:)` method which wraps this one. The precedence
+    /// here only covers cases where there's no manual cluster rename.
+    func displayInfo(forSegmentId segmentId: UUID, clusterId: String?) -> (name: String, isIdentified: Bool, isUncertain: Bool) {
+        // 1 — segment-manual: user tagged just this segment
+        if let seg = segmentIdentifications[segmentId], seg.isManual {
+            return (seg.name, true, false)
+        }
+
+        // 2 — cluster-manual: user tagged the entire cluster
+        if let cluster = clusterId,
+           let clusterIdent = identifications[cluster],
+           clusterIdent.isManual {
+            return (clusterIdent.name, true, false)
+        }
+
+        // 3 — segment-auto: legacy per-segment voiceprint match.
+        // Retained so any old segment-level identifications set
+        // during a session still surface, but the new primary
+        // auto path lands in step 4 (cluster-auto) instead.
+        if let seg = segmentIdentifications[segmentId] {
+            let uncertain = seg.confidence < highConfidenceThreshold
+            return (seg.name, true, uncertain)
+        }
+
+        // 4 — cluster-auto: cluster-level voiceprint match. This is
+        // the primary automatic identification path since the shift
+        // from per-segment to per-cluster identification. Without
+        // this step, cluster identifications from `identifyCluster`
+        // never surface in the UI — the transcript keeps showing
+        // "Speaker 1" even though the cluster has been correctly
+        // matched to Rep. Hal Rogers in `identifications`.
+        if let cluster = clusterId,
+           let clusterIdent = identifications[cluster] {
+            let uncertain = clusterIdent.confidence < highConfidenceThreshold
+            return (clusterIdent.name, true, uncertain)
+        }
+
+        // 5 — cluster ID fallback
+        return (clusterId ?? "Unknown", false, false)
+    }
+
+    /// Look up display info using just a cluster ID. Used by callers
+    /// that don't have a segment UUID (legacy paths, exports).
+    /// Reflects cluster-level identifications only — for per-segment
+    /// detail, use `displayInfo(forSegmentId:clusterId:)`.
     func displayInfo(forClusterId clusterId: String) -> (name: String, isIdentified: Bool, isUncertain: Bool) {
         guard let id = identifications[clusterId] else {
             return (clusterId, false, false)
@@ -272,36 +679,133 @@ final class VoiceprintService: ObservableObject {
     /// and the local cache on success. On failure, leaves existing
     /// templates intact (so a flaky network doesn't wipe out the
     /// user's working state) and surfaces the error via `loadState`.
+    ///
+    /// **Multi-URL support.** Fetches every URL in `r2URLs`, merges
+    /// the results into a single `templates` list, and caches the
+    /// merged payload. Failures on individual URLs are surfaced in
+    /// the console log but don't abort the whole refresh — as long
+    /// as one URL succeeds, `templates` gets populated. Only when
+    /// ALL URLs fail is `loadState` set to `.error`.
+    ///
+    /// **Merge semantics.** Duplicate names across files are NOT
+    /// deduplicated — if `voiceprints-House.json` and
+    /// `voiceprints-Senate.json` both contain "Bernie Sanders" (e.g.
+    /// clips from different sessions), both templates remain in the
+    /// pool and both participate in matching. This is intentional:
+    /// more templates per person = better coverage of their vocal
+    /// range = more reliable matching. Duplicate NAMES in the UI
+    /// (spotter picker, Identify Speaker menu) are a minor cosmetic
+    /// issue but not a correctness one.
     func refreshFromRemote() async {
-        guard let url = URL(string: r2URL) else {
-            loadState = .error("Invalid R2 URL")
+        let urls = r2URLs
+        guard !urls.isEmpty else {
+            loadState = .error("No source URLs configured")
             return
         }
 
         loadState = .loading
 
-        do {
-            // Plain URLSession — no cache (R2 returns its own
-            // Cache-Control), no auth, no special headers. The
-            // bucket is public.
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode) else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-                loadState = .error("HTTP \(code)")
-                return
+        var merged: [Voiceprint] = []
+        var groups: [CategoryGroup] = []
+        var errors: [(source: String, message: String)] = []
+
+        print("[Voiceprint] Loading from \(urls.count) source URL(s)…")
+
+        // Sequential fetch. Voice-template JSONs are typically
+        // small (few KB per person, so tens to hundreds of KB per
+        // file), and we're fetching a handful of files (2-10),
+        // not hundreds. Sequential keeps error reporting simple
+        // and avoids saturating the connection with parallel
+        // requests to the same R2 bucket.
+        for url in urls {
+            let category = Self.categoryName(from: url)
+            do {
+                // Explicitly bypass all HTTP caches on refresh.
+                // Default URLSession behavior honors cache-control
+                // headers, which means a recently-updated
+                // voiceprints-Executive.json can still return its
+                // stale predecessor if either URLSession's local
+                // cache or Cloudflare's edge cache has a fresh copy.
+                //
+                // **Why belt-and-suspenders:**
+                //   - `cachePolicy = .reloadIgnoringLocalAndRemoteCacheData`
+                //     tells URLSession to skip its local cache and
+                //     adds a `Pragma: no-cache` header so intermediate
+                //     proxies also bypass their caches.
+                //   - Cache-busting query param (`?_ts=<epoch>`) makes
+                //     the URL unique per request, defeating any cache
+                //     that keys purely on URL rather than headers.
+                //     Cloudflare's CDN cache is URL-keyed, so this is
+                //     required for R2 edge-cache misses on updated
+                //     files.
+                //
+                // Both together guarantee refresh actually fetches
+                // fresh content, regardless of what upstream cache
+                // policies say.
+                var request = URLRequest(url: bustCache(url))
+                request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse,
+                      (200..<300).contains(http.statusCode) else {
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    errors.append((url.lastPathComponent, "HTTP \(code)"))
+                    print("[Voiceprint]   ✗ \(url.lastPathComponent) — HTTP \(code)")
+                    continue
+                }
+                let payload = try JSONDecoder().decode(VoiceprintsPayload.self, from: data)
+                let sorted = payload.templates.sorted { $0.name < $1.name }
+                merged.append(contentsOf: sorted)
+                groups.append(CategoryGroup(name: category, templates: sorted))
+                print("[Voiceprint]   ✓ \(url.lastPathComponent) — \(payload.templates.count) template(s) [\(category)]")
+            } catch {
+                errors.append((url.lastPathComponent, error.localizedDescription))
+                print("[Voiceprint]   ✗ \(url.lastPathComponent) — \(error.localizedDescription)")
             }
+        }
 
-            let payload = try JSONDecoder().decode(VoiceprintsPayload.self, from: data)
-            templates = payload.templates.sorted { $0.name < $1.name }
-            lastRefreshedAt = Date()
+        // Publish grouped view first — the UI reads this before it
+        // reads templates, so setting them in this order avoids
+        // brief flashes of "loaded but uncategorized" state.
+        // Groups preserve URL-list order (House before Senate,
+        // etc.) rather than alphabetizing, which matches the
+        // user's mental order.
+        categorizedTemplates = groups
+
+        // Flat merged list for matching. Alphabetically sorted for
+        // consistent display in pickers that consume `templates`
+        // directly (spotter picker, Identify Speaker menu).
+        // Matching doesn't care about order; display does.
+        templates = merged.sorted { $0.name < $1.name }
+        lastRefreshedAt = Date()
+
+        // Load-state reporting:
+        //   - All succeeded → .loaded (clean)
+        //   - Partial success → .loaded, error count noted in
+        //     console but not shown as error in UI (we have
+        //     usable data)
+        //   - All failed → .error with the first failure's message
+        if errors.isEmpty {
             loadState = .loaded(count: templates.count)
-            saveToLocalCache(data)
+            print("[Voiceprint] Loaded \(templates.count) template(s) from \(urls.count) source(s)")
+        } else if templates.isEmpty {
+            let first = errors.first?.message ?? "unknown"
+            loadState = .error("All sources failed. First: \(first)")
+        } else {
+            loadState = .loaded(count: templates.count)
+            print("[Voiceprint] Partial success: \(templates.count) template(s) loaded, \(errors.count) source(s) failed")
+        }
 
-            print("[Voiceprint] Loaded \(templates.count) templates from R2")
-        } catch {
-            print("[Voiceprint] R2 refresh failed: \(error.localizedDescription) — keeping existing templates")
-            loadState = .error(error.localizedDescription)
+        // Cache the merged payload so we can boot from it if a
+        // future refresh fails. Version metadata gets a synthetic
+        // value since we're synthesizing this from N sources.
+        let cachePayload = VoiceprintsPayload(
+            version: 1,
+            updatedAt: ISO8601DateFormatter().string(from: Date()),
+            embeddingModel: "wespeaker-en-voxceleb-resnet34",
+            templates: templates
+        )
+        if let cacheData = try? JSONEncoder().encode(cachePayload) {
+            saveToLocalCache(cacheData)
         }
     }
 

@@ -23,6 +23,15 @@ struct StreamScribeApp: App {
     /// prints, otherwise early prints are lost. The @StateObject also gives the
     /// log viewer a stable observation target.
     @StateObject private var logger = StreamScribeLogger.shared
+    /// Update checker held at app scope so its @Published `updateAvailable`
+    /// can drive the WindowGroup's update alert and Settings UI. The
+    /// init() is private; we get the singleton instance here and let
+    /// the @StateObject wrapper hold it for the app's lifetime. The
+    /// actual launch-time check fires from a `.task` on ContentView below
+    /// — not from this declaration, since @StateObject's initializer runs
+    /// during view construction and we don't want to block startup on a
+    /// GitHub round-trip.
+    @StateObject private var updateChecker = UpdateChecker.shared
 
     /// Debug toggle: force every model download to skip HuggingFace and
     /// go straight to the R2 mirror. Bound to the Debug menu's "Force
@@ -51,6 +60,27 @@ struct StreamScribeApp: App {
     /// the menu bar for everyone.
     @AppStorage("debug.menuEnabled") private var debugMenuEnabledByUser: Bool = false
 
+    /// First-time-setup completion flag. False on a fresh install (key
+    /// has never been touched), flipped to true when the user dismisses
+    /// the WelcomeView (either via Continue or Skip), and backfilled to
+    /// true for existing users whose cookieBrowser is already configured
+    /// (see the .task on ContentView below — they'd otherwise see a
+    /// "welcome" sheet they don't need).
+    @AppStorage("hasCompletedFirstTimeSetup") private var hasCompletedFirstTimeSetup: Bool = false
+
+    /// Triggers the confirmation alert for the Debug menu's "Clear Model
+    /// Cache" item. The action is destructive (deletes downloaded
+    /// model files; user has to re-download to use them next session),
+    /// so we route through a confirmation dialog instead of firing
+    /// directly on menu click — preventing the easy misfire of
+    /// reaching for one debug menu item and hitting an adjacent one.
+    @State private var showClearCacheConfirmation: Bool = false
+
+    /// Set after a cache wipe completes; drives a brief success alert
+    /// so the user gets feedback that the wipe ran (otherwise the menu
+    /// just closes silently and they wonder if it worked).
+    @State private var clearCacheCompletionMessage: String? = nil
+
     /// Resolved debug-menu visibility, combining build-config and
     /// user preference. Encapsulated as a computed property so the
     /// menu definition stays readable and the policy is in one place.
@@ -65,39 +95,197 @@ struct StreamScribeApp: App {
     /// Lets us open the log viewer from menu commands.
     @Environment(\.openWindow) private var openWindow
 
-    init() {
-        // Redirect Hugging Face's Swift Hub cache from the default
-        // ~/.cache/huggingface/ (a hidden directory most users can't
-        // navigate to in Finder) into ~/Documents/huggingface/ where
-        // WhisperKit and SpeakerKit already live. This unifies all four
-        // backends under one visible tree so users can sideload model
-        // files on locked-down networks by dropping them into Documents
-        // rather than fighting hidden directories.
-        //
-        // After this: mlx-audio-swift's HubApi resolves to
-        // $HF_HOME/hub/models--<org>--<name>/ which becomes
-        // ~/Documents/huggingface/hub/models--mlx-community--<name>/.
-        // Still the ugly HF Hub layout (snapshots/, blobs/, refs/), but
-        // visible to users and consistent across all backends.
-        //
-        // **Timing.** Stored properties on this struct (transcriptionEngine,
-        // toolManager, modelDownloadManager) are initialized before this
-        // init body runs, so technically those constructors fire before
-        // HF_HOME is set. That's fine in practice: none of them load
-        // models in their initializers — they just hold state. The
-        // first model load happens on Start button or Download button,
-        // long after this setenv. swift-transformers' HubApi reads
-        // HF_HOME at the moment of each request, not at startup, so
-        // late-binding works.
-        //
-        // **Override semantics.** We pass overwrite=0 so an explicit
-        // HF_HOME from the launch environment (e.g. set in a developer's
-        // shell or Xcode scheme) wins. This lets us test with the
-        // default cache location without rebuilding.
-        if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
-            let hfHome = docs.appendingPathComponent("huggingface").path
-            setenv("HF_HOME", hfHome, 0)
+    /// Compute the canonical StreamScribe models root and ensure both
+    /// it and its expected subdirectories exist. Sets `HF_HOME` to the
+    /// huggingface subdirectory so swift-transformers and mlx-audio
+    /// route their caches there, and sets up the FluidAudio symlink
+    /// so the SDK's hardcoded cache path lands inside the unified
+    /// root.
+    ///
+    /// Idempotent: safe to call multiple times. All `try?` so partial
+    /// failures (e.g. parent dir already exists, symlink already
+    /// correct) silently no-op rather than throwing.
+    private static func setupUnifiedModelsRoot() {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            print("[StreamScribe] No Application Support directory available — skipping unified models setup")
+            return
         }
+
+        let modelsRoot = appSupport
+            .appendingPathComponent("StreamScribe")
+            .appendingPathComponent("Models")
+        try? fm.createDirectory(at: modelsRoot, withIntermediateDirectories: true)
+
+        // HF_HOME → <root>/huggingface
+        let hfHome = modelsRoot.appendingPathComponent("huggingface")
+        try? fm.createDirectory(at: hfHome, withIntermediateDirectories: true)
+        setenv("HF_HOME", hfHome.path, 0)
+
+        // FluidAudio target dir + symlink. See the helper for the
+        // full set of cases it handles (fresh install, existing
+        // symlink, existing real directory with files needing
+        // migration, etc.).
+        let fluidAudioTarget = modelsRoot.appendingPathComponent("fluidaudio")
+        try? fm.createDirectory(at: fluidAudioTarget, withIntermediateDirectories: true)
+        setupFluidAudioSymlink(target: fluidAudioTarget, appSupport: appSupport)
+    }
+
+    /// Make `~/Library/Application Support/FluidAudio/Models/` resolve
+    /// (via symlink) to `<unified models root>/fluidaudio/`. Handles
+    /// every state the SDK path could be in:
+    ///
+    ///   1. Doesn't exist → just create the symlink
+    ///   2. Already a correct symlink → no-op
+    ///   3. A symlink pointing elsewhere → replace
+    ///   4. A real directory with files → migrate files to target,
+    ///      then replace with symlink (preserves models from existing
+    ///      installs that ran FluidAudio's auto-download before we
+    ///      had this consolidation)
+    ///   5. A real directory but empty → delete + replace with symlink
+    ///   6. Something else (regular file?) → leave alone, log warning
+    ///
+    /// All file operations use `try?` and log on failure. The worst
+    /// case if anything fails: FluidAudio's SDK keeps using its
+    /// hardcoded cache path independently of our unified root,
+    /// losing the consolidation but not breaking anything else.
+    private static func setupFluidAudioSymlink(target: URL, appSupport: URL) {
+        let fm = FileManager.default
+        let sdkPath = appSupport
+            .appendingPathComponent("FluidAudio")
+            .appendingPathComponent("Models")
+
+        // Ensure the parent dir (~/Library/Application Support/FluidAudio/)
+        // exists. Without it, createSymbolicLink fails with EEXIST/ENOENT
+        // depending on the macOS version.
+        try? fm.createDirectory(
+            at: sdkPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        // Determine what's at the SDK path.
+        var isDir: ObjCBool = false
+        let exists = fm.fileExists(atPath: sdkPath.path, isDirectory: &isDir)
+        let attrs = try? fm.attributesOfItem(atPath: sdkPath.path)
+        let typeIsSymlink = (attrs?[.type] as? FileAttributeType) == .typeSymbolicLink
+
+        if !exists {
+            // Case 1: fresh install. Create the symlink and we're done.
+            do {
+                try fm.createSymbolicLink(at: sdkPath, withDestinationURL: target)
+                print("[StreamScribe] FluidAudio symlink created: \(sdkPath.path) → \(target.path)")
+            } catch {
+                print("[StreamScribe] FluidAudio symlink creation failed: \(error.localizedDescription)")
+            }
+            return
+        }
+
+        if typeIsSymlink {
+            // Case 2/3: existing symlink. Verify the destination; replace
+            // if wrong.
+            if let dest = try? fm.destinationOfSymbolicLink(atPath: sdkPath.path),
+               dest == target.path {
+                return
+            }
+            try? fm.removeItem(at: sdkPath)
+            try? fm.createSymbolicLink(at: sdkPath, withDestinationURL: target)
+            print("[StreamScribe] FluidAudio symlink replaced (was pointing elsewhere)")
+            return
+        }
+
+        if isDir.boolValue {
+            // Case 4 or 5: real directory at the SDK path. Migrate any
+            // contents into the target, then replace with a symlink.
+            // Use moveItem rather than copy to preserve disk space —
+            // these CoreML bundles are ~250 MB and copying then
+            // deleting wastes time on slow disks.
+            if let contents = try? fm.contentsOfDirectory(atPath: sdkPath.path),
+               !contents.isEmpty {
+                print("[StreamScribe] Migrating \(contents.count) item(s) from \(sdkPath.path) to \(target.path)")
+                for item in contents {
+                    let from = sdkPath.appendingPathComponent(item)
+                    let to = target.appendingPathComponent(item)
+                    if fm.fileExists(atPath: to.path) {
+                        // Already at target — skip (don't clobber). The
+                        // user may have manually copied or the migration
+                        // is running a second time after a partial
+                        // success.
+                        print("[StreamScribe]   - \(item): already at target, skipping")
+                        continue
+                    }
+                    do {
+                        try fm.moveItem(at: from, to: to)
+                        print("[StreamScribe]   - \(item): moved")
+                    } catch {
+                        print("[StreamScribe]   - \(item): move failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+            do {
+                try fm.removeItem(at: sdkPath)
+                try fm.createSymbolicLink(at: sdkPath, withDestinationURL: target)
+                print("[StreamScribe] FluidAudio cache dir replaced with symlink")
+            } catch {
+                print("[StreamScribe] FluidAudio symlink replace failed: \(error.localizedDescription) — files now at \(target.path); SDK will use the old path until manually fixed")
+            }
+            return
+        }
+
+        // Case 6: a regular file at the SDK path? Doesn't make sense
+        // but possible. Don't touch it.
+        print("[StreamScribe] Unexpected item at FluidAudio SDK path: \(sdkPath.path) — leaving as-is")
+    }
+
+    init() {
+        // Set up the unified StreamScribe models directory and route
+        // all model storage through it. Layout:
+        //
+        //   ~/Library/Application Support/StreamScribe/Models/
+        //   ├── huggingface/         (HF_HOME — Whisper, Parakeet,
+        //   │                         Sortformer, SpeakerKit, anything
+        //   │                         else routed through HuggingFace
+        //   │                         Hub or its mirror)
+        //   └── fluidaudio/          (FluidAudio CoreML bundles,
+        //                             reached via a symlink from
+        //                             FluidAudio's hardcoded path)
+        //
+        // **Why Application Support over Documents.** Originally we
+        // used `~/Documents/huggingface/` for visibility, but that was
+        // motivated by users sideloading models on locked-down
+        // networks. With R2 mirrors in place, that workflow is no
+        // longer needed — model fetches happen automatically and
+        // reliably. Application Support is the macOS-standard
+        // location for app-managed data the user doesn't directly
+        // edit. It's still visible in Finder via Cmd+Shift+G, just
+        // not part of the default sidebar.
+        //
+        // **Why FluidAudio gets a symlink.** FluidAudio's SDK
+        // hardcodes its cache path inside
+        // `OfflineDiarizerModels.defaultModelsDirectory()` —
+        // `~/Library/Application Support/FluidAudio/Models/`. There's
+        // no public API to redirect it. We solve this by making that
+        // hardcoded path a symlink that points into our unified
+        // models root. From FluidAudio's perspective nothing changes;
+        // from the user's perspective all models live under
+        // StreamScribe/Models/.
+        //
+        // **Timing.** Stored properties on this struct initialize
+        // before this init body runs, so technically they fire before
+        // HF_HOME is set. None of them load models in their
+        // initializers though — they just hold state. The first model
+        // load happens on Start button or Download button, long after
+        // this setenv. swift-transformers' HubApi reads HF_HOME at
+        // the moment of each request, not at startup, so late-binding
+        // works.
+        //
+        // **Override semantics.** `setenv` with `overwrite=0` so an
+        // explicit HF_HOME from the launch environment (e.g. set in
+        // a developer's shell or Xcode scheme) wins. Lets us test
+        // with the default cache location without rebuilding.
+        Self.setupUnifiedModelsRoot()
 
         // Start log capture FIRST, before any other code that might print.
         // Doing this in init() rather than .task or onAppear ensures we catch
@@ -145,6 +333,115 @@ struct StreamScribeApp: App {
                 .environmentObject(modelDownloadManager)
                 .environmentObject(notificationService)
                 .frame(minWidth: 900, minHeight: 600)
+                .task {
+                    // Fire-and-forget launch-time update check. The
+                    // 24h throttle inside UpdateChecker means subsequent
+                    // launches in the same day skip the actual network
+                    // round-trip, so this is genuinely cheap most of the
+                    // time. The first launch of each day takes ~200-500
+                    // ms (GitHub API round-trip) — happens during ContentView
+                    // appearance, doesn't block the window from showing.
+                    await updateChecker.checkOnLaunchIfDue()
+                }
+                .task {
+                    // Backfill the first-time-setup flag for existing
+                    // users who already have a cookieBrowser configured.
+                    // Without this backfill, an existing user upgrading
+                    // to this version would see the "Welcome" sheet on
+                    // their first post-upgrade launch even though they're
+                    // not new — the flag's default-false means we can't
+                    // distinguish "new install" from "old install never
+                    // touched this key" by the flag alone. The
+                    // cookieBrowser check is our heuristic: a user with
+                    // any non-default cookies setting has clearly used
+                    // the app before.
+                    if !hasCompletedFirstTimeSetup && toolManager.cookieBrowser != .none {
+                        hasCompletedFirstTimeSetup = true
+                    }
+                }
+                .sheet(isPresented: Binding(
+                    get: { !hasCompletedFirstTimeSetup },
+                    set: { isPresented in
+                        // SwiftUI sets isPresented=false on any dismissal
+                        // (button tap, Esc, click outside). The Continue
+                        // and Skip buttons in WelcomeView already flip
+                        // hasCompletedFirstTimeSetup; this binding makes
+                        // Esc/outside-click also count as "complete" so
+                        // we don't nag users who closed the sheet without
+                        // making an explicit choice.
+                        if !isPresented { hasCompletedFirstTimeSetup = true }
+                    }
+                )) {
+                    WelcomeView()
+                        .environmentObject(toolManager)
+                        .environmentObject(notificationService)
+                }
+                .alert(
+                    "Update Available",
+                    isPresented: Binding(
+                        get: { updateChecker.updateAvailable != nil },
+                        set: { isPresented in
+                            // SwiftUI sets isPresented=false when the
+                            // alert is dismissed by any means (button tap,
+                            // Esc, click outside). Each button's action
+                            // already updates state appropriately; this
+                            // binding just guards against orphan state
+                            // by clearing updateAvailable on any dismissal.
+                            if !isPresented { updateChecker.dismissAlert() }
+                        }
+                    ),
+                    presenting: updateChecker.updateAvailable
+                ) { release in
+                    Button("Download…") {
+                        NSWorkspace.shared.open(release.pageURL)
+                        updateChecker.dismissAlert()
+                    }
+                    Button("Skip This Version") {
+                        updateChecker.skipVersion(release.version)
+                    }
+                    Button("Remind Me Later", role: .cancel) {
+                        updateChecker.dismissAlert()
+                    }
+                } message: { release in
+                    Text("StreamScribe \(release.version) is available. You're running \(updateChecker.currentVersion).\n\n\(release.body)")
+                }
+                // Clear-cache confirmation alert. Routed via @State binding
+                // toggled from the Debug menu's "Clear Model Cache…" item.
+                // Lives here on ContentView (rather than next to the menu
+                // item) because `Button` inside `CommandMenu` can't host
+                // its own `.alert` modifier — the alert needs to attach
+                // to a regular `View`, and ContentView is the natural
+                // owner of any app-level UI.
+                .alert(
+                    "Clear all model caches?",
+                    isPresented: $showClearCacheConfirmation
+                ) {
+                    Button("Clear", role: .destructive) {
+                        Task {
+                            let cleared = await ModelDownloadManager.shared.clearAllModelCaches()
+                            await MainActor.run {
+                                clearCacheCompletionMessage = "Wiped \(cleared.count) cache director\(cleared.count == 1 ? "y" : "ies"). Models will re-download on next session start (or use the sidebar Download buttons)."
+                            }
+                        }
+                    }
+                    Button("Cancel", role: .cancel) { }
+                } message: {
+                    Text("This deletes downloaded model files from disk. The next session will need to re-download them (~2.5 GB for TDT-CTC 1.1B + FluidAudio).")
+                }
+                .alert(
+                    "Cache Cleared",
+                    isPresented: Binding(
+                        get: { clearCacheCompletionMessage != nil },
+                        set: { if !$0 { clearCacheCompletionMessage = nil } }
+                    ),
+                    presenting: clearCacheCompletionMessage
+                ) { _ in
+                    Button("OK", role: .cancel) {
+                        clearCacheCompletionMessage = nil
+                    }
+                } message: { msg in
+                    Text(msg)
+                }
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)
@@ -320,6 +617,40 @@ struct StreamScribeApp: App {
                     debugForceShowRetryProbeButton.toggle()
                     print("[Debug] debugForceShowRetryProbeButton = \(debugForceShowRetryProbeButton)")
                 }
+
+                Divider()
+
+                // Re-shows the first-launch welcome sheet by clearing
+                // the persisted completion flag. The sheet's
+                // .sheet(isPresented:) binding observes
+                // hasCompletedFirstTimeSetup, so flipping the flag back
+                // to false triggers the sheet to appear immediately —
+                // no app restart needed. Useful for testing the
+                // welcome flow itself, the Keychain prompt behavior on
+                // browser selection, and the "Skip for Now" path,
+                // none of which are otherwise easy to reach once
+                // first-time setup has completed on the user's machine.
+                Button("Show Welcome Screen Again") {
+                    hasCompletedFirstTimeSetup = false
+                    print("[Debug] hasCompletedFirstTimeSetup = false (welcome sheet will re-appear)")
+                }
+
+                Divider()
+
+                // Wipe every model cache directory we know about. Used
+                // for testing the download flow itself (verifying
+                // progress bars, error states, R2-vs-HF fallback paths)
+                // without manually `rm -rf`-ing cache dirs from Terminal.
+                //
+                // Routes through a confirmation alert because the action
+                // is destructive — the next session start will re-trigger
+                // a full ~2.5 GB download (TDT-CTC 1.1B + FluidAudio +
+                // whatever else was cached). The alert lives on
+                // ContentView's window since `Button` inside `CommandMenu`
+                // can't host its own `.alert` modifier.
+                Button("Clear Model Cache…") {
+                    showClearCacheConfirmation = true
+                }
             }
             }  // end of `if showDebugMenu`
         }
@@ -355,7 +686,13 @@ struct StreamScribeApp: App {
         // SettingsView's own header comment; will grow as we add other
         // preference sections.
         Settings {
+            // SettingsView's "Re-apply Dictionary" button reads from
+            // the engine's segments and mutates them in place. Inject
+            // the same engine instance the rest of the app uses so
+            // the button operates on the live session's transcript,
+            // not a phantom empty instance.
             SettingsView()
+                .environmentObject(transcriptionEngine)
         }
     }
 

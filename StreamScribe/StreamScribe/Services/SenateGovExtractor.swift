@@ -97,7 +97,7 @@ enum SenateGovExtractor {
             case .pageHTMLNotUTF8(let u):
                 return "Senate.gov page returned non-UTF-8 HTML: \(u.absoluteString)"
             case .isvpIframeNotFound(let u):
-                return "No ISVP video player iframe found on senate.gov page: \(u.absoluteString) — the page may not include a hearing video, or senate.gov may have changed its page structure."
+                return "No m3u8 stream URL found on senate.gov page: \(u.absoluteString) — the page didn't load a stream within 10 s. The hearing may not be live yet, may not have been archived yet, or the page may have failed to load (check network)."
             case .isvpURLMalformed(let s):
                 return "ISVP URL on the page is malformed: \(s)"
             case .missingISVPParams(let u):
@@ -113,60 +113,72 @@ enum SenateGovExtractor {
     /// Resolve a senate.gov URL (committee hearing page OR direct ISVP
     /// player URL) to its underlying HLS m3u8 stream.
     ///
-    /// Performs at most one HTTP fetch (the page itself). The committee
-    /// mapping is in-memory. Total latency on a typical broadband connection
-    /// is ~300–700 ms, dominated by the page fetch.
+    /// **Implementation: browser-based.** Uses `SenateGovBrowserExtractor`
+    /// which loads the page in an off-screen `WKWebView`, lets the
+    /// page's JavaScript run, and captures the m3u8 URL via injected
+    /// `fetch`/`XMLHttpRequest`/`HTMLMediaElement.src` interceptors —
+    /// the same approach browser extensions like FetchV use, and the
+    /// only one that works reliably across senate.gov's mix of
+    /// iframe-embedded (older committee sites) and JavaScript-loaded
+    /// (newer Bitmovin-based committee sites) players.
     ///
-    /// - Throws: `ExtractorError` on any failure. The caller should
-    ///   consider falling back to yt-dlp on failure since some hearings
-    ///   (typically older or on subdomains we don't have in our mapping)
-    ///   work through yt-dlp's broader matching.
+    /// **Direct ISVP shortcut.** If the input URL is itself a
+    /// senate.gov/isvp/?... URL (e.g. the user pasted the ISVP iframe
+    /// URL directly, or a previous probe returned one), we skip the
+    /// browser entirely and use the committee-mapping path to
+    /// construct the m3u8. Faster (~50 ms vs ~2-3 s) and the result
+    /// is identical for the ISVP-style cases.
+    ///
+    /// **Latency.** ~2-3 s for the WKWebView path on a healthy network
+    /// (page load + JS execution + first m3u8 request). The old HTML
+    /// scraping path was faster (~500 ms) but kept missing JS-loaded
+    /// URLs; reliability wins over speed here.
+    ///
+    /// - Throws: `ExtractorError.isvpIframeNotFound` if no m3u8 URL is
+    ///   observed within 10 s. Other error cases (notSenateGovURL,
+    ///   etc.) only apply to the direct-ISVP shortcut path.
     static func resolve(url: URL) async throws -> ResolvedStream {
-        // Direct ISVP URL: parse params from the URL itself, skip page fetch.
+        // Direct ISVP URL: parse params from the URL itself, skip the
+        // browser entirely. Faster than WKWebView and the committee
+        // mapping is reliable for these well-structured URLs.
         if isISVPURL(url) {
             return try resolveFromISVPURL(url, pageTitle: nil)
         }
 
-        // Hearing page: fetch HTML, find the ISVP iframe URL, then resolve.
+        // Reject non-senate.gov URLs up front.
         guard isSupportedSenateGovHost(url) else {
             throw ExtractorError.notSenateGovURL(url)
         }
 
-        let html: String
-        do {
-            // 15 s timeout — page fetches normally complete in well under
-            // a second on a healthy network. The timeout is for
-            // pathological cases (corporate firewall, captive portal,
-            // etc.) where the request would otherwise hang indefinitely.
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 15
-            // senate.gov occasionally serves slightly different HTML to
-            // identified browsers vs default URLSession user-agent. A
-            // generic Safari UA keeps us in the "normal browser" path
-            // and avoids any 403 edge cases. Not strictly necessary in
-            // testing but cheap insurance.
-            request.setValue(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-                forHTTPHeaderField: "User-Agent")
-            let (data, _) = try await URLSession.shared.data(for: request)
-            guard let s = String(data: data, encoding: .utf8) else {
-                throw ExtractorError.pageHTMLNotUTF8(url)
-            }
-            html = s
-        } catch let e as ExtractorError {
-            throw e
-        } catch {
-            throw ExtractorError.pageHTMLFetchFailed(url, underlying: error)
-        }
-
-        guard let isvpURL = findISVPURL(in: html) else {
+        // Browser-based extraction. WKWebView loads the page, runs its
+        // JavaScript, and our injected shim reports the m3u8 URL the
+        // moment the player initialization tries to load it. The result
+        // also carries the page <title> for display.
+        guard let extraction = await SenateGovBrowserExtractor.resolve(pageURL: url) else {
             throw ExtractorError.isvpIframeNotFound(url)
         }
 
-        // Extract the page's <title> for display. Best-effort — if it
-        // fails, the stream still resolves with title=nil.
-        let pageTitle = extractPageTitle(from: html)
-        return try resolveFromISVPURL(isvpURL, pageTitle: pageTitle)
+        let m3u8URL = extraction.m3u8URL
+
+        // Best-effort parse of comm + filename from the m3u8 path for
+        // logging / display metadata. URL shape:
+        //   /hls/live/<stream_id>/<comm>/<filename>/master.m3u8
+        var committee = ""
+        var filename = ""
+        let parts = m3u8URL.pathComponents
+        if let liveIdx = parts.firstIndex(of: "live"), parts.count > liveIdx + 3 {
+            committee = parts[liveIdx + 2]
+            filename = parts[liveIdx + 3]
+        }
+
+        return ResolvedStream(
+            m3u8URL: m3u8URL,
+            alternativeURLs: [m3u8URL],
+            isLive: false,  // ffmpeg probe determines this downstream
+            title: extraction.pageTitle,
+            committee: committee,
+            filename: filename
+        )
     }
 
     // MARK: - Committee mapping
@@ -318,22 +330,55 @@ enum SenateGovExtractor {
 
     // MARK: - HTML parsing
 
-    /// Find the senate.gov ISVP iframe URL in a page's HTML. Looks for the
-    /// classic pattern `src="https://www.senate.gov/isvp/..."` on iframes,
-    /// the same pattern yt-dlp's `SenateGovIE` extractor uses (via
-    /// `SenateISVPIE.extract_from_webpage`).
+    /// Find the senate.gov ISVP player URL in a page's HTML. Tries three
+    /// progressively-broader strategies:
     ///
-    /// Some hearing pages may have multiple iframes (the player plus, say,
-    /// a Twitter embed) — we take the first match against the senate.gov
-    /// ISVP URL pattern, which is reliably the player.
+    /// 1. **Iframe `src=` match.** The classic embed pattern used by older
+    ///    committee sites (banking, help, judiciary, etc.). Matches what
+    ///    yt-dlp's `SenateGovIE` extractor does via
+    ///    `SenateISVPIE.extract_from_webpage`. Catches the vast majority
+    ///    of hearings.
+    ///
+    /// 2. **Free-form URL search.** Newer committee sites (Elementor /
+    ///    WordPress builds) put the URL in `<a href>` popup launchers
+    ///    or `data-*` attributes. Look for any `senate.gov/isvp?...` URL
+    ///    anywhere in the HTML. **Crucially**, validates that the captured
+    ///    URL doesn't have placeholder query values like `comm=commcode`
+    ///    — some templates appear on the page in unsubstituted form with
+    ///    real values injected at JS runtime, and a placeholder URL
+    ///    can't be resolved to a real stream.
+    ///
+    /// 3. **Data extraction.** When strategies 1+2 fail (or only find
+    ///    placeholders), look directly for `comm=<value>` and
+    ///    `filename=<value>` as separate data attributes or JS variable
+    ///    assignments, then construct the ISVP URL from those values.
+    ///    Handles Elementor-style pages where the player widget exposes
+    ///    its config as `data-comm="govtaff" data-filename="govtaff062326"`
+    ///    on a container element.
+    ///
+    /// **Hard limit.** If the page constructs the ISVP URL purely from
+    /// runtime JavaScript with no full URL string AND no data attributes
+    /// or variable assignments visible in the static HTML, all three
+    /// strategies fail. User workaround: open Network tab in browser,
+    /// find the m3u8 URL, paste THAT into StreamScribe (auto-detects
+    /// as `.hls`).
     private static func findISVPURL(in html: String) -> URL? {
-        // Pattern: any src="..." (also handles src='...') containing
-        // /senate.gov/isvp on either the www. host or the bare apex host.
-        //
-        // The capture group greedy-matches up to the closing quote.
-        // Senate.gov ISVP URLs commonly contain `&`, `?`, `=`, alphanumerics,
-        // and slashes — all permitted by the negated-character-class
-        // `[^"']*`.
+        // Strategy 1: iframe src=. Fast-path for the common case.
+        if let u = findISVPURLViaIframeSrc(in: html), !urlHasPlaceholders(u) {
+            return u
+        }
+        // Strategy 2: free-form URL search across the whole HTML.
+        if let u = findISVPURLViaFreeFormSearch(in: html), !urlHasPlaceholders(u) {
+            return u
+        }
+        // Strategy 3: extract comm + filename from data attributes or
+        // JS variable assignments, build the URL ourselves.
+        return findISVPURLViaDataExtraction(in: html)
+    }
+
+    /// Iframe-`src=` strategy. The original pattern, kept verbatim
+    /// behind a helper method so the new strategies stay separable.
+    private static func findISVPURLViaIframeSrc(in html: String) -> URL? {
         let patterns = [
             #"src=["']([^"']*senate\.gov/isvp[^"']*)["']"#,
             #"src=["']([^"']*//(?:www\.)?senate\.gov/isvp[^"']*)["']"#,
@@ -348,26 +393,212 @@ enum SenateGovExtractor {
                   let captureRange = Range(match.range(at: 1), in: html) else {
                 continue
             }
-            var captured = String(html[captureRange])
-            // Decode common HTML entities that appear in HREF values.
-            captured = captured
-                .replacingOccurrences(of: "&amp;", with: "&")
-                .replacingOccurrences(of: "&quot;", with: "\"")
-                .replacingOccurrences(of: "&#39;", with: "'")
-            // Iframe src might be protocol-relative (`//www.senate.gov/...`)
-            // — promote to https. Or relative — promote to www.senate.gov.
-            if captured.hasPrefix("//") {
-                captured = "https:" + captured
-            } else if captured.hasPrefix("/isvp") {
-                captured = "https://www.senate.gov" + captured
-            } else if !captured.hasPrefix("http") {
-                continue
-            }
-            if let u = URL(string: captured) {
+            if let u = normalizeAndDecode(String(html[captureRange])) {
                 return u
             }
         }
         return nil
+    }
+
+    /// Free-form-URL strategy. Looks for any `senate.gov/isvp?...` URL
+    /// anywhere in the HTML, regardless of HTML context. Returns the
+    /// first match; the caller's placeholder check decides whether to
+    /// accept it.
+    private static func findISVPURLViaFreeFormSearch(in html: String) -> URL? {
+        let pattern = #"https?://(?:www\.)?senate\.gov/isvp/?\?[^\s"'<>\\]+?(?=["'<>\s\\]|$)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            return nil
+        }
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        guard let match = regex.firstMatch(in: html, options: [], range: range),
+              let captureRange = Range(match.range, in: html) else {
+            return nil
+        }
+        return normalizeAndDecode(String(html[captureRange]))
+    }
+
+    /// Data-extraction strategy. When the page embeds the player as
+    /// a custom widget with config in data attributes or JS variables,
+    /// the comm code + filename appear separately rather than as a
+    /// full ISVP URL. Reconstruct the URL from those values.
+    ///
+    /// Patterns tried for each value, in order:
+    ///   - `data-comm="govtaff"` / `data-filename="..."` (HTML attribute)
+    ///   - `"comm":"govtaff"` / `"filename":"..."` (JSON config)
+    ///   - `comm="govtaff"` / `filename="..."` (JS variable assignment)
+    ///   - `comm=govtaff&filename=...` (unquoted query-string fragment)
+    ///
+    /// Each pattern's match is validated against `isPlaceholder` so
+    /// the literal template values (`commcode`, `filename` as a value,
+    /// `{{comm}}`, etc.) don't pollute the result.
+    ///
+    /// Type (live vs archived) defaults to arch when not found. If the
+    /// page indicates live in any of the same patterns, use that. Live
+    /// hearings still resolve to a playable m3u8 — the only place this
+    /// matters is the `isLive` flag we return downstream.
+    private static func findISVPURLViaDataExtraction(in html: String) -> URL? {
+        let commPatterns = [
+            #"data-comm=["']([a-z_]+)["']"#,
+            #"["']comm["']\s*:\s*["']([a-z_]+)["']"#,
+            #"\bcomm\s*=\s*["']([a-z_]+)["']"#,
+            #"[?&]comm=([a-z_]+)(?:&|"|'|\s|$)"#,
+        ]
+        let filenamePatterns = [
+            #"data-filename=["']([a-z0-9_]+)["']"#,
+            #"["']filename["']\s*:\s*["']([a-z0-9_]+)["']"#,
+            #"\bfilename\s*=\s*["']([a-z0-9_]+)["']"#,
+            #"[?&]filename=([a-z0-9_]+)(?:&|"|'|\s|$)"#,
+        ]
+        let typePatterns = [
+            #"data-type=["'](live|arch)["']"#,
+            #"["']type["']\s*:\s*["'](live|arch)["']"#,
+            #"[?&]type=(live|arch)(?:&|"|'|\s|$)"#,
+        ]
+
+        guard let comm = firstNonPlaceholderMatch(in: html, patterns: commPatterns) else {
+            return nil
+        }
+        guard let filename = firstNonPlaceholderMatch(in: html, patterns: filenamePatterns) else {
+            return nil
+        }
+        let type = firstNonPlaceholderMatch(in: html, patterns: typePatterns) ?? "arch"
+
+        let urlString = "https://www.senate.gov/isvp/?type=\(type)&comm=\(comm)&filename=\(filename)"
+        return URL(string: urlString)
+    }
+
+    /// Iterate `patterns` and return the first capture that isn't a
+    /// placeholder. Each pattern is tried with case-insensitive matching.
+    private static func firstNonPlaceholderMatch(in text: String, patterns: [String]) -> String? {
+        for pattern in patterns {
+            if let captured = matchFirstCapture(in: text, pattern: pattern), !isPlaceholder(captured) {
+                return captured
+            }
+        }
+        return nil
+    }
+
+    /// Find an m3u8 URL embedded directly in the page HTML. Used for
+    /// committee sites that wrap playback in JavaScript players
+    /// (Bitmovin, Video.js, etc.) rather than the classic ISVP iframe.
+    /// Bitmovin specifically embeds its config as a JS object like
+    /// `{source: {hls: "https://www-senate-gov-media-srs.akamaized.net/.../master.m3u8"}}`
+    /// which is plain-text findable in the source.
+    ///
+    /// Matches any URL on senate.gov's known CDN hosts
+    /// (`akamaized.net` for the modern senate CDN,
+    /// `akamaihd.net` for legacy committee streams) that ends in
+    /// `.m3u8`. Handles JSON-escaped forward slashes (`\/`) which
+    /// appear when the config is embedded inside a JSON string.
+    ///
+    /// Returns the first match — Bitmovin configs typically have one
+    /// `hls` entry that points at the master playlist; multi-bitrate
+    /// alternatives live inside the playlist itself, not as separate
+    /// page-level URLs.
+    private static func findDirectM3U8URL(in html: String) -> URL? {
+        let pattern = #"https?:(?:\\?/\\?/)[a-z0-9.-]*(?:akamaized\.net|akamaihd\.net)[^"'\s<>\\]*?\.m3u8"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            return nil
+        }
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        guard let match = regex.firstMatch(in: html, options: [], range: range),
+              let captureRange = Range(match.range, in: html) else {
+            return nil
+        }
+        // Unescape JSON-style escaped slashes — common in embedded
+        // config objects: `"hls":"https:\/\/host\/path\/master.m3u8"`.
+        let raw = String(html[captureRange])
+            .replacingOccurrences(of: "\\/", with: "/")
+            .replacingOccurrences(of: "&amp;", with: "&")
+        return URL(string: raw)
+    }
+
+    /// Build a `ResolvedStream` from a direct m3u8 URL found on the page,
+    /// when the ISVP-resolution path didn't yield a usable URL. Best-effort
+    /// parses comm/filename from the URL path for the returned metadata,
+    /// but the m3u8 URL itself is what matters for playback — even if
+    /// path parsing produces empty strings, the stream still plays.
+    ///
+    /// **Why isLive defaults to false:** the senate.gov URL path uses
+    /// `/hls/live/...` for both live AND archived content, so the path
+    /// alone can't distinguish. Setting `isLive=false` makes the probe
+    /// fall through to `probeRemoteDurationViaFFmpeg`, which correctly
+    /// detects live streams (finite duration → static; missing duration
+    /// or unbounded playlist → live). Slightly slower probe than a
+    /// live-known-up-front result but the right answer regardless.
+    private static func resolveFromDirectM3U8(_ m3u8URL: URL, pageTitle: String?) -> ResolvedStream {
+        // Parse `/hls/live/<stream_id>/<comm>/<filename>/master.m3u8`
+        // path for metadata. If the path format diverges, the parse
+        // yields empty strings — log-quality cosmetics only, doesn't
+        // affect playback.
+        var committee = ""
+        var filename = ""
+        let parts = m3u8URL.pathComponents
+        if let liveIdx = parts.firstIndex(of: "live"), parts.count > liveIdx + 3 {
+            committee = parts[liveIdx + 2]
+            filename = parts[liveIdx + 3]
+        }
+        return ResolvedStream(
+            m3u8URL: m3u8URL,
+            alternativeURLs: [m3u8URL],
+            isLive: false,
+            title: pageTitle,
+            committee: committee,
+            filename: filename
+        )
+    }
+
+    /// True if `value` looks like an unsubstituted template placeholder
+    /// rather than a real committee code or filename. Catches the common
+    /// patterns: literal "commcode" / "filename" as values (Elementor
+    /// puts these in templates), `{{...}}` Mustache-style placeholders,
+    /// `$...` shell-style placeholders, and the JS-variable style
+    /// where the parameter NAME ends up where its VALUE should be.
+    private static func isPlaceholder(_ value: String) -> Bool {
+        let v = value.lowercased()
+        // Mustache-style {{var}}: require both opening and closing braces
+        // so we don't false-positive on values that happen to start with
+        // two open-brace characters but aren't templates.
+        if v.hasPrefix("{{") && v.hasSuffix("}}") { return true }
+        if v.hasPrefix("$") || v.hasPrefix("%") { return true }
+        // The literal parameter names appearing as values — definitive
+        // template-not-filled-in signal. The senate.gov ISVP URLs use
+        // these exact parameter names so the inversion is unambiguous.
+        return v == "commcode" || v == "comm" || v == "filename"
+            || v == "type" || v == "stream_id" || v == "streamid"
+    }
+
+    /// True if any of the URL's query parameters contains a placeholder
+    /// value. Used by the caller to reject template URLs found by
+    /// strategy 1 or 2 in favor of falling through to strategy 3.
+    private static func urlHasPlaceholders(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems else {
+            return false
+        }
+        return items.contains { item in
+            if let v = item.value { return isPlaceholder(v) }
+            return false
+        }
+    }
+
+    /// Decode HTML entities and normalize a captured ISVP URL string
+    /// into a `URL`. Handles `&amp;`, `&quot;`, `&#39;`, plus
+    /// protocol-relative (`//www.senate.gov/...`) and root-relative
+    /// (`/isvp/...`) forms.
+    private static func normalizeAndDecode(_ captured: String) -> URL? {
+        var s = captured
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+        if s.hasPrefix("//") {
+            s = "https:" + s
+        } else if s.hasPrefix("/isvp") {
+            s = "https://www.senate.gov" + s
+        } else if !s.hasPrefix("http") {
+            return nil
+        }
+        return URL(string: s)
     }
 
     /// Extract the page <title>. Tries the og:title meta tag first (it's

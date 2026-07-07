@@ -40,12 +40,29 @@ import FluidAudio
 /// MIT (per FluidInference's HF repo). All three require attribution
 /// per their terms — see the About panel / NOTICES for credits.
 ///
-/// **Cache location.** FluidAudio stores models under
-/// `~/.cache/fluidaudio/Models/`. We don't manage that path directly —
-/// SDK handles download, compilation, and caching. The
-/// `ModelRegistry.baseURL` override (set in `prepare()`) redirects
-/// downloads to our R2 mirror when the user has one configured;
-/// otherwise FluidAudio downloads from HuggingFace.
+/// **Cache location.** FluidAudio's SDK hardcodes
+/// `~/Library/Application Support/FluidAudio/Models/` as its
+/// download/load directory — `OfflineDiarizerModels.defaultModelsDirectory()`
+/// returns it and there's no public API to redirect. StreamScribe
+/// works around this by setting up a symlink at app launch (see
+/// `StreamScribeApp.setupFluidAudioSymlink()`) that points the SDK's
+/// hardcoded path at the unified models root:
+/// `~/Library/Application Support/StreamScribe/Models/fluidaudio/`.
+/// From the SDK's perspective nothing changes; from StreamScribe's
+/// perspective all models live in one place.
+///
+/// Two download paths are supported:
+///   1. **R2 mirror (preferred)**: `ModelDownloadManager` downloads
+///      a single `fluidaudio.tar.gz` archive and extracts it to the
+///      unified path. Skips the SDK's own download flow entirely.
+///      Progress tracking comes from the same `MirrorDownloader`
+///      delegate that Parakeet/Whisper use.
+///   2. **HuggingFace fallback**: if the R2 mirror fails (tarball
+///      missing, network error), `runDownload` falls through and
+///      calls `prepare()` below. The SDK's own auto-download runs,
+///      writing into the unified path via the symlink. Progress
+///      tracking is approximate (disk-poll, since we don't control
+///      the SDK's downloader).
 ///
 /// Public API consumed (verified against FluidAudio 0.12.4 / 0.14.x):
 ///   - `OfflineDiarizerManager(config:)`, `prepareModels()`, `process(audio:)`
@@ -224,16 +241,18 @@ actor FluidAudioBackend: DiarizationBackend {
             let result = try await manager.process(audio: samples)
 
             // Map pyannote's result format to our SpeakerTurn array.
-            // OfflineDiarizerResult.segments has speakerId (String),
-            // startTimeSeconds (Double), endTimeSeconds (Double).
+            // OfflineDiarizerResult.segments has speakerId (String) and
+            // start/endTimeSeconds (Float — wrapped via TimeInterval()
+            // since SpeakerTurn / our timeline math uses Double, and
+            // Swift doesn't auto-promote Float + Double).
             // speakerId is something like "SPEAKER_00", "SPEAKER_01", etc.
             // We relabel by first appearance to match SortformerBackend
             // and SpeakerKitBackend conventions.
             let raw = result.segments.map { seg in
                 SpeakerTurn(
                     speaker: seg.speakerId,
-                    start: bufferStartTime + seg.startTimeSeconds,
-                    end: bufferStartTime + seg.endTimeSeconds
+                    start: bufferStartTime + TimeInterval(seg.startTimeSeconds),
+                    end: bufferStartTime + TimeInterval(seg.endTimeSeconds)
                 )
             }
             return FluidAudioBackend.relabelByFirstAppearance(raw)
@@ -265,6 +284,58 @@ actor FluidAudioBackend: DiarizationBackend {
         accumulatedStart = 0
         liveLabelMap = [:]
         print("[FluidAudio] unloaded models.")
+    }
+
+    /// Slice audio from the accumulated buffer for a given time range.
+    /// Used by `TranscriptionEngine.runVoiceprintIdentification` to
+    /// pull per-cluster audio for WeSpeaker extraction.
+    ///
+    /// **Time origin.** Time ranges are in session-wall-clock seconds,
+    /// matching what `SpeakerTurn` and segment fields use. The buffer
+    /// stores audio starting at `accumulatedStart`; sample index is
+    /// `(time - accumulatedStart) × 16000`.
+    ///
+    /// **Out-of-buffer behavior.** Returns empty if the requested
+    /// range falls entirely outside the buffer's current contents.
+    /// Clips the range to whatever portion IS in the buffer if it
+    /// overlaps partially. The buffer gets trimmed periodically by
+    /// the live diarization loop, so requests for old time ranges
+    /// will return progressively less audio over time.
+    ///
+    /// **Sample rate is hardcoded** at 16,000 — matches the
+    /// FluidAudio pipeline's expected rate and `accumulatedBuffer`'s
+    /// content rate. If the pipeline ever moves to a different rate
+    /// this needs to update in lockstep.
+    func sliceAccumulatedBuffer(from startTime: TimeInterval, to endTime: TimeInterval) -> [Float] {
+        let sampleRate: Double = 16_000
+        let bufferStart = accumulatedStart
+        let bufferEnd = bufferStart + Double(accumulatedBuffer.count) / sampleRate
+
+        let clipStart = max(startTime, bufferStart)
+        let clipEnd = min(endTime, bufferEnd)
+        guard clipEnd > clipStart else { return [] }
+
+        let startIdx = Int((clipStart - bufferStart) * sampleRate)
+        let endIdx = Int((clipEnd - bufferStart) * sampleRate)
+        guard startIdx >= 0,
+              endIdx <= accumulatedBuffer.count,
+              startIdx < endIdx else {
+            return []
+        }
+
+        return Array(accumulatedBuffer[startIdx..<endIdx])
+    }
+
+    /// **OBSOLETE.** Originally intended to expose per-cluster
+    /// embeddings from LSEEND's internal state, but LSEEND's
+    /// end-to-end architecture doesn't surface WeSpeaker embeddings.
+    /// Embeddings now come from `WeSpeakerExtractor` via
+    /// `sliceAccumulatedBuffer` + `DiarizerManager`. This method is
+    /// kept as a no-op so the older integration path in
+    /// `TranscriptionEngine` compiles during the transition; it will
+    /// be removed once that path is fully migrated.
+    func currentSpeakerEmbeddings() -> [String: [Float]] {
+        return [:]
     }
 
     // MARK: - Live-mode label stability
@@ -327,23 +398,41 @@ extension FluidAudioBackend {
     static let mirrorURLKey = "fluidAudio.mirrorURL"
 
     /// Best-effort check for whether FluidAudio's models are already
-    /// cached on disk. FluidAudio stores models under
-    /// `~/.cache/fluidaudio/Models/`. We check whether the directory
-    /// exists and contains at least one entry — not a perfect indicator
-    /// (could be a partial download from an interrupted prepare()) but
-    /// good enough for the sidebar's pre-download status indicator.
+    /// cached on disk. Checks the unified models path
+    /// (`~/Library/Application Support/StreamScribe/Models/fluidaudio/`,
+    /// returned by `fluidAudioCacheDirectory()`). We check whether
+    /// the directory exists and contains at least one entry — not a
+    /// perfect indicator (could be a partial download from an
+    /// interrupted prepare()) but good enough for the sidebar's
+    /// pre-download status indicator.
     ///
     /// More accurate per-model checks would require knowing FluidAudio's
     /// internal model subdirectory layout, which isn't part of their
     /// public API contract. Worst case if this returns false-positive
     /// "cached": the next session start does a download anyway, with
     /// progress visible in the SDK's logs.
+    /// Whether FluidAudio's CoreML model bundles are already on disk.
+    ///
+    /// **Path:** `~/Library/Application Support/StreamScribe/Models/fluidaudio/`
+    /// (the unified models root). Files written here are visible to
+    /// the FluidAudio SDK via the symlink set up by
+    /// `StreamScribeApp.setupFluidAudioSymlink()` — the SDK's
+    /// hardcoded `~/Library/Application Support/FluidAudio/Models/`
+    /// resolves to this directory.
+    ///
+    /// **Heuristic only.** A user manually deleting individual files
+    /// inside this directory wouldn't be detected here, and a future
+    /// FluidAudio update could add new required bundles we don't
+    /// check for. The function returns true when ANY content exists
+    /// at the path, treating "non-empty directory" as a proxy for
+    /// "probably cached" — the real source of truth is FluidAudio's
+    /// own `DiarizerModels.downloadIfNeeded()` which probes individual
+    /// `.mlmodelc` bundles against its public API contract. Worst
+    /// case if this returns false-positive "cached": the next session
+    /// start does a download anyway, with progress visible in the
+    /// SDK's logs.
     static func isModelCached() -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let cacheDir = home
-            .appendingPathComponent(".cache")
-            .appendingPathComponent("fluidaudio")
-            .appendingPathComponent("Models")
+        let cacheDir = fluidAudioCacheDirectory()
         guard FileManager.default.fileExists(atPath: cacheDir.path) else {
             return false
         }
@@ -351,5 +440,38 @@ extension FluidAudioBackend {
         // count as cached — could be a leftover from a wiped install.
         let contents = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
         return (contents?.isEmpty == false)
+    }
+
+    /// Canonical path where FluidAudio's CoreML model bundles live on
+    /// disk. Returns the unified StreamScribe path
+    /// (`~/Library/Application Support/StreamScribe/Models/fluidaudio/`)
+    /// rather than FluidAudio's hardcoded SDK path
+    /// (`~/Library/Application Support/FluidAudio/Models/`).
+    ///
+    /// Both paths point at the same physical files — the SDK's path
+    /// is set up as a symlink to the unified path at app launch by
+    /// `StreamScribeApp.setupFluidAudioSymlink()`. We prefer the
+    /// unified path here so reads don't depend on symlink traversal
+    /// behavior, and so debugging output (which sometimes prints
+    /// this path) shows the user-friendly canonical location.
+    ///
+    /// If the symlink isn't set up for whatever reason (early launch
+    /// failure, manual filesystem tampering), this still returns the
+    /// unified path. FluidAudio's auto-download would then write to
+    /// its own hardcoded path while our code reads from the unified
+    /// path — `isModelCached` would return false despite files
+    /// existing under the SDK path. Acceptable failure mode: the
+    /// next download via our R2 mirror writes to the unified path,
+    /// after which both paths see the same files.
+    static func fluidAudioCacheDirectory() -> URL {
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Application Support")
+        return appSupport
+            .appendingPathComponent("StreamScribe")
+            .appendingPathComponent("Models")
+            .appendingPathComponent("fluidaudio")
     }
 }

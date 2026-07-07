@@ -247,8 +247,11 @@ enum StreamSource: String, CaseIterable {
     case twitter = "Twitter / X"
     case facebook = "Facebook"
     case instagram = "Instagram"
+    case threads = "Threads"
     case applePodcast = "Apple Podcasts"
     case soundcloud = "SoundCloud"
+    case senateGov = "U.S. Senate"
+    case criticalMention = "Critical Mention"
     case hls = "HLS Stream"
     case directAudio = "Direct Audio"
     case localFile = "Local File"
@@ -275,15 +278,24 @@ enum StreamSource: String, CaseIterable {
     /// `.unknown` is in the yt-dlp camp because yt-dlp's *generic* extractor
     /// scrapes arbitrary HTML pages for embedded media URLs (HLS in `<video>`
     /// tags, JW Player configs, `.m3u8` references in JS, etc.). Pages that
-    /// embed a video — Senate hearings, news sites, BBC iPlayer, etc. — paste
+    /// embed a video — news sites, BBC iPlayer, etc. — paste
     /// as `.unknown` and yt-dlp's generic extractor finds the underlying
     /// stream. When yt-dlp can't extract, the user sees a yt-dlp error
     /// (better than ffmpeg's cryptic "Invalid data found").
+    ///
+    /// `.senateGov` is NOT in the yt-dlp camp. Senate.gov ISVP URLs have a
+    /// fully deterministic structure — the m3u8 URL is derivable from the
+    /// committee + filename + a hardcoded committee→ID mapping (see
+    /// `SenateGovExtractor`). Resolving directly is ~500 ms (one HTTP page
+    /// fetch for the iframe) vs. 6–9 s for the yt-dlp probe + URL-resolution
+    /// fallback path. Routing senate.gov through our own extractor avoids
+    /// every yt-dlp quirk (auth, format selection, fragment write paths)
+    /// for the long-form government hearings this app sees most often.
     var requiresYTDlp: Bool {
         switch self {
-        case .youtube, .twitter, .facebook, .instagram, .applePodcast, .soundcloud, .unknown:
+        case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
             return true
-        case .hls, .directAudio, .localFile:
+        case .senateGov, .criticalMention, .hls, .directAudio, .localFile:
             return false
         }
     }
@@ -308,7 +320,7 @@ enum StreamSource: String, CaseIterable {
     ///     would need an explicit workaround.
     var benefitsFromImpersonation: Bool {
         switch self {
-        case .facebook, .instagram:
+        case .facebook, .instagram, .threads:
             return true
         default:
             return false
@@ -360,6 +372,36 @@ enum StreamSource: String, CaseIterable {
         {
             return .instagram
         }
+        // Threads: threads.com (primary) and threads.net (the original
+        // launch domain, still resolves and gets shared). Runs on
+        // Meta's Instagram CDN — direct media URLs end up at
+        // `scontent-*.cdninstagram.com` with signed query strings. yt-dlp
+        // has a dedicated Threads extractor (added mid-2024) that
+        // handles both post URLs and direct video extraction. Same TLS-
+        // fingerprinting + cookie behavior as Instagram — wired up via
+        // `requiresYTDlp` + `benefitsFromImpersonation` above. Login is
+        // required for some accounts/posts; the existing cookie-from-
+        // browser flow covers it.
+        if host == "threads.com" || host.hasSuffix(".threads.com")
+            || host == "threads.net" || host.hasSuffix(".threads.net")
+        {
+            return .threads
+        }
+        // Critical Mention: media-monitoring service serving broadcast
+        // clips via signed HLS streams. Two URL shapes matter:
+        //   - `app.criticalmention.com/app/#/clip/public/<uuid>` — the
+        //     canonical page URL users share; hash-routed SPA. Our
+        //     browser extractor watches this page for the actual
+        //     stream URL that its JS bundle fetches.
+        //   - `<region>.assets.criticalmention.com/stream.php?...` —
+        //     the direct signed HLS URL. Users could paste this too,
+        //     though it expires within hours. Both are recognized
+        //     here so pasted variants route to the same extractor
+        //     (which for a direct-assets URL, would just capture it
+        //     via the JS shim on first observation).
+        if host == "criticalmention.com" || host.hasSuffix(".criticalmention.com") {
+            return .criticalMention
+        }
         // Apple Podcasts: host is always podcasts.apple.com. yt-dlp's extractor
         // requires URLs of the shape /<lang>/podcast/<name>/idNNN?i=NNN — i.e.
         // an episode-level URL with the i= query parameter. Podcast-level URLs
@@ -376,6 +418,47 @@ enum StreamSource: String, CaseIterable {
         // first track (since `resolveViaYTDlp` takes the first stdout line).
         if host == "soundcloud.com" || host.hasSuffix(".soundcloud.com") {
             return .soundcloud
+        }
+        // U.S. Senate: any of the supported committee subdomains under
+        // .senate.gov, plus the central www.senate.gov/isvp/ player URL.
+        // Routed through `SenateGovExtractor` instead of yt-dlp because
+        // the ISVP player has a fully deterministic URL structure — the
+        // m3u8 URL is derivable from the committee + filename params
+        // with a one-time HTML fetch for the iframe URL on hearing
+        // pages. Our extractor is ~500 ms vs ~6-9 s for the yt-dlp +
+        // URL-resolution-fallback chain, AND it bypasses every yt-dlp
+        // quirk we've debugged for senate.gov (auth, format selection,
+        // fragment write paths).
+        //
+        // Subdomain list mirrors the set of committee hearing pages we
+        // can resolve via `SenateGovExtractor.committees`. Note that
+        // some page subdomains differ from their ISVP `comm` codes
+        // (the iframe URL parameter) — `hsgac.senate.gov` hosts the
+        // Homeland Security pages but the ISVP `comm` is `govtaff`,
+        // for example. The extractor handles that mapping internally;
+        // here we just need the page subdomain to be recognized so
+        // detection picks `.senateGov` and routes accordingly.
+        let senateSubdomains: Set<String> = [
+            "agriculture", "aging", "appropriations", "armed-services",
+            "banking", "budget", "commerce", "energy", "epw", "ethics",
+            "finance", "foreign", "help", "hsgac", "inaugural", "indian",
+            "intelligence", "jec", "judiciary", "rules", "sbc", "veterans",
+        ]
+        if host.hasSuffix(".senate.gov") {
+            // Strip optional "www." prefix to match against subdomain set.
+            let withoutSuffix = host.dropLast(".senate.gov".count)
+            let normalized = withoutSuffix.hasPrefix("www.")
+                ? String(withoutSuffix.dropFirst("www.".count))
+                : String(withoutSuffix)
+            if senateSubdomains.contains(normalized) {
+                return .senateGov
+            }
+            // www.senate.gov/isvp/... — the central ISVP player. Some pages
+            // link directly to it (and yt-dlp's c-span integration emits
+            // these URLs), so catch them here too.
+            if (normalized == "www" || normalized.isEmpty) && url.path.hasPrefix("/isvp") {
+                return .senateGov
+            }
         }
         let path = url.path.lowercased()
         if path.hasSuffix(".m3u8") || path.contains("/hls/") {

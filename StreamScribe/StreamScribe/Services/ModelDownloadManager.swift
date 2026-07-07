@@ -66,6 +66,7 @@ final class ModelDownloadManager: ObservableObject {
         case parakeet(modelRepo: String)
         case sortformer
         case speakerKit
+        case fluidAudio
 
         /// Short identifier for log lines. Avoids dumping a full repo path
         /// into every status print.
@@ -75,6 +76,7 @@ final class ModelDownloadManager: ObservableObject {
             case .parakeet(let r): return "parakeet:\(r)"
             case .sortformer:      return "sortformer"
             case .speakerKit:      return "speakerKit"
+            case .fluidAudio:      return "fluidAudio"
             }
         }
     }
@@ -115,11 +117,29 @@ final class ModelDownloadManager: ObservableObject {
         /// sure it's needed.
         case notDownloaded
         /// `prepare()` is in flight and the model wasn't already on disk —
-        /// we're actually downloading bytes over the network. Carries
-        /// the start timestamp so the UI can show elapsed time
-        /// ("Downloading… 0:37"). No progress fraction — see enum doc
-        /// for why.
-        case downloading(startedAt: Date)
+        /// we're actually downloading bytes over the network.
+        ///
+        /// **Carries:** the start timestamp so the UI can show elapsed time
+        /// ("Downloading… 0:37"), and an optional progress fraction (0...1).
+        ///
+        /// **Why `progress` is optional.** Three regimes:
+        ///   1. Mirror downloads (R2 tarballs, the default path) — we use
+        ///      `URLSessionDownloadDelegate` and get exact byte progress
+        ///      from `didWriteData`. Progress = non-nil from the first
+        ///      chunk onward.
+        ///   2. FluidAudio — its library manages its own per-file
+        ///      downloads, so we disk-poll the cache directory against a
+        ///      known total size. Progress = approximate but non-nil.
+        ///   3. HuggingFace fallback (when the R2 mirror is missing or
+        ///      fails) — we hand control to the library's own loader and
+        ///      have no per-byte visibility. Progress = nil; UI falls
+        ///      back to an indeterminate spinner.
+        ///
+        /// Initial state on entering this case is `progress: nil` (we
+        /// haven't received the first delegate callback yet); the value
+        /// updates to non-nil within a few hundred ms once the download
+        /// begins streaming bytes.
+        case downloading(startedAt: Date, progress: Double?)
         /// `prepare()` is in flight but the model IS already on disk —
         /// no network, just CoreML/MLX weights being loaded into RAM.
         /// Distinct from `.downloading` because the previous label
@@ -140,10 +160,22 @@ final class ModelDownloadManager: ObservableObject {
             case .unknown:                  return ""
             case .cached:                   return "Downloaded"
             case .notDownloaded:            return "Not downloaded"
-            case .downloading(let start):
+            case .downloading(let start, let progress):
                 let elapsed = Int(Date().timeIntervalSince(start))
                 let mins = elapsed / 60
                 let secs = elapsed % 60
+                if let progress {
+                    // Clamp defensively — the delegate has occasionally
+                    // been observed to report `totalBytesExpectedToWrite`
+                    // as -1 on servers that don't send Content-Length, in
+                    // which case division yields negative/NaN values that
+                    // were already filtered at the call site. The clamp
+                    // here is belt-and-suspenders insurance for an
+                    // unexpected value sneaking through.
+                    let clamped = max(0.0, min(1.0, progress))
+                    let pct = Int(clamped * 100)
+                    return String(format: "Downloading… %d:%02d (%d%%)", mins, secs, pct)
+                }
                 return String(format: "Downloading… %d:%02d", mins, secs)
             case .loading(let start):
                 let elapsed = Int(Date().timeIntervalSince(start))
@@ -254,6 +286,8 @@ final class ModelDownloadManager: ObservableObject {
             cached = SortformerBackend.isModelCached()
         case .speakerKit:
             cached = SpeakerKitBackend.isModelCached()
+        case .fluidAudio:
+            cached = FluidAudioBackend.isModelCached()
         }
         print("[ModelDownload] Probe \(key.logTag): \(cached ? "cached" : "not on disk")")
         return cached
@@ -264,8 +298,115 @@ final class ModelDownloadManager: ObservableObject {
     @MainActor
     func markDownloading(_ key: ModelKey) {
         let prev = statuses[key] ?? .unknown
-        statuses[key] = .downloading(startedAt: Date())
+        statuses[key] = .downloading(startedAt: Date(), progress: nil)
         print("[ModelDownload] \(key.logTag): \(stateName(prev)) → downloading")
+    }
+
+    /// Update the progress fraction inside an in-flight `.downloading`
+    /// status without resetting the start timestamp. Called repeatedly
+    /// from:
+    ///   - The R2 mirror download delegate (`MirrorDownloader`'s
+    ///     `didWriteData`) at every received chunk
+    ///   - The FluidAudio disk poller (a separate Task that watches
+    ///     `~/Library/Application Support/FluidAudio/Models/`)
+    ///
+    /// If the current status is not `.downloading` (e.g. it raced with
+    /// a transition to `.loading` after the download completed), this
+    /// no-ops. Safe to call from any thread — hops to MainActor for the
+    /// publish, like every other status mutation in this manager.
+    ///
+    /// Progress is clamped to 0...1 here as well as in the label
+    /// accessor; the double-clamp is defensive cheap insurance and not
+    /// otherwise meaningful.
+    @MainActor
+    private func updateDownloadProgress(_ key: ModelKey, progress: Double) {
+        guard case .downloading(let start, _) = statuses[key] else { return }
+        let clamped = max(0.0, min(1.0, progress))
+        statuses[key] = .downloading(startedAt: start, progress: clamped)
+    }
+
+    // MARK: - Cache management (debug)
+
+    /// Delete every model cache directory we know about, then refresh
+    /// statuses so the sidebar reflects the post-wipe state. Returns the
+    /// list of paths the wipe attempted (including ones that didn't
+    /// exist), for the caller to surface in a confirmation dialog or log.
+    ///
+    /// **Debug-only.** Wired up via the Debug menu's "Clear Model Cache"
+    /// item — not exposed in the main UI. The intended use case is
+    /// testing the download flow itself (verifying progress bars,
+    /// error states, R2-vs-HF fallback paths) without manually `rm
+    /// -rf`-ing cache directories from the terminal.
+    ///
+    /// **What gets deleted:**
+    ///   - `~/Library/Application Support/StreamScribe/Models/` — the
+    ///     unified models root. Wipes both the `huggingface/` subdirectory
+    ///     (Parakeet, Whisper, Sortformer, SpeakerKit) and the
+    ///     `fluidaudio/` subdirectory (FluidAudio's CoreML bundles).
+    ///   - `~/Library/Application Support/FluidAudio/Models/` — the
+    ///     symlink the SDK uses. Whether this resolves to our
+    ///     unified root (the common case) or is a stale real
+    ///     directory from a pre-consolidation install, removing it
+    ///     ensures the symlink is recreated cleanly on next launch.
+    ///
+    /// We don't try to be surgical (deleting only the specific repos
+    /// StreamScribe uses) because:
+    ///   - The candidate-path logic varies per backend
+    ///   - This is a debug feature, not a user-facing one
+    ///   - The user who clicks this button knows what they're doing
+    ///
+    /// WhisperKit's cache isn't covered here — it lives under
+    /// `~/Library/Application Support/WhisperKit/` (system-managed,
+    /// per the SDK's own conventions). If you're testing WhisperKit
+    /// redownloads, you'll need to wipe that path separately. Not
+    /// included because most StreamScribe testing centers on
+    /// Parakeet/FluidAudio (the new defaults) and the unified root.
+    ///
+    /// Errors per-path are caught and logged but don't abort the
+    /// overall wipe — best-effort. The returned list says what was
+    /// attempted, not what succeeded.
+    nonisolated func clearAllModelCaches() async -> [String] {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? home.appendingPathComponent("Library").appendingPathComponent("Application Support")
+
+        let pathsToWipe: [URL] = [
+            // Unified models root — primary deletion target. Wipes
+            // everything under StreamScribe/Models/ (huggingface/ +
+            // fluidaudio/ + anything else we add later).
+            appSupport.appendingPathComponent("StreamScribe").appendingPathComponent("Models"),
+            // FluidAudio symlink at the SDK's hardcoded path. Removing
+            // the symlink itself (not following it) — the next launch
+            // recreates it pointing at the freshly-empty unified root.
+            // If it's somehow not a symlink (older install), removing
+            // is still the right thing: clears whatever stale state
+            // was there.
+            appSupport.appendingPathComponent("FluidAudio").appendingPathComponent("Models"),
+        ]
+
+        var attempted: [String] = []
+        for path in pathsToWipe {
+            attempted.append(path.path)
+            guard fm.fileExists(atPath: path.path) else {
+                print("[ModelDownload] clearAllModelCaches: \(path.path) does not exist, skipping")
+                continue
+            }
+            do {
+                try fm.removeItem(at: path)
+                print("[ModelDownload] clearAllModelCaches: removed \(path.path)")
+            } catch {
+                print("[ModelDownload] clearAllModelCaches: FAILED to remove \(path.path) — \(error.localizedDescription)")
+            }
+        }
+
+        // Re-probe disk so the sidebar's status indicators flip from
+        // .cached → .notDownloaded for the models we just deleted.
+        await MainActor.run {
+            self.refreshAllOnDiskStatuses()
+        }
+
+        return attempted
     }
 
     /// Mark a prepare-in-flight where the model is already on disk —
@@ -340,6 +481,128 @@ final class ModelDownloadManager: ObservableObject {
             let backend = SpeakerKitBackend()
             try await backend.prepare()
         }
+    }
+
+    /// Pre-download FluidAudio's models without starting a session. Same
+    /// shape as the other download methods — uses `runDownload` for the
+    /// status scaffolding, calls `FluidAudioBackend.prepare()` which
+    /// downloads + compiles both the offline pyannote pipeline (3 CoreML
+    /// bundles: segmentation + embedding + VAD) AND the LS-EEND streaming
+    /// model. The backend's prepare loads both eagerly because it can't
+    /// know in advance whether the user's next session will be static
+    /// or live.
+    ///
+    /// Backend memory is released after prepare returns by instantiating
+    /// it locally — the local reference goes out of scope as soon as the
+    /// closure exits, letting ARC reclaim the CoreML buffers. Same trick
+    /// the SortformerBackend pre-download uses.
+    func downloadFluidAudioModel() async {
+        // Spawn a disk-poll task in parallel with prepare() so the UI
+        // sees a progress percentage during FluidAudio's download.
+        // Unlike the R2 mirror path, we don't control FluidAudio's
+        // downloader (it's inside the SDK), so we approximate progress
+        // by watching the cache directory size against an expected
+        // total. The expected total is a conservative estimate of the
+        // pyannote pipeline (~150 MB) + LSEEND dihard3 (~100 MB) =
+        // ~250 MB. Real-world transfer size varies with model variant
+        // and HF response headers; the percentage will be approximate.
+        //
+        // The poller starts at the same time prepare() does and
+        // cancels when prepare() returns (success or throw). It
+        // updates `statuses[.fluidAudio]` via `updateDownloadProgress`,
+        // which no-ops harmlessly if the state has already moved to
+        // `.loading` (post-download, pre-ready).
+        let pollerTask = Task { [weak self] in
+            await self?.pollFluidAudioCacheSize(key: .fluidAudio)
+        }
+        await runDownload(key: .fluidAudio) {
+            let backend = FluidAudioBackend()
+            try await backend.prepare()
+            // Explicit unload here as a belt-and-suspenders. The local
+            // reference would be released anyway when the closure exits,
+            // but FluidAudio's CoreML buffers are large enough that we
+            // want to be explicit about reclaiming them before the
+            // surrounding await chain returns control to the UI.
+            await backend.unload()
+        }
+        pollerTask.cancel()
+    }
+
+    /// Approximate total size of FluidAudio's combined model bundles
+    /// after download + CoreML compilation. Used to compute a percentage
+    /// in `pollFluidAudioCacheSize` without a per-file HEAD request.
+    ///
+    /// The expected size is the SUM of:
+    ///   - Offline pyannote pipeline (segmentation + embedding + VAD
+    ///     CoreML bundles): ~150 MB on disk after compilation
+    ///   - LS-EEND dihard3 variant CoreML bundle: ~100 MB on disk
+    ///
+    /// Tracked as a constant rather than a configured value because
+    /// FluidAudio's model versions change rarely; if they do, the
+    /// progress percentage gets slightly off and we adjust the
+    /// constant on the next release.
+    private static let fluidAudioExpectedTotalBytes: Int64 = 250 * 1024 * 1024
+
+    /// Poll FluidAudio's cache directory every 500 ms, computing the
+    /// download progress as `current_dir_size / expected_total`.
+    /// Runs until the task is cancelled (which happens when prepare()
+    /// returns in `downloadFluidAudioModel`).
+    ///
+    /// Read-only filesystem traversal — `enumerator(at:includingPropertiesForKeys:)`
+    /// walks the directory tree once per tick, summing file sizes.
+    /// For ~250 MB across a few dozen files, this is well under 1 ms
+    /// on local SSD; the polling interval is the dominant cost.
+    private func pollFluidAudioCacheSize(key: ModelKey) async {
+        // Use FluidAudioBackend's canonical path resolver. The actual
+        // location is `~/Library/Application Support/FluidAudio/Models/`
+        // — hardcoded by the SDK and not configurable via API. Earlier
+        // versions of this file polled `~/.cache/fluidaudio/Models/`
+        // which never existed, so the progress percentage stayed at
+        // nil indefinitely and the UI fell back to the indeterminate
+        // spinner. Now centralized so any future SDK API change for
+        // path overrides only needs to be applied in one place.
+        let cacheDir = FluidAudioBackend.fluidAudioCacheDirectory()
+
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 500_000_000)  // 500 ms
+            if Task.isCancelled { break }
+
+            // Re-stat the cache dir size each tick. Don't cache results
+            // — the file count and individual sizes change throughout
+            // the download as CoreML bundles get compiled in place.
+            let bytes = directorySize(at: cacheDir)
+            if bytes <= 0 { continue }
+
+            let fraction = Double(bytes) / Double(Self.fluidAudioExpectedTotalBytes)
+            await MainActor.run {
+                self.updateDownloadProgress(key, progress: fraction)
+            }
+        }
+    }
+
+    /// Recursively sum the file sizes under `directory`. Returns 0 if
+    /// the directory doesn't exist or is empty. Used by the FluidAudio
+    /// disk poller to compute download progress; could be reused for
+    /// any other backend that manages its own downloads.
+    ///
+    /// Errors from individual file stats are swallowed — partial
+    /// results are better than no results for a progress estimator.
+    private func directorySize(at directory: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            if values?.isRegularFile == true, let size = values?.fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
     }
 
     /// Shared scaffolding for the four `downloadXModel` methods. Sets status
@@ -483,7 +746,7 @@ final class ModelDownloadManager: ObservableObject {
     }
 
     /// Tick once per second to refresh the elapsed-time label. The
-    /// `ModelStatus.downloading(startedAt:)` payload doesn't change on
+    /// `ModelStatus.downloading(startedAt:progress:)` payload doesn't change on
     /// its own, but SwiftUI only re-renders when `@Published` actually
     /// publishes. So we re-publish the same value once a second so the
     /// view recomputes `status.label` and the timer text advances.
@@ -531,8 +794,15 @@ final class ModelDownloadManager: ObservableObject {
                 let stillRunning: Bool = await MainActor.run { [weak self] in
                     guard let self else { return false }
                     switch self.statuses[key] {
-                    case .downloading(let s):
-                        self.statuses[key] = .downloading(startedAt: s)
+                    case .downloading(let s, let p):
+                        // Preserve the latest known progress when
+                        // re-publishing. The progress value is updated
+                        // independently from this ticker by the URL
+                        // session delegate (R2 mirror path) or the
+                        // FluidAudio disk poller; this ticker's only
+                        // job is to wake SwiftUI so the elapsed-time
+                        // portion of the label advances.
+                        self.statuses[key] = .downloading(startedAt: s, progress: p)
                         return true
                     case .loading(let s):
                         self.statuses[key] = .loading(startedAt: s)
@@ -608,27 +878,48 @@ final class ModelDownloadManager: ObservableObject {
 
     /// Look up the R2 mirror for a given model key, or nil if no mirror
     /// is configured for it. The extract-to paths match where each
-    /// backend looks for its local cache:
+    /// backend looks for its local cache, all rooted under the
+    /// unified models root (`~/Library/Application Support/StreamScribe/Models/`):
     ///
-    /// - WhisperKit: `~/Documents/huggingface/models/argmaxinc/whisperkit-coreml/<modelName>/`
-    /// - SpeakerKit: `~/Documents/huggingface/models/argmaxinc/speakerkit-coreml/`
-    /// - Parakeet / Sortformer: `~/Documents/huggingface/hub/mlx-audio/<org>_<name>/`
+    /// - WhisperKit: `<root>/huggingface/models/argmaxinc/whisperkit-coreml/<modelName>/`
+    /// - SpeakerKit: `<root>/huggingface/models/argmaxinc/speakerkit-coreml/`
+    /// - Parakeet / Sortformer: `<root>/huggingface/hub/mlx-audio/<org>_<name>/`
     ///   (mlx-audio-swift's empirically-observed cache convention — note
     ///   the underscore separator between org and name, not HF Hub's
     ///   `--` separator. See `ParakeetBackend.cacheCandidatePaths` for
     ///   the full provenance.)
+    /// - FluidAudio: `<root>/fluidaudio/` (with a symlink from
+    ///   `~/Library/Application Support/FluidAudio/Models/` pointing
+    ///   here, set up at app launch by
+    ///   `StreamScribeApp.setupFluidAudioSymlink()`)
     ///
     /// Returns nil if `mirrorBaseURL` is left at the placeholder, which
     /// effectively disables the fallback. To enable mirrors, replace
     /// the placeholder with your actual bucket URL.
+    /// Compute the StreamScribe models root: `~/Library/Application
+    /// Support/StreamScribe/Models/`. Matches the path set up by
+    /// `StreamScribeApp.setupUnifiedModelsRoot()` — both functions
+    /// MUST stay in sync (any future change should be made in both
+    /// places, or refactored into a shared utility).
+    ///
+    /// Returns nil if Application Support isn't reachable, which
+    /// shouldn't happen in practice on a normally-functioning macOS
+    /// install. Mirror lookup falls back to nil in that case, which
+    /// disables R2 mirrors for the session — HF fallback still works.
+    private static func streamScribeModelsRoot() -> URL? {
+        FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first?
+            .appendingPathComponent("StreamScribe")
+            .appendingPathComponent("Models")
+    }
+
     private static func mirror(for key: ModelKey) -> ModelMirror? {
         guard !mirrorBaseURL.contains("REPLACE-ME") else { return nil }
         guard let base = URL(string: mirrorBaseURL) else { return nil }
-        let fm = FileManager.default
-        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let hfRoot = docs.appendingPathComponent("huggingface")
+        guard let modelsRoot = streamScribeModelsRoot() else { return nil }
+        let hfRoot = modelsRoot.appendingPathComponent("huggingface")
 
         switch key {
         case .whisper(let modelName):
@@ -680,6 +971,43 @@ final class ModelDownloadManager: ObservableObject {
                     .appendingPathComponent("mlx-audio")
                     .appendingPathComponent("\(org)_\(name)")
             )
+
+        case .fluidAudio:
+            // FluidAudio's CoreML bundles are R2-mirrored as a single
+            // tarball (`fluidaudio.tar.gz`) containing the SDK's
+            // expected `Models/` layout — pyannote segmentation +
+            // embedding bundles under `speaker-diarization-coreml/`,
+            // the LS-EEND bundle under `ls-eend-coreml/`, etc.
+            //
+            // **Extract destination.** `<root>/fluidaudio/`, which is
+            // also the symlink target set up by
+            // `StreamScribeApp.setupFluidAudioSymlink()`. The
+            // hardcoded SDK path
+            // `~/Library/Application Support/FluidAudio/Models/` is a
+            // symlink to here, so files written via this mirror are
+            // automatically findable by the SDK without any
+            // additional configuration on its side.
+            //
+            // **Tarball production.** One-time user setup: run the
+            // app once with default HF download to populate
+            // FluidAudio's models, then `tar -czf fluidaudio.tar.gz
+            // *` from inside the populated Models directory and
+            // upload to R2. The archive's relative paths should
+            // place entries at `speaker-diarization-coreml/...` and
+            // `ls-eend-coreml/...` at the archive root so extraction
+            // lands them correctly under `<root>/fluidaudio/`.
+            //
+            // **Fallback to HF.** If this R2 mirror fails (tarball
+            // missing, network error, decode failure), `runDownload`
+            // catches the error and falls through to the closure
+            // that calls `FluidAudioBackend.prepare()` — which uses
+            // FluidAudio's own HF-based download. The disk-poll
+            // progress task started in `downloadFluidAudioModel`
+            // covers that fallback path with approximate progress.
+            return ModelMirror(
+                url: base.appendingPathComponent("fluidaudio.tar.gz"),
+                extractTo: modelsRoot.appendingPathComponent("fluidaudio")
+            )
         }
     }
 
@@ -709,18 +1037,29 @@ final class ModelDownloadManager: ObservableObject {
     private func downloadAndExtractMirror(key: ModelKey, mirror: ModelMirror) async throws {
         print("[ModelDownload] \(key.logTag): downloading mirror archive from \(mirror.url.absoluteString)")
 
-        // Step 1: download to a temp file. URLSession.download writes
-        // directly to disk; we move the temp file aside immediately so
-        // it doesn't get swept by the URL loading system's cleanup.
-        let (downloadedURL, response) = try await URLSession.shared.download(from: mirror.url)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw NSError(
-                domain: "ModelDownloadManager",
-                code: code,
-                userInfo: [NSLocalizedDescriptionKey: "mirror returned HTTP \(code)"]
-            )
-        }
+        // Step 1: download to a temp file with per-byte progress.
+        //
+        // Uses `MirrorDownloader` (a `URLSessionDownloadDelegate` wrapper)
+        // instead of `URLSession.shared.download(from:)` so we get
+        // `didWriteData(totalBytesWritten:totalBytesExpectedToWrite:)`
+        // callbacks during the transfer. R2 always sends `Content-Length`
+        // for static objects, so `totalBytesExpectedToWrite` is the real
+        // archive size — no separate HEAD request needed.
+        //
+        // The progress callback updates `statuses[key]` on MainActor
+        // (hop inside the closure) so SwiftUI sees the fraction tick
+        // up in real time, and the "Downloading… 0:37 (42%)" label
+        // takes shape within a few hundred ms of the first chunk
+        // arriving.
+        let downloadedURL = try await MirrorDownloader.download(
+            from: mirror.url,
+            onProgress: { [weak self] fraction in
+                guard let self else { return }
+                Task { @MainActor in
+                    self.updateDownloadProgress(key, progress: fraction)
+                }
+            }
+        )
 
         // Move the temp file to a stable temp path before the cleanup
         // hook fires. Pure paranoia — the file URL we got back from
@@ -899,5 +1238,177 @@ final class ModelDownloadManager: ObservableObject {
             print("[ModelDownload] \(key.logTag): \(msg)")
             await markError(key, message: msg)
         }
+    }
+}
+
+// MARK: - MirrorDownloader
+
+/// `URLSessionDownloadDelegate`-based downloader with per-byte progress
+/// reporting. Drop-in replacement for `URLSession.shared.download(from:)`
+/// — same shape (URL in, file URL out, throws on failure), but with a
+/// progress callback that fires whenever URLSession delivers a chunk.
+///
+/// **Why a one-shot delegate instance per download.** Each download
+/// gets its own `URLSession` configured with this delegate as its
+/// delegate. The session is invalidated in `urlSession(_:didBecomeInvalidWithError:)`
+/// or in `finish(...)`, breaking the retain cycle that would otherwise
+/// leak the session, delegate, continuation, and any captured callback
+/// state. This is the recommended Apple pattern — `URLSession`'s
+/// delegate-based init was designed for short-lived sessions.
+///
+/// **Continuation semantics.** Resumed exactly once: either from
+/// `didFinishDownloadingTo` (success) or `didCompleteWithError`
+/// (failure). The `finished` flag guards against the rare case
+/// where both fire (e.g. cancellation racing with completion).
+///
+/// **File lifetime.** The temp file URL we get from
+/// `didFinishDownloadingTo` is only valid until that delegate method
+/// returns. We move it to a stable location inline, then resume the
+/// continuation with the new URL. The caller is responsible for
+/// deleting the moved file.
+private final class MirrorDownloader: NSObject, URLSessionDownloadDelegate {
+
+    /// Download a file from `url`, reporting progress via `onProgress`
+    /// (called on URLSession's background queue, not necessarily main).
+    /// Returns the URL of a temp file containing the downloaded bytes;
+    /// the caller is responsible for moving/deleting it.
+    ///
+    /// Throws on non-2xx HTTP status, transport errors, or cancellation.
+    static func download(
+        from url: URL,
+        onProgress: @escaping (Double) -> Void
+    ) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            let downloader = MirrorDownloader(onProgress: onProgress, continuation: continuation)
+            // Default config (no caching, no cookie store needed) is
+            // fine for one-shot large-file downloads from a public CDN.
+            let session = URLSession(
+                configuration: .default,
+                delegate: downloader,
+                delegateQueue: nil
+            )
+            downloader.session = session
+            let task = session.downloadTask(with: url)
+            task.resume()
+        }
+    }
+
+    private let onProgress: (Double) -> Void
+    private var continuation: CheckedContinuation<URL, Error>?
+    /// Captured so we can invalidate the session in `finish` — breaking
+    /// the URLSession → delegate retain cycle that would otherwise keep
+    /// this instance alive forever.
+    fileprivate var session: URLSession?
+    /// Guard against double-resume on the continuation. URLSession
+    /// occasionally fires both `didFinishDownloadingTo` and
+    /// `didCompleteWithError(nil)` for the same task; without this
+    /// guard, the second call would crash with a "continuation
+    /// resumed twice" trap.
+    private var finished = false
+
+    private init(
+        onProgress: @escaping (Double) -> Void,
+        continuation: CheckedContinuation<URL, Error>
+    ) {
+        self.onProgress = onProgress
+        self.continuation = continuation
+        super.init()
+    }
+
+    // MARK: URLSessionDownloadDelegate
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        // `totalBytesExpectedToWrite` is `-1` (NSURLSessionTransferSizeUnknown)
+        // when the server doesn't send Content-Length. R2 always sends
+        // it, but we guard anyway — if we ever point this at a server
+        // that doesn't, we silently skip the progress update for that
+        // chunk rather than reporting a bogus fraction.
+        guard totalBytesExpectedToWrite > 0 else { return }
+        let fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        onProgress(fraction)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        // The temp file at `location` is only valid until this delegate
+        // method returns. Move it to a stable temp path inline before
+        // resuming the continuation so the caller has time to do
+        // whatever (move it again, extract it, etc.).
+        //
+        // We use a UUID-named file rather than letting URLSession's
+        // own temp name leak — the URLSession path is opaque and the
+        // caller may want a friendlier name for logging.
+        let stable = FileManager.default.temporaryDirectory
+            .appendingPathComponent("streamscribe-download-\(UUID().uuidString)")
+        do {
+            try FileManager.default.moveItem(at: location, to: stable)
+
+            // Validate HTTP status before declaring success. A 4xx or
+            // 5xx body could have been written to disk as a "downloaded
+            // file" containing an error page — we don't want the caller
+            // to try to extract that as if it were a tarball.
+            if let http = downloadTask.response as? HTTPURLResponse,
+               !(200..<300).contains(http.statusCode) {
+                try? FileManager.default.removeItem(at: stable)
+                finish(throwing: NSError(
+                    domain: "MirrorDownloader",
+                    code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode) from mirror"]
+                ))
+                return
+            }
+
+            finish(returning: stable)
+        } catch {
+            finish(throwing: error)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        // Only fire the error path here; success path was already
+        // handled in `didFinishDownloadingTo`. If `error == nil` and
+        // we haven't finished yet, it means the task completed
+        // without a finished-download callback (e.g. cancellation
+        // before any data arrived) — treat as a generic failure.
+        if let error {
+            finish(throwing: error)
+        } else if !finished {
+            finish(throwing: NSError(
+                domain: "MirrorDownloader",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "download completed without producing a file"]
+            ))
+        }
+    }
+
+    // MARK: Continuation plumbing
+
+    private func finish(returning url: URL) {
+        guard !finished else { return }
+        finished = true
+        continuation?.resume(returning: url)
+        continuation = nil
+        session?.finishTasksAndInvalidate()
+    }
+
+    private func finish(throwing error: Error) {
+        guard !finished else { return }
+        finished = true
+        continuation?.resume(throwing: error)
+        continuation = nil
+        session?.finishTasksAndInvalidate()
     }
 }

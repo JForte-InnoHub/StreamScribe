@@ -53,6 +53,22 @@ import WebKit
 @MainActor
 final class SenateGovBrowserExtractor: NSObject {
 
+    /// Result of a successful extraction. Returned by `resolve()` when
+    /// the page loads and the JavaScript shim observes an m3u8 URL on
+    /// senate.gov's CDN.
+    ///
+    /// `pageTitle` is best-effort — read from `WKWebView.title` at the
+    /// moment we capture the m3u8 URL. Title is populated from the
+    /// `<title>` tag during HTML parsing, which typically completes
+    /// before the page's JavaScript runs and requests the m3u8 — so
+    /// by the time we capture the URL, the title is almost always
+    /// available. Nil if the page is unusually fast to JS-load or
+    /// the `<title>` tag is empty.
+    struct ExtractionResult {
+        let m3u8URL: URL
+        let pageTitle: String?
+    }
+
     /// Resolve a senate.gov hearing page URL to its m3u8 stream URL.
     /// Returns nil if no stream URL is observed within `timeout` seconds.
     ///
@@ -60,8 +76,8 @@ final class SenateGovBrowserExtractor: NSObject {
     /// playback — it's the actual master playlist URL the page's
     /// player would load, not a synthesized URL from a committee
     /// mapping table.
-    static func resolve(pageURL: URL, timeout: TimeInterval = 10) async -> URL? {
-        await withCheckedContinuation { (continuation: CheckedContinuation<URL?, Never>) in
+    static func resolve(pageURL: URL, timeout: TimeInterval = 10) async -> ExtractionResult? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<ExtractionResult?, Never>) in
             Task { @MainActor in
                 let extractor = SenateGovBrowserExtractor()
                 extractor.start(pageURL: pageURL, timeout: timeout) { result in
@@ -74,13 +90,13 @@ final class SenateGovBrowserExtractor: NSObject {
     // MARK: - Instance state
 
     private var webView: WKWebView?
-    private var completion: ((URL?) -> Void)?
+    private var completion: ((ExtractionResult?) -> Void)?
     private var timeoutTask: Task<Void, Never>?
     private var finished = false
 
     private override init() { super.init() }
 
-    private func start(pageURL: URL, timeout: TimeInterval, completion: @escaping (URL?) -> Void) {
+    private func start(pageURL: URL, timeout: TimeInterval, completion: @escaping (ExtractionResult?) -> Void) {
         self.completion = completion
 
         let config = WKWebViewConfiguration()
@@ -120,7 +136,7 @@ final class SenateGovBrowserExtractor: NSObject {
             await MainActor.run {
                 guard let self, !self.finished else { return }
                 print("[SenateGovBrowser] Timeout after \(Int(timeout))s waiting for m3u8 URL — page may have failed to load or doesn't fetch an m3u8.")
-                self.finish(url: nil)
+                self.finish(result: nil)
             }
         }
 
@@ -134,7 +150,7 @@ final class SenateGovBrowserExtractor: NSObject {
 
     /// Finish the extraction, deliver the result, and tear down. Idempotent
     /// (only the first call delivers the result; subsequent calls no-op).
-    private func finish(url: URL?) {
+    private func finish(result: ExtractionResult?) {
         guard !finished else { return }
         finished = true
         timeoutTask?.cancel()
@@ -148,7 +164,7 @@ final class SenateGovBrowserExtractor: NSObject {
 
         let cb = completion
         completion = nil
-        cb?(url)
+        cb?(result)
     }
 
     // MARK: - The injected JavaScript
@@ -240,8 +256,21 @@ extension SenateGovBrowserExtractor: WKScriptMessageHandler {
 
         Task { @MainActor [weak self] in
             guard let self, !self.finished else { return }
-            print("[SenateGovBrowser] Captured m3u8 URL: \(url.absoluteString)")
-            self.finish(url: url)
+            // Capture the page title from WKWebView at the same moment
+            // we capture the m3u8 URL. By this point HTML parsing has
+            // completed enough that the <title> tag has been read into
+            // `WKWebView.title` — the property is updated synchronously
+            // during parse, well before JS-triggered subresource loads
+            // like the m3u8 fetch we're observing here.
+            //
+            // Normalize empty strings to nil so downstream "if let title"
+            // checks behave naturally; pages with literally empty
+            // <title></title> get treated the same as "no title found."
+            let rawTitle = self.webView?.title
+            let pageTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
+
+            print("[SenateGovBrowser] Captured m3u8 URL: \(url.absoluteString)\(pageTitle.map { " — title: \"\($0)\"" } ?? "")")
+            self.finish(result: ExtractionResult(m3u8URL: url, pageTitle: pageTitle))
         }
     }
 }
@@ -253,7 +282,7 @@ extension SenateGovBrowserExtractor: WKNavigationDelegate {
         Task { @MainActor [weak self] in
             guard let self, !self.finished else { return }
             print("[SenateGovBrowser] Page load failed: \(error.localizedDescription)")
-            self.finish(url: nil)
+            self.finish(result: nil)
         }
     }
 
@@ -261,7 +290,7 @@ extension SenateGovBrowserExtractor: WKNavigationDelegate {
         Task { @MainActor [weak self] in
             guard let self, !self.finished else { return }
             print("[SenateGovBrowser] Page provisional load failed: \(error.localizedDescription)")
-            self.finish(url: nil)
+            self.finish(result: nil)
         }
     }
 }

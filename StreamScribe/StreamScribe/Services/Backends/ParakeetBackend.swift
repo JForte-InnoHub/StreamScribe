@@ -222,8 +222,20 @@ actor ParakeetBackend: TranscriptionBackend {
         let outChars = finalSegments.reduce(0) { $0 + $1.text.count }
         print("[Parakeet] #\(callNum) emit: \(finalSegments.count) segment(s), \(outChars) char(s) (pre-dedup=\(preDedupCount), dedup=\(dedupAction))")
 
+        // Apply PnC restoration as the last step before returning. The
+        // mlx-audio port of Parakeet TDT 0.6B v3 produces lowercase
+        // unpunctuated text despite NVIDIA's original model card
+        // claiming PnC support — see `PnCRestorer` for the full story.
+        // Failure to restore (model unavailable, generation error,
+        // suspicious length mismatch) falls back to original text per
+        // segment, so this can never cause an empty or broken result.
+        // We restore AFTER updating `recentTailText` above so the
+        // dedup tail keeps matching against raw lowercase content
+        // (matching what subsequent chunks emit pre-restoration).
+        let segmentsToReturn = await Self.restorePnCIfEnabled(in: finalSegments, callNum: callNum)
+
         return TranscriptionResult(
-            segments: finalSegments,
+            segments: segmentsToReturn,
             detectedLanguage: output.language
         )
     }
@@ -307,6 +319,97 @@ actor ParakeetBackend: TranscriptionBackend {
         let lastEnd = kept.last!.rangeInOriginal.upperBound
         return String(s[first.rangeInOriginal.lowerBound..<lastEnd])
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - PnC restoration
+
+    /// UserDefaults key controlling Parakeet PnC restoration. **Default
+    /// OFF** as of the TDT-CTC 1.1B default — that model produces PnC
+    /// natively, so post-processing isn't needed. The toggle remains for
+    /// users on the 0.6B v3 fallback who want to restore PnC via Apple's
+    /// Foundation Model.
+    static let pncRestorationDefaultsKey = "parakeet.pncRestoration"
+
+    /// Whether PnC restoration is enabled for Parakeet output.
+    ///
+    /// **Defaults to false** because the current default Parakeet model
+    /// (TDT-CTC 1.1B) produces native PnC via its CTC head — running
+    /// the Foundation Model on top adds latency and provides no benefit.
+    ///
+    /// History: this default was previously `true` because the prior
+    /// default model (TDT 0.6B v3) loses its PnC tokens during MLX
+    /// conversion. We unblocked TDT-CTC 1.1B loading by patching
+    /// `JForte-InnoHub/mlx-audio-swift` (the `rel_pos_local_attn`
+    /// attention-class match — see TranscriptionEngine.swift's
+    /// `defaultParakeetModel` doc), made it the default, and flipped
+    /// this default off.
+    ///
+    /// Users who switch back to the 0.6B v3 model and want PnC should
+    /// flip the Settings toggle on. The inline availability indicator
+    /// under the toggle tells them whether the Foundation Model is
+    /// actually reachable on their machine (macOS 26+, Apple Intelligence
+    /// enabled, model downloaded).
+    ///
+    /// Must stay in sync with SettingsView's `@AppStorage` default for
+    /// the same key — both sides read `parakeet.pncRestoration` and
+    /// must agree on the unset-value fallback.
+    private static var pncRestorationEnabled: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: pncRestorationDefaultsKey) == nil {
+            return false
+        }
+        return defaults.bool(forKey: pncRestorationDefaultsKey)
+    }
+
+    /// Apply PnC restoration to each segment's text, returning a new
+    /// array with restored text and identical timestamps/speakers.
+    /// No-ops (returns input unchanged) when:
+    ///   - User has disabled the setting
+    ///   - PnCRestorer reports unavailable (older macOS, AI not enabled,
+    ///     model still downloading)
+    ///   - Segments array is empty
+    ///
+    /// Per-segment failures inside `PnCRestorer.restore` fall back to
+    /// the original text, so a partial failure produces a partially-
+    /// restored result (the segments that succeeded keep their PnC,
+    /// the ones that failed stay raw) — better than throwing the
+    /// whole batch out.
+    ///
+    /// Serial rather than parallel: while the Foundation Model can in
+    /// theory handle concurrent sessions, in practice the inference
+    /// engine serializes through the Neural Engine anyway, and serial
+    /// processing keeps the log output sane during debugging.
+    private static func restorePnCIfEnabled(in segments: [TranscriptSegment], callNum: Int) async -> [TranscriptSegment] {
+        guard pncRestorationEnabled else { return segments }
+
+        // Availability gate. The most common reason this silently fails
+        // is Apple Intelligence not being enabled in System Settings —
+        // the user turns on the PnC toggle in Settings, sees raw output,
+        // and has no idea why. Log clearly on the first chunk of every
+        // session so the reason is visible in diagnostics. Throttled to
+        // callNum == 1 to avoid spamming the log for every chunk in a
+        // long session (the state doesn't change mid-session anyway).
+        let avail = PnCRestorer.shared.availability
+        guard avail.isAvailable else {
+            if callNum == 1, case .unavailable(let reason) = avail {
+                print("[Parakeet] #1 PnC restoration is ENABLED but Foundation Model is unavailable: \(reason)")
+            }
+            return segments
+        }
+
+        guard !segments.isEmpty else { return segments }
+
+        let restoreStart = Date()
+        var restored: [TranscriptSegment] = []
+        restored.reserveCapacity(segments.count)
+        for var seg in segments {
+            let newText = await PnCRestorer.shared.restore(seg.text)
+            seg.text = newText
+            restored.append(seg)
+        }
+        let elapsed = Date().timeIntervalSince(restoreStart)
+        print(String(format: "[Parakeet] #%d PnC restoration: %d segment(s) in %.2fs", callNum, segments.count, elapsed))
+        return restored
     }
 
     /// Fuzzy boundary trim: if `newText` begins with content that matches the tail

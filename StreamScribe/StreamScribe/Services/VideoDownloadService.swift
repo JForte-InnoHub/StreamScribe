@@ -145,29 +145,55 @@ final class VideoDownloadService: ObservableObject {
     /// file to the user's chosen destination. Same idiom as the
     /// audio path.
     nonisolated private func performDownload(from sourceURL: URL, to destinationURL: URL) async throws {
-        let tools = try await AudioStreamExtractor.resolveYTDlpTools()
+        // Route by source type. yt-dlp is the workhorse for most
+        // platforms (YouTube, Twitter, Instagram, Threads, etc.)
+        // because it handles their platform-specific format
+        // negotiation and JS challenges. Critical Mention doesn't
+        // have a yt-dlp extractor — we resolve it via our own
+        // WebKit-based extractor and download the HLS stream
+        // directly via ffmpeg, mirroring the transcription path's
+        // approach.
+        let ffmpegPath = try AudioStreamExtractor.requireFFmpegPath()
 
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("streamscribe-vid-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
-        let baseFilename = "video"
-        let outputTemplate = tempDir.appendingPathComponent("\(baseFilename).%(ext)s").path
-
-        // Run yt-dlp, capture the post-rename path, then move to
-        // destination. Wrap in a defer that cleans up the temp dir
-        // regardless of outcome — so cancelled or failed downloads
-        // don't leak temp files.
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        let downloadedPath = try await runYTDlp(
-            sourceURL: sourceURL,
-            outputTemplate: outputTemplate,
-            tempDir: tempDir,
-            tools: tools
-        )
+        let source = StreamSource.detect(from: sourceURL)
+        let downloadedPath: String
+
+        if source == .criticalMention {
+            // Critical Mention flow: resolve SPA page → signed HLS URL
+            // → ffmpeg copies the stream to disk. ffmpeg reads the
+            // m3u8, downloads segments in order, and remuxes to mp4
+            // without re-encoding — same bit-exact copy semantics as
+            // yt-dlp would provide, but via a path that doesn't
+            // depend on yt-dlp knowing about the source.
+            await MainActor.run {
+                self.statusText = "Resolving Critical Mention clip…"
+            }
+            let resolved = try await CriticalMentionExtractor.resolve(url: sourceURL)
+            downloadedPath = try await runFFmpegHLSDownload(
+                streamURL: resolved.m3u8URL,
+                tempDir: tempDir,
+                ffmpegPath: ffmpegPath
+            )
+        } else {
+            // yt-dlp flow for all other sources.
+            let tools = try await AudioStreamExtractor.resolveYTDlpTools()
+            let outputTemplate = tempDir.appendingPathComponent("video.%(ext)s").path
+            downloadedPath = try await runYTDlp(
+                sourceURL: sourceURL,
+                outputTemplate: outputTemplate,
+                tempDir: tempDir,
+                ffmpegPath: ffmpegPath,
+                tools: tools
+            )
+        }
 
         let downloadedURL = URL(fileURLWithPath: downloadedPath)
 
@@ -191,6 +217,152 @@ final class VideoDownloadService: ObservableObject {
         }
     }
 
+    /// Download an HLS stream via ffmpeg. Used for Critical Mention
+    /// clips (and potentially any other future source whose stream
+    /// URL we know but yt-dlp doesn't handle). Emits mp4 with copied
+    /// codecs — no re-encoding, so the resulting file is bit-identical
+    /// to what the CDN served, just remuxed to a container that plays
+    /// in QuickTime and other standard apps.
+    ///
+    /// **Progress reporting.** ffmpeg's stderr emits `time=HH:MM:SS.mm`
+    /// lines during processing. We parse those and divide by the
+    /// total duration (probed from the m3u8 manifest) to derive a
+    /// fraction. Without a known total we can't display a percentage
+    /// — the status stays at "Downloading…" until completion.
+    nonisolated private func runFFmpegHLSDownload(
+        streamURL: URL,
+        tempDir: URL,
+        ffmpegPath: String
+    ) async throws -> String {
+        let outputPath = tempDir.appendingPathComponent("video.mp4").path
+
+        // Optionally probe total duration up front so we can compute
+        // progress percentages. If the probe fails, we still proceed
+        // — the download works either way, just without a % display.
+        let totalDurationSeconds: Double? = await {
+            let result = await TranscriptionEngine.probeRemoteDurationViaFFmpeg(url: streamURL)
+            if case .finite(let s) = result { return s }
+            return nil
+        }()
+
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            let process = Process()
+            let errPipe = Pipe()
+
+            process.executableURL = URL(fileURLWithPath: ffmpegPath)
+            process.currentDirectoryURL = tempDir
+
+            // ffmpeg args:
+            //   -i <url>           input HLS manifest
+            //   -c copy            no re-encoding; remux codecs as-is
+            //   -bsf:a aac_adtstoasc  ADTS → ASC audio bitstream conversion,
+            //                        needed when muxing AAC into mp4
+            //                        (HLS commonly delivers AAC as ADTS)
+            //   -y                 overwrite output without prompting
+            //   -progress pipe:2   emit machine-readable progress to stderr
+            //   -nostats           suppress the human-readable progress
+            //                     (would interleave with -progress output)
+            //   -loglevel warning  quiet the info-level chatter but keep
+            //                     warnings + errors
+            process.arguments = [
+                "-i", streamURL.absoluteString,
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                "-y",
+                "-progress", "pipe:2",
+                "-nostats",
+                "-loglevel", "warning",
+                outputPath
+            ]
+
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = errPipe
+
+            // Parse `out_time_ms=N` progress lines to update
+            // percentage. `-progress pipe:2` emits key=value pairs
+            // one per line; `out_time_ms` is the current position in
+            // microseconds (not millis, despite the name — ffmpeg's
+            // naming is historical).
+            errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty,
+                      let text = String(data: data, encoding: .utf8) else {
+                    return
+                }
+                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                    let lineStr = String(line).trimmingCharacters(in: .whitespaces)
+                    if lineStr.hasPrefix("out_time_ms=") {
+                        let value = lineStr.dropFirst("out_time_ms=".count)
+                        if let microseconds = Double(value), microseconds > 0 {
+                            let currentSeconds = microseconds / 1_000_000
+                            if let total = totalDurationSeconds, total > 0 {
+                                let fraction = min(1.0, currentSeconds / total)
+                                Task { @MainActor [weak self] in
+                                    self?.progress = fraction
+                                    self?.statusText = "Downloading… \(Int(fraction * 100))%"
+                                }
+                            } else {
+                                let mmss = String(
+                                    format: "%d:%02d",
+                                    Int(currentSeconds) / 60,
+                                    Int(currentSeconds) % 60
+                                )
+                                Task { @MainActor [weak self] in
+                                    self?.statusText = "Downloading… \(mmss)"
+                                }
+                            }
+                        }
+                    } else if !lineStr.isEmpty {
+                        // Warnings + errors that made it through
+                        // -loglevel warning. Log for diagnosis.
+                        print("[VideoDownload ffmpeg] \(lineStr)")
+                    }
+                }
+            }
+
+            process.terminationHandler = { proc in
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                let exitStatus = proc.terminationStatus
+                if proc.terminationReason == .uncaughtSignal {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                guard exitStatus == 0 else {
+                    let errText = String(
+                        data: errPipe.fileHandleForReading.readDataToEndOfFile(),
+                        encoding: .utf8
+                    ) ?? ""
+                    cont.resume(throwing: NSError(
+                        domain: "VideoDownload",
+                        code: Int(exitStatus),
+                        userInfo: [NSLocalizedDescriptionKey: "ffmpeg exited with code \(exitStatus): \(errText)"]
+                    ))
+                    return
+                }
+                cont.resume(returning: outputPath)
+            }
+
+            do {
+                try process.run()
+            } catch {
+                cont.resume(throwing: error)
+                return
+            }
+
+            // Cancellation → SIGTERM ffmpeg. Same polling pattern as
+            // the yt-dlp path.
+            Task {
+                while process.isRunning {
+                    if Task.isCancelled {
+                        process.terminate()
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+            }
+        }
+    }
+
     /// Run the yt-dlp subprocess with progress reporting. Returns
     /// the final post-rename filepath emitted by
     /// `--print after_move:filepath`.
@@ -198,6 +370,7 @@ final class VideoDownloadService: ObservableObject {
         sourceURL: URL,
         outputTemplate: String,
         tempDir: URL,
+        ffmpegPath: String,
         tools: (ytDlpPath: String, denoPath: String?, cookieBrowser: CookieBrowser, disableTLSCheck: Bool, childEnvironment: [String: String]?)
     ) async throws -> String {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
@@ -218,21 +391,76 @@ final class VideoDownloadService: ObservableObject {
             var args: [String] = []
             args.append(contentsOf: ["--ignore-config", "--no-mark-watched"])
 
-            // Cookies for sites that require login. Same tool config
-            // the rest of the app uses.
-            if let browserArg = tools.cookieBrowser.ytDlpArgument {
-                args.append(contentsOf: ["--cookies-from-browser", browserArg])
+            // JavaScript runtime for YouTube's n-parameter challenge.
+            // YouTube runs an obfuscated JS decryption on video URL
+            // parameters; without a JS runtime, yt-dlp emits the
+            // "n challenge solving failed: Some formats may be
+            // missing" warning and skips the formats that need
+            // decryption. Which is often ALL of them, producing
+            // "Requested format is not available" downstream.
+            //
+            // Passing `--js-runtimes deno:<path>` gives yt-dlp a
+            // sandboxed JavaScript engine to run the challenge in.
+            // ToolManager provides the deno binary on demand; if
+            // it's not installed, we omit the flag and yt-dlp falls
+            // back to whatever it can find on PATH (typically
+            // nothing on a packaged .app), producing the warning
+            // the user reported.
+            //
+            // Mirrors the setup in AudioStreamExtractor's download
+            // path — same tools tuple, same flag, same behavior.
+            if let denoPath = tools.denoPath {
+                args.append(contentsOf: ["--js-runtimes", "deno:\(denoPath)"])
             }
 
-            // No `-f` — let yt-dlp pick the best video+audio merge.
-            // For most platforms (YouTube, Vimeo, CNN, etc.) this is
-            // the highest-quality mp4. Users wanting a specific format
-            // can do that via yt-dlp directly; the app's job here is
-            // "just give me a good copy."
+            // Cookies for sites that require login. Session-cached —
+            // browser extraction on first invocation, cheap jar reads
+            // after. See ToolManager.sessionCookieArguments.
+            args.append(contentsOf: ToolManager.shared.sessionCookieArguments(
+                browserArg: tools.cookieBrowser.ytDlpArgument
+            ))
+
+            // **Format selector rationale (revised).** Original chain
+            // (`bv*+ba/best/…`) prioritized the video+audio merge
+            // (needs ffmpeg) as the primary tier. In practice, some
+            // YouTube videos have separated formats where `bv*+ba`
+            // parses correctly but the fallback logic doesn't kick in
+            // properly — yt-dlp reports "requested format is not
+            // available" even when a plain `best` single-file DOES
+            // exist. Reordering to try single-file FIRST sidesteps
+            // this: yt-dlp evaluates against the actual format list
+            // and finds a match on tier 1 for the common case.
+            //
+            //   1. `best` — best single-file with combined video+audio.
+            //      Works without ffmpeg. Most compatible. Gives ~360p
+            //      on YouTube (the highest quality that's still
+            //      shipped as a combined single file) — but reliably.
+            //   2. `bv*+ba` — best video + best audio, merged via
+            //      ffmpeg. HD content. Fires when tier 1 has no
+            //      single-file combined format (some past-broadcast
+            //      livestreams, some DASH-only uploads).
+            //   3. `bv*` — best video-only. Video without audio;
+            //      better than failing outright.
+            //   4. `wv*` — worst video-only. Guarantees we return
+            //      SOMETHING for videos with restrictive format
+            //      access.
+            //   5. `w` — worst overall. Absolute last resort.
+            //
+            // **`--ffmpeg-location` still passed.** Tier 2 (merge)
+            // needs it; keeping it always-on so tier 2 works when
+            // tier 1 falls through.
+            //
+            // **`--no-warnings` removed.** The original suppressed
+            // useful diagnostic output. yt-dlp warnings now flow to
+            // the log, where the user (or the diagnostic assistant)
+            // can see WHY a specific format request failed. The
+            // progress line parser skips warnings — they don't
+            // interfere with progress display.
             args.append(contentsOf: [
+                "--ffmpeg-location", ffmpegPath,
+                "-f", "best/bv*+ba/bv*/wv*/w",
                 "-o", outputTemplate,
                 "--print", "after_move:filepath",
-                "--no-warnings",
                 "--newline",   // progress lines on their own lines, easier to parse
                 sourceURL.absoluteString
             ])
@@ -270,8 +498,15 @@ final class VideoDownloadService: ObservableObject {
                         }
                     } else {
                         // Non-progress stderr line — log for debug.
-                        if lineStr.contains("ERROR") || lineStr.contains("WARNING") {
-                            print("[VideoDownload yt-dlp] \(lineStr)")
+                        // Previously we filtered to ERROR/WARNING but
+                        // that hid useful information (available-
+                        // formats hints, extractor negotiation, etc.).
+                        // Logging everything makes format failures
+                        // debuggable; the small volume during a normal
+                        // download is acceptable.
+                        let stripped = lineStr.trimmingCharacters(in: .whitespaces)
+                        if !stripped.isEmpty {
+                            print("[VideoDownload yt-dlp] \(stripped)")
                         }
                     }
                 }

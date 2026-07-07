@@ -8,6 +8,7 @@ struct SidebarView: View {
     @EnvironmentObject var toolManager: ToolManager
     @EnvironmentObject var modelDownloadManager: ModelDownloadManager
     @EnvironmentObject var notificationService: NotificationService
+    @ObservedObject private var videoDownloadService = VideoDownloadService.shared
     @Binding var urlInput: String
     let onStart: () -> Void
     let onStop: () -> Void
@@ -25,6 +26,14 @@ struct SidebarView: View {
     /// Pasting a comma- or newline-separated list is also supported — we split on
     /// commit so power users don't have to add chips one at a time.
     @State private var keywordDraft: String = ""
+
+    /// Buffer for the speaker-search field. Used to filter the
+    /// voiceprint template list shown as suggestions below the
+    /// field. Unlike the keyword draft, this string is NEVER
+    /// committed directly — only template names are added to
+    /// `engine.spottedSpeakers`, via the suggestion list, never via
+    /// free-form text entry.
+    @State private var speakerSearchDraft: String = ""
 
     /// One-shot flag: have we ever auto-paired Parakeet with Sortformer?
     /// The first time the user picks Parakeet as the transcription engine
@@ -51,6 +60,7 @@ struct SidebarView: View {
     @AppStorage("sidebar.expanded.diarization") private var diarizationEngineExpanded: Bool = true
     @AppStorage("sidebar.expanded.refinement") private var refinementExpanded: Bool = true
     @AppStorage("sidebar.expanded.keywords") private var keywordsExpanded: Bool = true
+    @AppStorage("sidebar.expanded.spotter") private var spotterExpanded: Bool = true
     @AppStorage("sidebar.expanded.status") private var statusExpanded: Bool = true
     @AppStorage("sidebar.expanded.tools") private var toolsExpanded: Bool = true
 
@@ -61,6 +71,20 @@ struct SidebarView: View {
     /// UserDefaults key the Debug menu binds to, so toggling the
     /// menu item flips this and re-renders the sidebar.
     @AppStorage("debug.forceShowRetryProbeButton") private var debugForceShowRetryProbeButton: Bool = false
+
+    /// "Show all models" toggle in Settings → Advanced. Default off:
+    /// the pickers show only the curated essential set
+    /// (`essentialWhisperModels` / `essentialParakeetModels` from
+    /// TranscriptionEngine). When on, every variant in
+    /// `availableWhisperModels` / `availableParakeetModels` shows up.
+    /// Persisted via @AppStorage so the choice survives launches.
+    ///
+    /// Always-on safety: regardless of this flag, if the currently-
+    /// selected model isn't in the essential list, the picker still
+    /// shows it (see the visibleWhisperModels/visibleParakeetModels
+    /// computeds below). That keeps users from losing their selection
+    /// mid-session if they toggled the flag.
+    @AppStorage("models.showAllModels") private var showAllModels: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -83,11 +107,12 @@ struct SidebarView: View {
                 VStack(alignment: .leading, spacing: 22) {
                     urlSection
                     modeSection
+                    statusSection
                     transcriptionEngineSection
                     diarizationEngineSection
                     refinementSection
                     keywordsSection
-                    statusSection
+                    speakerSpotterSection
                     toolsSection
                 }
                 .padding(20)
@@ -135,7 +160,40 @@ struct SidebarView: View {
                     .controlSize(.small)
                     .disabled(engine.state.isActive)
 
+                    // Download Video button. Visible when the probe
+                    // has classified the URL as static (a finite-
+                    // duration video, not a live stream) and the
+                    // engine is idle. The static-only restriction
+                    // matters because yt-dlp's HLS-live download
+                    // would never terminate — the user would need a
+                    // separate "record live stream" flow we don't
+                    // offer here.
+                    //
+                    // Clicking opens NSSavePanel defaulted to
+                    // ~/Downloads with the probed title as the
+                    // suggested filename. The download is fire-and-
+                    // forget; progress shows in the status row
+                    // below.
+                    if showDownloadButton {
+                        Button(action: downloadVideo) {
+                            Label("Download Video…", systemImage: "arrow.down.circle")
+                                .font(.system(size: 11))
+                        }
+                        .controlSize(.small)
+                        .disabled(engine.state.isActive || videoDownloadService.isDownloading)
+                    }
+
                     Spacer()
+                }
+
+                // Inline download progress / status. Renders only
+                // while a download is in progress, just finished, or
+                // failed — hidden when idle so the sidebar doesn't
+                // carry dead UI between downloads. Sits directly under
+                // the buttons so the progress feels attached to the
+                // action that started it.
+                if !videoDownloadService.statusText.isEmpty {
+                    videoDownloadStatusRow
                 }
 
                 // Title from the probe, shown above the source/duration line.
@@ -198,7 +256,7 @@ struct SidebarView: View {
                         return nil
                     }()
                     if let reason = probeFailureReason,
-                       liveDetectedSource.requiresYTDlp,
+                       (liveDetectedSource.requiresYTDlp || liveDetectedSource == .criticalMention),
                        !urlInput.trimmingCharacters(in: .whitespaces).isEmpty {
                         Button {
                             engine.beginProbe(for: urlInput)
@@ -233,6 +291,142 @@ struct SidebarView: View {
         }
         if panel.runModal() == .OK, let url = panel.url {
             urlInput = url.path
+        }
+    }
+
+    /// Show the Download Video button based on URL classification —
+    /// available immediately when the user pastes a URL, rather than
+    /// waiting for a probe to complete. `resolvedSessionMode` was the
+    /// wrong signal: it's only set inside `start()`, which means the
+    /// button would never appear until the user clicked Start (defeating
+    /// the point of a separate download flow).
+    ///
+    /// **Visibility rules:**
+    ///   - URL field must be non-empty
+    ///   - Must look like a URL (contain `://`), not a local file path
+    ///   - Source can't be `.hls` — bare HLS streams are usually live
+    ///     and would never terminate. Everything else (yt-dlp sources,
+    ///     direct audio, etc.) MIGHT be a live stream (YouTube can be
+    ///     either), but the vast majority aren't. If a user tries to
+    ///     download an active livestream, yt-dlp will error out with a
+    ///     clear message — acceptable failure mode vs. hiding the
+    ///     button entirely.
+    ///
+    /// The status text is intentionally NOT a gate here — we want the
+    /// button to remain visible during a download so users see why
+    /// it's disabled (download in progress).
+    private var showDownloadButton: Bool {
+        let trimmed = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard trimmed.contains("://") else { return false }
+        let source = liveDetectedSource
+        // Local files are already on disk, no download needed.
+        if source == .localFile { return false }
+        // Bare HLS streams are typically live — hide button to avoid
+        // encouraging a download that would never finish.
+        if source == .hls { return false }
+        return true
+    }
+
+    /// Inline status row for the in-flight (or just-completed) video
+    /// download. Renders the current `statusText`, a progress bar
+    /// while downloading, a cancel button while downloading, and a
+    /// dismiss "×" when finished/failed so the user can clear the
+    /// row before starting a new download.
+    private var videoDownloadStatusRow: some View {
+        HStack(spacing: 8) {
+            if videoDownloadService.isDownloading {
+                ProgressView(value: videoDownloadService.progress)
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    .frame(maxWidth: 80)
+            }
+            Text(videoDownloadService.statusText)
+                .font(.system(size: 10))
+                .foregroundStyle(videoDownloadService.lastError != nil ? .red : .secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            if videoDownloadService.isDownloading {
+                Button {
+                    videoDownloadService.cancel()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel download")
+            } else {
+                Button {
+                    videoDownloadService.clearStatus()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss")
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        )
+    }
+
+    /// Open NSSavePanel and kick off a download if confirmed.
+    ///
+    /// **Filename strategy** mirrors `ContentView.exportMedia`: use
+    /// the detected title (sanitized for filesystem-unsafe chars),
+    /// fall back to "Video" if no title is available, and default
+    /// to `.mp4` extension. The user can rename and change extension
+    /// in the panel; yt-dlp picks the actual container based on best-
+    /// quality source format, and we move-as-renamed to honor the
+    /// user's choice — see VideoDownloadService for the detail.
+    ///
+    /// **Default directory** is `~/Downloads/` per the standard macOS
+    /// expectation for "save downloaded content." If the user has
+    /// chosen a different directory in a previous Save panel during
+    /// this session, NSSavePanel remembers — which is good UX, we
+    /// don't fight it.
+    private func downloadVideo() {
+        let trimmed = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed) else { return }
+
+        let panel = NSSavePanel()
+        panel.title = "Download Video"
+        panel.canCreateDirectories = true
+
+        // Default to ~/Downloads. NSHomeDirectory respects sandboxing
+        // when the app is sandboxed; for an unsandboxed dev build it
+        // returns the real user home. Either way "~/Downloads" is
+        // what users expect for downloaded content.
+        let downloadsURL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Downloads", isDirectory: true)
+        panel.directoryURL = downloadsURL
+
+        // Sanitize the title for use as a filename. Same rules as
+        // ContentView.exportMedia's helper — strip path separators
+        // and control chars.
+        let rawTitle = engine.detectedTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title: String = {
+            guard let t = rawTitle, !t.isEmpty else { return "Video" }
+            let bad = CharacterSet(charactersIn: "/\\:").union(.controlCharacters)
+            return t.components(separatedBy: bad).joined(separator: " ")
+        }()
+        panel.nameFieldStringValue = "\(title).mp4"
+
+        if let mp4Type = UTType(filenameExtension: "mp4") {
+            panel.allowedContentTypes = [mp4Type]
+        }
+
+        panel.begin { response in
+            guard response == .OK, let destURL = panel.url else { return }
+            videoDownloadService.downloadVideo(from: url, to: destURL)
         }
     }
 
@@ -338,9 +532,15 @@ struct SidebarView: View {
         }
         // Local files default to Static even before the probe lands —
         // AVURLAsset is synchronous so probe completes nearly instantly.
+        // Senate.gov hearings are also Static by default — the vast
+        // majority of senate.gov ISVP content is archived (`type=arch`),
+        // and the SenateGovExtractor probe lands in ~500 ms-1 s so any
+        // mismatched preview here is short-lived. Defaulting senate.gov
+        // to Static avoids a brief "Live" flicker in the sidebar mode
+        // chip while the probe completes.
         switch liveDetectedSource {
-        case .localFile: return .static
-        default:         return .live
+        case .localFile, .senateGov: return .static
+        default:                     return .live
         }
     }
 
@@ -423,7 +623,7 @@ struct SidebarView: View {
                     // an explicit Group's closure).
                     Group {
                         Picker("", selection: $engine.whisperModelName) {
-                            ForEach(TranscriptionEngine.availableWhisperModels, id: \.self) { m in
+                            ForEach(visibleWhisperModels, id: \.self) { m in
                                 Text(whisperDisplayName(m)).tag(m)
                             }
                         }
@@ -458,7 +658,7 @@ struct SidebarView: View {
                 case .parakeet:
                     Group {
                         Picker("", selection: $engine.parakeetModelName) {
-                            ForEach(TranscriptionEngine.availableParakeetModels, id: \.self) { m in
+                            ForEach(visibleParakeetModels, id: \.self) { m in
                                 Text(parakeetDisplayName(m)).tag(m)
                             }
                         }
@@ -545,6 +745,13 @@ struct SidebarView: View {
                     key: .sortformer,
                     downloadAction: {
                         Task { await modelDownloadManager.downloadSortformerModel() }
+                    }
+                )
+            case .fluidAudio:
+                modelStatusRow(
+                    key: .fluidAudio,
+                    downloadAction: {
+                        Task { await modelDownloadManager.downloadFluidAudioModel() }
                     }
                 )
             }
@@ -651,19 +858,15 @@ struct SidebarView: View {
                         .fixedSize()
                     }
 
-                    // The refined engine reuses whichever model and language
-                    // settings are stored for that engine kind (e.g.
-                    // `whisperModelName`, `selectedLanguageCode`). Today the
-                    // top-level model/language pickers are scoped to the
-                    // currently-selected raw engine, so to change the refined
-                    // Whisper model the user has to temporarily switch the
-                    // top picker. Acceptable for first ship; the default
-                    // Whisper model (bundled) is the right answer for almost
-                    // all sessions.
-                    Text("The refined engine uses its own saved model and language settings — change them by temporarily switching the engine picker above.")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    // Refined-slot model picker. Independent from the raw
+                    // model — same engine kind can use different models
+                    // in the two slots (e.g. Whisper Medium raw + Large
+                    // v3 Turbo refined for an accuracy boost on the
+                    // refinement pass). When the engine kinds match
+                    // between slots, this picker just sits alongside the
+                    // raw one — the user can pick different models or
+                    // the same, both work.
+                    refinedModelPicker
 
                     // Surface the canonical-pair hint when the user picks the
                     // recommended combination, and a soft warning when they
@@ -702,15 +905,40 @@ struct SidebarView: View {
             // section, but its enablement uses a separate computed
             // property: live mode AND a diarizer is enabled AND no
             // session running. Refinement-on is NOT required.
+            //
+            // Engine picker: lets the user choose which diarization backend
+            // runs the whole-file pass. Defaults to SpeakerKit for
+            // backward compat. Independent of the live diarizer choice
+            // — a user can have Sortformer streaming for low-latency
+            // live labels and FluidAudio offline for the final relabel.
+            // `.off` is filtered out since "rediarize with nothing"
+            // would defeat the toggle's purpose.
             VStack(alignment: .leading, spacing: 6) {
                 Toggle(isOn: $engine.postFinishRediarizeEnabled) {
-                    Text("Re-diarize with SpeakerKit when finished")
+                    Text("Re-diarize when finished")
                         .font(.system(size: 11))
                 }
                 .toggleStyle(.switch)
                 .controlSize(.mini)
 
-                Text("After transcription ends, run a one-shot whole-file SpeakerKit pass and re-label every segment. Usually more accurate than the live (streaming) diarizer at the cost of holding the full audio in memory for the session (≈230 MB/hour).")
+                if engine.postFinishRediarizeEnabled {
+                    HStack {
+                        Text("Engine")
+                            .font(.system(size: 11))
+                        Spacer()
+                        Picker("", selection: $engine.rediarizeEngine) {
+                            ForEach(DiarizationEngineKind.allCases.filter { $0 != .off }) { kind in
+                                Text(kind.rawValue).tag(kind)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .controlSize(.small)
+                        .fixedSize()
+                    }
+                }
+
+                Text("After transcription ends, run a one-shot whole-file diarization pass using the selected engine and re-label every segment. Usually more accurate than the live (streaming) diarizer at the cost of holding the full audio in memory for the session (≈230 MB/hour).")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -758,6 +986,82 @@ struct SidebarView: View {
             }
             .disabled(!refinementParametersEnabled)
             .opacity(refinementParametersEnabled ? 1.0 : 0.5)
+            }
+        }
+    }
+
+    /// Refined-slot model picker. Used inside `refinementSection` when
+    /// split mode is on. Mirrors the raw-engine model picker structure
+    /// (same lists, same display names, same modelStatusRow per-row) but
+    /// binds against the engine's refined-slot model properties so the
+    /// two slots can independently hold different models.
+    ///
+    /// **Why a `@ViewBuilder` helper rather than inlining.** The switch
+    /// on `engine.refinedTranscriptionEngine` produces different picker
+    /// content per case (Whisper has language options, Parakeet has its
+    /// own model list). Pulling it out keeps the parent body compact and
+    /// matches the structure already used for the raw engine block.
+    @ViewBuilder
+    private var refinedModelPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Refined Model")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            switch engine.refinedTranscriptionEngine {
+            case .whisperKit:
+                Group {
+                    Picker("", selection: $engine.refinedWhisperModelName) {
+                        ForEach(visibleWhisperModels, id: \.self) { m in
+                            Text(whisperDisplayName(m)).tag(m)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .disabled(engine.state.isActive)
+
+                    // Status row for the refined-slot model. Mirrors the
+                    // raw picker's status row exactly — surfaces download
+                    // state for whichever model is selected here, with
+                    // its own prefetch button. This is critical because
+                    // the refined model may be different from the raw
+                    // one (the whole point of this feature) and the user
+                    // needs to be able to prefetch it independently.
+                    let currentRefinedWhisperModel = engine.refinedWhisperModelName
+                    modelStatusRow(
+                        key: .whisper(modelName: currentRefinedWhisperModel),
+                        downloadAction: {
+                            Task {
+                                await modelDownloadManager.downloadWhisperModel(
+                                    name: currentRefinedWhisperModel
+                                )
+                            }
+                        }
+                    )
+                }
+            case .parakeet:
+                Group {
+                    Picker("", selection: $engine.refinedParakeetModelName) {
+                        ForEach(visibleParakeetModels, id: \.self) { m in
+                            Text(parakeetDisplayName(m)).tag(m)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .disabled(engine.state.isActive)
+
+                    let currentRefinedParakeetModel = engine.refinedParakeetModelName
+                    modelStatusRow(
+                        key: .parakeet(modelRepo: currentRefinedParakeetModel),
+                        downloadAction: {
+                            Task {
+                                await modelDownloadManager.downloadParakeetModel(
+                                    repo: currentRefinedParakeetModel
+                                )
+                            }
+                        }
+                    )
+                }
             }
         }
     }
@@ -929,6 +1233,191 @@ struct SidebarView: View {
         case .authorized, .provisional, .ephemeral: return .secondary
         default: return Color.secondary.opacity(0.6)
         }
+    }
+
+    // MARK: - Speaker spotter
+
+    /// Sidebar block for the Speaker Spotter feature: notify the user
+    /// when a specific person (selected from voiceprint templates)
+    /// starts speaking during a live session.
+    ///
+    /// **Layout**:
+    ///   • search field (filters templates as you type)
+    ///   • suggestions list (visible when search text is non-empty;
+    ///     shows matching templates not yet in the spotted list)
+    ///   • chips of currently-spotted speakers (× to remove)
+    ///   • toggle: notify on hit (with auth status surfaced inline)
+    ///
+    /// **Selection-only semantics.** The search field never commits
+    /// directly — only template names from the suggestions list can
+    /// be added to `engine.spottedSpeakers`. Free-form text entry
+    /// is intentionally not supported because spotting works by
+    /// matching identified-segment names against template names;
+    /// adding a name that has no template would silently never
+    /// trigger.
+    private var speakerSpotterSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionHeader("Speaker Spotter", isExpanded: $spotterExpanded)
+            if spotterExpanded {
+
+                Text("Notify when these speakers start speaking.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Search field. Filters the suggestions list below.
+                // No Add button — entries can only come from the
+                // suggestions list, which enforces template-name
+                // validity.
+                TextField("Search voice templates…", text: $speakerSearchDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+
+                // Suggestions list. Visible when there's a search
+                // query AND we have matches (or "no matches" message).
+                // Hidden when the field is empty to keep the sidebar
+                // compact.
+                if !speakerSearchDraft.trimmingCharacters(in: .whitespaces).isEmpty {
+                    speakerSuggestionsList
+                }
+
+                // Selected speakers as chips. Same FlowLayout-based
+                // chips used by the keyword watcher — visual
+                // consistency between the two adjacent features.
+                if !engine.spottedSpeakers.isEmpty {
+                    KeywordChipFlow(
+                        keywords: engine.spottedSpeakers,
+                        onRemove: removeSpottedSpeaker
+                    )
+                }
+
+                Divider()
+                    .padding(.vertical, 2)
+
+                // Notify toggle + auth status indicator. Wired the
+                // same way as the keyword watcher's toggle: requesting
+                // notification authorization on opt-in rather than at
+                // first hit.
+                Toggle(isOn: $engine.notifyOnSpeakerHit) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Notify on hit")
+                            .font(.system(size: 12))
+                        Text(notificationStatusText)
+                            .font(.system(size: 10))
+                            .foregroundStyle(notificationStatusColor)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .onChange(of: engine.notifyOnSpeakerHit) { _, newValue in
+                    guard newValue else { return }
+                    Task {
+                        await notificationService.refreshAuthorizationStatus()
+                        if !notificationService.isAuthorized {
+                            await notificationService.requestAuthorization()
+                        }
+                    }
+                }
+
+                if engine.notifyOnSpeakerHit && !notificationService.isAuthorized {
+                    Text("Notifications won't be delivered. Enable StreamScribe in System Settings → Notifications.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// The filtered-templates suggestions list. Extracted so the main
+    /// section body stays readable.
+    ///
+    /// **Filter logic.** Case-insensitive substring match against
+    /// template names, with already-spotted templates excluded
+    /// (don't suggest adding the same speaker twice). Sorted
+    /// alphabetically — most useful for hearings where the user
+    /// scans a familiar list of senator names.
+    ///
+    /// **Capped at 8 visible rows** to prevent the sidebar from
+    /// growing unbounded with broad searches against a large
+    /// template library. The list IS scrollable past 8, but the
+    /// height cap keeps the other sections accessible.
+    @ViewBuilder
+    private var speakerSuggestionsList: some View {
+        let matches = filteredSpeakerTemplates
+        if matches.isEmpty {
+            Text("No matching templates")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(matches, id: \.id) { template in
+                        Button {
+                            addSpottedSpeaker(template.name)
+                        } label: {
+                            HStack {
+                                Text(template.name)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.primary)
+                                Spacer(minLength: 8)
+                                Image(systemName: "plus.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.vertical, 5)
+                            .padding(.horizontal, 8)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(maxHeight: 180)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+            )
+        }
+    }
+
+    /// Templates matching the current search query, excluding any
+    /// already in `engine.spottedSpeakers`, sorted alphabetically.
+    /// Recomputed on every render — cost is O(templates) which is
+    /// fine for the expected scale (dozens to low hundreds of
+    /// templates).
+    private var filteredSpeakerTemplates: [VoiceprintService.Voiceprint] {
+        let query = speakerSearchDraft
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased()
+        let alreadySpotted = Set(engine.spottedSpeakers)
+        return VoiceprintService.shared.templates
+            .filter { template in
+                !alreadySpotted.contains(template.name) &&
+                (query.isEmpty || template.name.lowercased().contains(query))
+            }
+            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    /// Add a speaker to the spotted list. Validates against the
+    /// current template list (defense in depth — the UI should only
+    /// surface valid names, but this guards against stale state if
+    /// templates are reloaded mid-add).
+    private func addSpottedSpeaker(_ name: String) {
+        guard VoiceprintService.shared.templates.contains(where: { $0.name == name }) else { return }
+        guard !engine.spottedSpeakers.contains(name) else { return }
+        engine.spottedSpeakers.append(name)
+        speakerSearchDraft = ""
+    }
+
+    private func removeSpottedSpeaker(_ name: String) {
+        engine.spottedSpeakers.removeAll { $0 == name }
     }
 
     private var toolsSection: some View {
@@ -1684,14 +2173,37 @@ struct SidebarView: View {
                     }
                 }
 
-                // Progress visualization: indeterminate barberpole during
-                // download or load. The underlying libraries don't expose
-                // any usable progress callback (per-byte or otherwise), so
-                // we can't show a real percentage. The status label above
-                // shows elapsed time ("Downloading… 0:37" or "Loading…
-                // 0:04") so the user can at least see the process is alive.
+                // Progress visualization. Linear bar in both cases; the
+                // difference is determinate vs indeterminate:
+                //   - `.downloading` with a known fraction → determinate
+                //     `ProgressView(value:)`. R2 mirror downloads
+                //     surface a real percentage via
+                //     `URLSessionDownloadDelegate`; FluidAudio surfaces
+                //     an approximate one via disk polling. Both update
+                //     several times a second so the bar moves visibly.
+                //   - `.downloading` with no fraction → indeterminate
+                //     barberpole. Hit when the delegate hasn't fired
+                //     the first chunk yet (first few hundred ms of
+                //     download), or when the HuggingFace fallback path
+                //     runs (no per-byte visibility into the library's
+                //     own loader).
+                //   - `.loading` → indeterminate. Tensor deserialization
+                //     happens inside MLX/CoreML with no progress
+                //     callback we can subscribe to. 5-15 seconds for a
+                //     2 GB Parakeet on Apple Silicon; the elapsed-time
+                //     label makes it clear the process is alive.
                 switch status {
-                case .downloading, .loading:
+                case .downloading(_, let progress):
+                    if let progress {
+                        ProgressView(value: max(0.0, min(1.0, progress)))
+                            .progressViewStyle(.linear)
+                            .controlSize(.mini)
+                    } else {
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                            .controlSize(.mini)
+                    }
+                case .loading:
                     ProgressView()
                         .progressViewStyle(.linear)
                         .controlSize(.mini)
@@ -1827,8 +2339,11 @@ struct SidebarView: View {
         case .twitter:      return "bubble.left.and.bubble.right.fill"
         case .facebook:     return "person.2.fill"
         case .instagram:    return "camera.fill"
+        case .threads:      return "at"
         case .applePodcast: return "mic.fill"
         case .soundcloud:   return "waveform.circle.fill"
+        case .senateGov:    return "building.columns.fill"
+        case .criticalMention: return "eye.fill"
         case .hls:          return "antenna.radiowaves.left.and.right"
         case .directAudio:  return "waveform"
         case .localFile:    return "doc.fill"
@@ -1836,16 +2351,46 @@ struct SidebarView: View {
         }
     }
 
+    /// Whisper models shown in the picker — essentials by default,
+    /// the full list when `showAllModels` is on. Always includes the
+    /// currently-selected model even if not in the visible set, so
+    /// the picker can render its own selection (a Picker can't show
+    /// a selection that's not in its ForEach data).
+    private var visibleWhisperModels: [String] {
+        let base = showAllModels
+            ? TranscriptionEngine.availableWhisperModels
+            : TranscriptionEngine.essentialWhisperModels
+        if base.contains(engine.whisperModelName) {
+            return base
+        }
+        // Current selection is outside the visible set — append it so
+        // the Picker renders correctly. Happens if a user switches off
+        // Show All while having a non-essential model selected.
+        return base + [engine.whisperModelName]
+    }
+
+    /// Parakeet models shown in the picker. Same essential-vs-all
+    /// pattern as Whisper, with the same current-selection safety net.
+    private var visibleParakeetModels: [String] {
+        let base = showAllModels
+            ? TranscriptionEngine.availableParakeetModels
+            : TranscriptionEngine.essentialParakeetModels
+        if base.contains(engine.parakeetModelName) {
+            return base
+        }
+        return base + [engine.parakeetModelName]
+    }
+
     private func whisperDisplayName(_ raw: String) -> String {
         switch raw {
         case "openai_whisper-tiny.en":                          return "Tiny (English) — 39 MB"
         case "openai_whisper-base.en":                          return "Base (English) — 74 MB"
         case "openai_whisper-small.en":                         return "Small (English) — 244 MB"
-        case "openai_whisper-medium.en":                        return "Medium (English) — 769 MB"
+        case "openai_whisper-medium.en":                        return "Medium (English) — 769 MB ⚡ — Fastest"
         case "openai_whisper-large-v3":                         return "Large v3 — 1.5 GB"
         case "openai_whisper-large-v3-v20240930":               return "Large v3 (Sep 2024) — 1.5 GB"
-        case "openai_whisper-large-v3-v20240930_turbo":         return "Large v3 Turbo — 1.5 GB"
-        case "openai_whisper-large-v3-v20240930_turbo_632MB":   return "Large v3 Turbo (4-bit) — 632 MB ⚡"
+        case "openai_whisper-large-v3-v20240930_turbo":         return "Large v3 Turbo — 1.5 GB — Most accurate"
+        case "openai_whisper-large-v3-v20240930_turbo_632MB":   return "Large v3 Turbo (4-bit) — 632 MB — Balanced (recommended)"
         default:
             return raw.replacingOccurrences(of: "openai_whisper-", with: "")
         }
@@ -1855,10 +2400,10 @@ struct SidebarView: View {
         // Strip the org prefix and decorate with rough size hints
         let short = raw.replacingOccurrences(of: "mlx-community/", with: "")
         switch raw {
-        case "mlx-community/parakeet-tdt-0.6b-v3":     return "TDT 0.6B v3 (recommended)"
+        case "mlx-community/parakeet-tdt_ctc-1.1b":    return "TDT-CTC 1.1B — Native PnC (recommended)"
+        case "mlx-community/parakeet-tdt-0.6b-v3":     return "TDT 0.6B v3 — Smaller, requires PnC restoration"
         case "mlx-community/parakeet-tdt-0.6b-v2":     return "TDT 0.6B v2"
-        case "mlx-community/parakeet-tdt-1.1b":        return "TDT 1.1B (large)"
-        case "mlx-community/parakeet-tdt_ctc-1.1b":    return "TDT-CTC 1.1B"
+        case "mlx-community/parakeet-tdt-1.1b":        return "TDT 1.1B — No PnC, slightly faster"
         case "mlx-community/parakeet-tdt_ctc-110m":    return "TDT-CTC 110M (fastest)"
         case "mlx-community/parakeet-ctc-0.6b":        return "CTC 0.6B"
         case "mlx-community/parakeet-ctc-1.1b":        return "CTC 1.1B"
@@ -1873,6 +2418,7 @@ struct SidebarView: View {
         case .off:        return "Off"
         case .speakerKit: return "SpeakerKit"
         case .sortformer: return "Sortformer (MLX)"
+        case .fluidAudio: return "FluidAudio"
         }
     }
 

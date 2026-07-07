@@ -138,19 +138,26 @@ final class ToolManager: ObservableObject {
     }
 
     /// Skip TLS certificate validation in yt-dlp by passing
-    /// `--no-check-certificate`. Off by default — TLS validation is a
-    /// real security control and we don't want to weaken it without
-    /// user opt-in. The use case is corporate networks where a
-    /// middlebox does TLS interception with a self-signed root that
-    /// the system trust store doesn't have, so legitimate yt-dlp
-    /// requests fail SSL handshake even though the connection is
-    /// otherwise valid. Surfaces in the Tools section right under
-    /// the Cookies row.
+    /// `--no-check-certificate`. **Default ON** as of the onboarding
+    /// pass — most StreamScribe users are on corporate-managed Macs
+    /// with TLS interception (Netskope, Zscaler, etc.) where the
+    /// bundled yt-dlp's Python SSL trust store doesn't include the
+    /// corporate root CA, and every download fails handshake. Defaulting
+    /// this ON lets corporate users hit the ground running without
+    /// having to discover the toggle.
     ///
-    /// Same UserDefaults persistence pattern as `cookieBrowser`:
-    /// loaded at init via the static helper, written back through
-    /// `didSet` on every change, skip-when-unchanged to avoid SwiftUI
-    /// rebuild churn writing duplicate values.
+    /// **The trade-off** is a real security weakening for anyone NOT on
+    /// such a network — they should turn this OFF in Settings → Tools.
+    /// We accept the trade because the StreamScribe audience skews
+    /// heavily corporate, and home users have alternatives (Homebrew
+    /// yt-dlp via the user-override field, or running on a non-managed
+    /// machine) that corporate users typically don't.
+    ///
+    /// Surfaces in the Tools section right under the Cookies row. Same
+    /// UserDefaults persistence pattern as `cookieBrowser`: loaded at
+    /// init via the static helper, written back through `didSet` on
+    /// every change, skip-when-unchanged to avoid SwiftUI rebuild
+    /// churn writing duplicate values.
     @Published var disableTLSCheck: Bool = ToolManager.loadInitialDisableTLSCheck() {
         didSet {
             guard oldValue != disableTLSCheck else { return }
@@ -465,11 +472,26 @@ final class ToolManager: ObservableObject {
         }
     }
 
-    /// Load the persisted `disableTLSCheck` flag. UserDefaults returns
-    /// `false` for missing-or-non-bool, which matches our intended
-    /// default (TLS checking ON), so this is a one-liner.
+    /// Load the persisted `disableTLSCheck` flag. **Defaults to true**
+    /// when the key has never been set (first launch of a fresh install
+    /// or an upgrade from a version predating this setting). Existing
+    /// users who explicitly turned the toggle off keep their off
+    /// setting; users who never touched it shift to on at next launch.
+    ///
+    /// The migration behavior is intentional: pre-onboarding versions
+    /// had the toggle off by default, and most users never knew to
+    /// flip it, so a silent ON migration restores expected functionality
+    /// for the bulk of users (corporate Macs with TLS interception)
+    /// without disrupting the minority who consciously chose off.
+    ///
+    /// See the @Published property's docstring for the rationale on
+    /// the default value itself.
     private static func loadInitialDisableTLSCheck() -> Bool {
-        UserDefaults.standard.bool(forKey: disableTLSCheckDefaultsKey)
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: disableTLSCheckDefaultsKey) == nil {
+            return true
+        }
+        return defaults.bool(forKey: disableTLSCheckDefaultsKey)
     }
 
     /// Load the persisted user-override SSL cert file path. Empty
@@ -731,8 +753,72 @@ final class ToolManager: ObservableObject {
         Bundle.main.url(forResource: "ffmpeg", withExtension: nil)?.path
     }
 
-    var ytDlpPath: String {
+    /// Legacy single-file install location (the PyInstaller *onefile*
+    /// `yt-dlp_macos` binary). Retained as a read fallback so existing
+    /// installs keep working until the first update swaps them to the
+    /// onedir build. New downloads no longer write here.
+    var legacyYTDlpPath: String {
         Self.appSupportDir.appendingPathComponent("yt-dlp").path
+    }
+
+    /// Directory the *onedir* build unpacks into. Contains the
+    /// `yt-dlp_macos` executable plus its pre-extracted Python runtime
+    /// (either alongside it or in an `_internal/` folder, depending on
+    /// the PyInstaller version yt-dlp built with).
+    var ytDlpInstallDir: String {
+        Self.appSupportDir.appendingPathComponent("yt-dlp_macos").path
+    }
+
+    /// Path callers should spawn. Resolution order:
+    ///   1. The onedir executable (fast startup — no per-launch
+    ///      self-extraction; see `downloadLatest` for why we switched)
+    ///   2. The legacy single-file binary (pre-switch installs)
+    ///
+    /// The onedir executable's exact location inside the install dir
+    /// varies with PyInstaller versions, so we scan for it on each
+    /// read. The scan touches at most a handful of paths and this is
+    /// read a few times per session — negligible.
+    var ytDlpPath: String {
+        if let exe = Self.findYTDlpExecutable(in: ytDlpInstallDir) {
+            return exe
+        }
+        return legacyYTDlpPath
+    }
+
+    /// Locate the yt-dlp executable inside an onedir install. Checks
+    /// the directory itself and one level of subdirectories for a
+    /// file named `yt-dlp_macos` or `yt-dlp` with the executable bit.
+    /// One-level depth covers both zip layouts observed in releases:
+    /// executable at the zip root, or nested inside a `yt-dlp_macos/`
+    /// folder.
+    static func findYTDlpExecutable(in dir: String) -> String? {
+        let fm = FileManager.default
+        let names = ["yt-dlp_macos", "yt-dlp"]
+        for name in names {
+            let direct = (dir as NSString).appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: direct, isDirectory: &isDir),
+               !isDir.boolValue,
+               fm.isExecutableFile(atPath: direct) {
+                return direct
+            }
+        }
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
+        for entry in entries {
+            let subdir = (dir as NSString).appendingPathComponent(entry)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: subdir, isDirectory: &isDir), isDir.boolValue else { continue }
+            for name in names {
+                let candidate = (subdir as NSString).appendingPathComponent(name)
+                var candidateIsDir: ObjCBool = false
+                if fm.fileExists(atPath: candidate, isDirectory: &candidateIsDir),
+                   !candidateIsDir.boolValue,
+                   fm.isExecutableFile(atPath: candidate) {
+                    return candidate
+                }
+            }
+        }
+        return nil
     }
 
     /// The yt-dlp path that callers should ACTUALLY use for spawning.
@@ -831,9 +917,29 @@ final class ToolManager: ObservableObject {
         Task.detached { [weak self] in
             await self?.refreshIfNeeded()
         }
-        // Deno doesn't need a refresh-on-launch — its release cadence is slow and a
-        // mismatched version isn't a security/functionality emergency the way a
-        // stale yt-dlp is. We just confirm the cached binary still exists.
+        // Deno auto-update on launch. Used to skip this on the
+        // assumption that Deno's release cadence is slow enough that
+        // a mismatched version isn't urgent, but in practice yt-dlp's
+        // n-parameter JavaScript evolves alongside the underlying
+        // YouTube changes, and a stale Deno occasionally chokes on
+        // newer JS features. The cost is one GitHub API round-trip
+        // per launch (~200-500ms, non-blocking — runs detached),
+        // which is negligible relative to the failure-mode debugging
+        // a stale-Deno failure would otherwise produce.
+        Task.detached { [weak self] in
+            await self?.refreshDenoIfNeeded()
+        }
+
+        // Delete cookie jars left over from the previous app run —
+        // they hold plaintext auth cookies and go stale (see
+        // `cleanupSessionCookieJars`). The first yt-dlp invocation of
+        // this session re-extracts and writes a fresh jar.
+        cleanupSessionCookieJars()
+
+        // Warm the yt-dlp binary so the first probe/download doesn't
+        // pay the cold-start tax while the user waits. See
+        // `prewarmYTDlp` docstring for what this buys per binary type.
+        prewarmYTDlp()
     }
 
     /// Ensure yt-dlp exists on disk and return the path callers should
@@ -856,13 +962,142 @@ final class ToolManager: ObservableObject {
         if !override.isEmpty {
             // Override set but not executable. Log so the user has a
             // breadcrumb in the log viewer; fall back to bundled.
-            print("[ToolManager] yt-dlp: custom binary at '\(override)' not executable; falling back to bundled.")
+            print("[ToolManager] yt-dlp: custom binary at '\(override)' not executable; falling back.")
         }
+
+        // Optionally prefer an externally-installed yt-dlp (pip/Homebrew).
+        // OFF by default: end users won't have one, and we don't want
+        // dev machines silently running a different binary than the
+        // fleet. The startup-speed problem this originally worked
+        // around is now solved for everyone by the onedir bundled
+        // build (see `downloadLatest`). Opt in on a dev machine with:
+        //   defaults write PLUS-PR.StreamScribe tools.preferExternalYTDlp -bool true
+        let preferExternal = UserDefaults.standard.object(forKey: "tools.preferExternalYTDlp") as? Bool ?? false
+        if preferExternal, let external = Self.detectExternalYTDlp() {
+            print("[ToolManager] yt-dlp: using external install at \(external) (tools.preferExternalYTDlp is enabled).")
+            return external
+        }
+
         if FileManager.default.isExecutableFile(atPath: ytDlpPath) {
             return ytDlpPath
         }
         try await downloadLatest()
         return ytDlpPath
+    }
+
+    // MARK: - Session cookie jar
+
+    /// Path of the per-session cookie jar for a given browser argument.
+    /// Browser name is embedded in the filename so switching the cookie
+    /// browser mid-session doesn't reuse another browser's jar.
+    func sessionCookieJarPath(forBrowserArg browserArg: String) -> String {
+        // Sanitize: browser args can be "chrome" or "chrome:Profile 1";
+        // keep filenames filesystem-safe.
+        let safe = browserArg.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
+        return Self.appSupportDir.appendingPathComponent("session-cookies-\(safe).txt").path
+    }
+
+    /// Cookie arguments for a yt-dlp invocation, with per-session
+    /// extraction caching.
+    ///
+    /// **The problem this solves.** `--cookies-from-browser` makes
+    /// yt-dlp decrypt the browser's entire cookie store on EVERY
+    /// invocation — for Chrome that means a Keychain round-trip plus
+    /// AES decryption of the full cookie DB, typically 1-3 seconds.
+    /// With the PyInstaller startup tax gone (onedir build), this is
+    /// the biggest remaining per-invocation cost.
+    ///
+    /// **The mechanism.** yt-dlp's `--cookies FILE` flag both reads
+    /// the jar AND writes the final cookie state back to it on exit.
+    /// So the first invocation of a session runs with
+    /// `--cookies-from-browser X --cookies <jar>` — paying the
+    /// extraction once and dumping the result to the jar — and every
+    /// subsequent invocation passes only `--cookies <jar>`, skipping
+    /// browser extraction entirely (~milliseconds to read the file).
+    /// As a bonus, each invocation writes rotated cookies back to the
+    /// jar, so YouTube's session-cookie rotation stays fresh across
+    /// the session.
+    ///
+    /// **Statelessness = self-healing.** The switch is keyed on jar
+    /// existence, not an in-memory flag. If the first invocation gets
+    /// killed before writing the jar (probe timeout, user cancel),
+    /// the next invocation simply extracts from the browser again.
+    /// No stuck states.
+    ///
+    /// **Staleness.** Jars are deleted at every app launch (see
+    /// `bootstrap`), so a session's jar never outlives the app run.
+    /// Within a session, logins/logouts in the browser won't be
+    /// picked up until relaunch — acceptable for a session-scoped
+    /// cache, and the pre-cache behavior (fresh extraction per
+    /// invocation) had the same practical latency for noticing a
+    /// *logout* anyway since sites revalidate server-side.
+    func sessionCookieArguments(browserArg: String?) -> [String] {
+        guard let browserArg, !browserArg.isEmpty else { return [] }
+        let jar = sessionCookieJarPath(forBrowserArg: browserArg)
+        if FileManager.default.fileExists(atPath: jar) {
+            // Jar exists → reuse. Tighten perms opportunistically;
+            // the jar holds live auth cookies in plaintext and
+            // yt-dlp's own umask-derived perms may be looser.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: jar
+            )
+            return ["--cookies", jar]
+        }
+        // No jar yet → extract from browser AND dump to jar so the
+        // next invocation can skip extraction.
+        return ["--cookies-from-browser", browserArg, "--cookies", jar]
+    }
+
+    /// Delete session cookie jars from previous app runs. Called from
+    /// `bootstrap()`. Two reasons: (1) jars hold plaintext auth
+    /// cookies and shouldn't persist longer than needed; (2) stale
+    /// jars from yesterday would silently serve outdated cookies
+    /// (missing new logins) for the whole session.
+    func cleanupSessionCookieJars() {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: Self.appSupportDir.path) else { return }
+        for entry in entries where entry.hasPrefix("session-cookies-") && entry.hasSuffix(".txt") {
+            let path = Self.appSupportDir.appendingPathComponent(entry).path
+            try? fm.removeItem(atPath: path)
+        }
+    }
+
+    /// Warm up the yt-dlp binary in the background so the first real
+    /// probe/download doesn't pay the cold-start tax interactively.
+    /// Fired from `bootstrap()` at app launch.
+    ///
+    /// What the warm-up buys depends on which binary is in use:
+    ///   - **Bundled PyInstaller binary:** triggers Gatekeeper's
+    ///     first-run-per-boot scan and populates the filesystem cache
+    ///     for the self-extraction. Doesn't eliminate the per-launch
+    ///     extraction (that's inherent to onefile builds) but shaves
+    ///     the worst-case first invocation from ~15s toward the
+    ///     steady-state ~5s.
+    ///   - **External pip/Homebrew script:** already fast; the warm-up
+    ///     costs <1s and additionally primes the Python interpreter's
+    ///     bytecode cache.
+    ///
+    /// Runs `--version` — the cheapest invocation that exercises the
+    /// full startup path. Fire-and-forget; failures are logged and
+    /// ignored (the real invocation will surface any genuine problem).
+    func prewarmYTDlp() {
+        Task.detached(priority: .utility) {
+            do {
+                let path = try await self.ensureYTDlpAvailable()
+                let start = Date()
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: path)
+                process.arguments = ["--version"]
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError = FileHandle.nullDevice
+                try process.run()
+                process.waitUntilExit()
+                let elapsed = Date().timeIntervalSince(start)
+                print("[ToolManager] yt-dlp prewarm completed in \(String(format: "%.1f", elapsed))s (\(path))")
+            } catch {
+                print("[ToolManager] yt-dlp prewarm skipped: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Force a fresh download regardless of cached version. Backed by the menu item
@@ -885,8 +1120,16 @@ final class ToolManager: ObservableObject {
 
             let currentVersion = await MainActor.run { self.ytDlpVersion }
 
-            if let current = currentVersion, current == latest,
-               FileManager.default.isExecutableFile(atPath: ytDlpPath) {
+            // "Up to date" now requires the ONEDIR install to exist,
+            // not just any executable at ytDlpPath (which falls back
+            // to the legacy single-file binary). Without this check,
+            // users who already have the slow onefile binary at the
+            // current version would never migrate to the fast build
+            // until yt-dlp ships its next release. With it, the first
+            // launch after this app update re-downloads once and
+            // swaps them over.
+            let hasOnedirInstall = Self.findYTDlpExecutable(in: ytDlpInstallDir) != nil
+            if let current = currentVersion, current == latest, hasOnedirInstall {
                 await setStatus(.ready)
                 return
             }
@@ -931,41 +1174,45 @@ final class ToolManager: ObservableObject {
         return release.tag_name
     }
 
-    /// Download the `yt-dlp_macos` binary from the latest release, verify its SHA-256
-    /// against the published checksum, and atomically replace the on-disk binary.
+    /// Download the `yt-dlp_macos.zip` (onedir) build from the latest release,
+    /// verify its SHA-256 against the published checksum, unpack it, and
+    /// atomically replace the on-disk install.
+    ///
+    /// **Why the .zip (onedir) build rather than the single `yt-dlp_macos`
+    /// binary.** The single binary is a PyInstaller *onefile* build: it
+    /// self-extracts its entire bundled Python runtime into a temp
+    /// directory on EVERY invocation — measured at 5-10+ seconds per
+    /// launch, which made every probe and download feel sluggish
+    /// compared to a pip-installed yt-dlp. The onedir build inside the
+    /// zip is the same PyInstaller output but pre-extracted: executable
+    /// + runtime sitting in a folder, ~1s startup, no per-launch unpack.
+    /// Same extractor code, same behavior, one-time unzip at install
+    /// instead of an unpack tax on every single run.
+    ///
     /// Runs entirely off the main actor (only `setStatus` hops back).
     private func downloadLatest() async throws {
         print("[ToolManager] yt-dlp update starting…")
         let tag = try await fetchLatestVersionTag()
         let base = "https://github.com/yt-dlp/yt-dlp/releases/download/\(tag)"
-        let binaryURL = URL(string: "\(base)/yt-dlp_macos")!
-        let sumsURL   = URL(string: "\(base)/SHA2-256SUMS")!
+        let zipURL  = URL(string: "\(base)/yt-dlp_macos.zip")!
+        let sumsURL = URL(string: "\(base)/SHA2-256SUMS")!
 
         await setStatus(.downloading(progress: 0))
 
-        // Pull the SHA sums file first; it's tiny and lets us verify the binary later.
+        // Pull the SHA sums file first; it's tiny and lets us verify the zip later.
         let (sumsData, sumsResp) = try await URLSession.shared.data(from: sumsURL)
         guard (sumsResp as? HTTPURLResponse)?.statusCode == 200 else {
             throw ToolError.updateFetchFailed("Could not fetch yt-dlp SHA2-256SUMS")
         }
         let expectedSum = try Self.parseExpectedSum(
-            from: sumsData, filename: "yt-dlp_macos"
+            from: sumsData, filename: "yt-dlp_macos.zip"
         )
 
-        // Stream the binary download with progress callbacks.
-        // We use URLSession.shared.bytes for progress reporting but read in
-        // chunks rather than byte-by-byte. The AsyncBytes sequence yields
-        // individual bytes; collecting them one-at-a-time into Data is ~40M
-        // iterations for a 40MB binary — each with a cooperative suspension
-        // point and a Data.append. That made downloads take minutes even on
-        // fast connections. Instead we use the bulk .data(from:) API for the
-        // actual download (single allocation, no per-byte overhead) and give
-        // up per-byte progress. Since the download is ~40MB and typically
-        // completes in a few seconds on broadband, the tradeoff is fine —
-        // we show indeterminate "Downloading…" and jump to "Verifying…"
-        // when the response arrives.
+        // Bulk download — see the chunking rationale in the git history
+        // of this function; bulk .data(from:) beats per-byte AsyncBytes
+        // by orders of magnitude for a ~35MB asset.
         await setStatus(.downloading(progress: 0))
-        let (data, binResp) = try await URLSession.shared.data(from: binaryURL)
+        let (data, binResp) = try await URLSession.shared.data(from: zipURL)
         guard let httpBin = binResp as? HTTPURLResponse, httpBin.statusCode == 200 else {
             throw ToolError.updateFetchFailed("yt-dlp download HTTP \((binResp as? HTTPURLResponse)?.statusCode ?? -1)")
         }
@@ -979,17 +1226,59 @@ final class ToolManager: ObservableObject {
         }
         print("[ToolManager] yt-dlp \(tag) downloaded and verified.")
 
-        // Atomic replace: write to temp file, chmod, then move into place.
-        let dest = ytDlpPath
-        let tmpURL = URL(fileURLWithPath: dest + ".tmp")
-        try data.write(to: tmpURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: tmpURL.path
-        )
-        if FileManager.default.fileExists(atPath: dest) {
-            try FileManager.default.removeItem(atPath: dest)
+        // Unpack to a staging dir, then atomically swap into place.
+        // `ditto -x -k` extracts zips while preserving POSIX permissions
+        // (including the executable bit) — the system unzip does too,
+        // but ditto is the Apple-blessed tool for archives and handles
+        // resource forks / extended attributes without surprises.
+        let fm = FileManager.default
+        let stagingRoot = fm.temporaryDirectory
+            .appendingPathComponent("streamscribe-ytdlp-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stagingRoot) }
+
+        let zipFile = stagingRoot.appendingPathComponent("yt-dlp_macos.zip")
+        try data.write(to: zipFile, options: .atomic)
+
+        let extractDir = stagingRoot.appendingPathComponent("extracted", isDirectory: true)
+        try fm.createDirectory(at: extractDir, withIntermediateDirectories: true)
+
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-x", "-k", zipFile.path, extractDir.path]
+        ditto.standardOutput = FileHandle.nullDevice
+        ditto.standardError = FileHandle.nullDevice
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationStatus == 0 else {
+            throw ToolError.updateFetchFailed("Unzip of yt-dlp_macos.zip failed (ditto exit \(ditto.terminationStatus))")
         }
-        try FileManager.default.moveItem(atPath: tmpURL.path, toPath: dest)
+
+        // Locate the executable in the extracted tree and ensure the
+        // exec bit survived extraction (belt-and-suspenders; ditto
+        // preserves it, but a chmod costs nothing).
+        guard let extractedExe = Self.findYTDlpExecutable(in: extractDir.path) else {
+            throw ToolError.updateFetchFailed("yt-dlp_macos.zip did not contain a recognizable executable")
+        }
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: extractedExe)
+
+        // Atomic-ish swap: remove old install dir, move the extracted
+        // tree into place. The extracted tree root becomes the install
+        // dir wholesale, so whatever internal layout this PyInstaller
+        // version produced is preserved and `findYTDlpExecutable`
+        // re-locates the binary inside it on each read.
+        let installDir = ytDlpInstallDir
+        if fm.fileExists(atPath: installDir) {
+            try fm.removeItem(atPath: installDir)
+        }
+        try fm.moveItem(atPath: extractDir.path, toPath: installDir)
+
+        // Clean up the legacy single-file binary if present — it's
+        // superseded and only wastes ~35MB. Best-effort.
+        if fm.fileExists(atPath: legacyYTDlpPath) {
+            try? fm.removeItem(atPath: legacyYTDlpPath)
+            print("[ToolManager] Removed legacy single-file yt-dlp binary.")
+        }
 
         // Persist the new version tag.
         try tag.write(toFile: versionFilePath, atomically: true, encoding: .utf8)
@@ -999,7 +1288,7 @@ final class ToolManager: ObservableObject {
             self.ytDlpStatus = .ready
             self.lastUpdateCheck = Date()
         }
-        print("[ToolManager] yt-dlp \(tag) installed at \(dest)")
+        print("[ToolManager] yt-dlp \(tag) (onedir) installed at \(installDir)")
     }
 
     /// Hop to MainActor to publish a status change.
@@ -1053,6 +1342,54 @@ final class ToolManager: ObservableObject {
         }
         try await downloadLatestDeno()
         return denoPath
+    }
+
+    /// Check for a newer Deno release and download if available. Mirrors
+    /// `refreshIfNeeded()` for yt-dlp: compare cached tag to the latest
+    /// upstream tag, no-op if matched, download if mismatched or missing.
+    /// Called from `bootstrap()` on every app launch so users get fresh
+    /// Deno without manual intervention.
+    ///
+    /// **Failure handling.** If the GitHub API check or download fails,
+    /// we keep the existing cached binary (if any) and don't escalate
+    /// to error — the user can still run sessions, they just don't get
+    /// the latest Deno this launch. Only the no-cached-binary case
+    /// surfaces an error status, since we'd then be unable to handle
+    /// yt-dlp's n-parameter JS at all.
+    func refreshDenoIfNeeded() async {
+        await setDenoStatus(.checking)
+        do {
+            let latest = try await fetchLatestDenoTag()
+            let currentVersion = await MainActor.run { self.denoVersion }
+
+            // Cached version matches AND binary exists → nothing to do.
+            // Strip the leading "v" from `latest` (Deno tags include it)
+            // when comparing against cached versions that may or may not
+            // include it depending on when they were written.
+            let normalizedLatest = latest.hasPrefix("v") ? String(latest.dropFirst()) : latest
+            let normalizedCurrent = currentVersion.flatMap {
+                $0.hasPrefix("v") ? String($0.dropFirst()) : $0
+            }
+
+            if let current = normalizedCurrent, current == normalizedLatest,
+               FileManager.default.isExecutableFile(atPath: denoPath) {
+                await setDenoStatus(.ready)
+                return
+            }
+
+            // Either no cached version, mismatched version, or binary
+            // missing — fetch and install the latest.
+            try await downloadLatestDeno()
+        } catch {
+            // Cached binary still works → fall back to "ready" silently.
+            // No cached binary → surface the error so the user sees why
+            // Deno-dependent operations (YouTube n-param JS) will fail.
+            if FileManager.default.isExecutableFile(atPath: denoPath) {
+                await setDenoStatus(.ready)
+            } else {
+                await setDenoStatus(.error(error.localizedDescription))
+            }
+        }
     }
 
     /// Force a fresh Deno download regardless of cached version. Backed by a

@@ -1,6 +1,5 @@
 import SwiftUI
 import UniformTypeIdentifiers
-import AppKit
 
 struct ContentView: View {
     @EnvironmentObject var engine: TranscriptionEngine
@@ -120,7 +119,7 @@ struct ContentView: View {
                         includeGenerated: prefIncludeGenerated
                     )
                     TranscriptExporter.saveToDisk(
-                        engine.segments,
+                        segmentsForExport(engine: engine),
                         format: exportFormat,
                         sourceURL: urlInput,
                         title: engine.detectedTitle,
@@ -130,7 +129,10 @@ struct ContentView: View {
                     showExportSheet = false
                 },
                 onCancel: { showExportSheet = false },
-                onExportMedia: { exportSourceMedia() },
+                onExportMedia: {
+                    exportMedia(engine: engine)
+                    showExportSheet = false
+                },
                 mediaAvailable: engine.playbackMediaURL != nil
             )
         }
@@ -198,77 +200,124 @@ struct ContentView: View {
         return true
     }
 
-    /// Save a copy of the session's source media (the same file the miniplayer
-    /// plays from) to a user-chosen location. We deliberately just copy the
-    /// file rather than re-encoding: for local-file transcriptions the source
-    /// is already in its native format, and for URL transcriptions the cache
-    /// is a stream-copied mp4 — re-encoding would lose quality for no gain.
+    /// Build the segment array sent to `TranscriptExporter` with each
+    /// segment's `speaker` field replaced by its EFFECTIVE display
+    /// name — the result of walking the same precedence the transcript
+    /// pane uses (manual rename → manual segment ID → manual cluster
+    /// ID → automatic segment ID → cluster ID fallback). Without this
+    /// step, exports would show generic "Speaker 1" labels even when
+    /// the on-screen transcript shows "Bernie Sanders," because the
+    /// exporter operates purely on cluster IDs.
     ///
-    /// The save panel suggests a filename based on the detected title (falling
-    /// back to the cache file's name) and preserves the source's extension so
-    /// the user gets a working file regardless of whether the source was a
-    /// dropped .mov, a dropped .mp3, or a YouTube-cache .mp4.
-    ///
-    /// Failure modes (nil media URL, missing file at the URL, copy error) are
-    /// all silently no-ops with a console log — same posture as the transcript
-    /// exporter above. The button is disabled when media is unavailable, so
-    /// the nil case shouldn't fire in practice.
-    private func exportSourceMedia() {
-        guard let mediaURL = engine.playbackMediaURL else {
-            print("[Export] No playback media URL available; ignoring media export.")
-            return
-        }
-        guard FileManager.default.fileExists(atPath: mediaURL.path) else {
-            print("[Export] Media file missing at \(mediaURL.path); ignoring media export.")
-            return
-        }
+    /// **Why mutate rather than thread voiceprint state through the
+    /// exporter.** The exporter is a pure renderer — it takes
+    /// segments + speakerNames and produces output. Adding a
+    /// VoiceprintService dependency would couple a stateless renderer
+    /// to a runtime singleton, complicating testing and making the
+    /// exporter aware of features outside its concern. Pre-resolving
+    /// here means the exporter sees segments whose `speaker` field
+    /// already IS the display name, and its existing grouping
+    /// (`groupedBySpeaker()`) naturally splits cluster merges
+    /// because segments with different identified names now have
+    /// different speaker fields.
+    private func segmentsForExport(engine: TranscriptionEngine) -> [TranscriptSegment] {
+        // Compute cluster majorities once so the per-segment loop
+        // below is O(N), not O(N²). Without this, every displayName
+        // call would re-walk segments to determine its cluster's
+        // majority.
+        let majorities = engine.clusterMajorityIdentifications()
 
-        let ext = mediaURL.pathExtension.isEmpty ? "mp4" : mediaURL.pathExtension
-        let baseName: String = {
-            // Prefer the detected title (sanitized) so YouTube exports come out
-            // as "Some Video Title.mp4" instead of "current.mp4". For local
-            // files, fall back to the source file's own basename.
-            if let title = engine.detectedTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !title.isEmpty {
-                return sanitizeFilename(title)
+        return engine.segments.map { seg -> TranscriptSegment in
+            var copy = seg
+            // `displayName(forSegment:clusterMajorities:)` returns the
+            // effective name already factoring in voiceprint
+            // identifications + manual cluster reassignments +
+            // per-segment overrides + cluster majority smoothing.
+            // For unidentified speakers with no cluster majority it
+            // returns the cluster ID unchanged, so this is a safe
+            // transformation in all cases.
+            if let resolved = engine.displayName(
+                forSegment: seg,
+                clusterMajorities: majorities
+            ) {
+                copy.speaker = resolved
             }
-            return mediaURL.deletingPathExtension().lastPathComponent
-        }()
+            return copy
+        }
+    }
+
+    /// Handle the "Export Media…" button: copy whatever's at
+    /// `engine.playbackMediaURL` (either the original local file for
+    /// imported transcriptions, or the cached mp4 for URL-based ones)
+    /// to a user-chosen location. Opens an NSSavePanel with a sensible
+    /// default filename derived from the detected title.
+    ///
+    /// **Why copy rather than move.** The source might still be in use
+    /// — the miniplayer holds it open for playback, the engine may
+    /// re-read it for refinement passes, and the cache manager owns
+    /// its lifecycle. Moving would yank the file out from under those
+    /// consumers. Copy is the safe operation.
+    ///
+    /// **Filename strategy.** Use the detected title (the video's
+    /// human-readable title from yt-dlp's metadata) as the base name,
+    /// falling back to "StreamScribe Media" when no title is
+    /// available. Preserve the source file's extension so the
+    /// exported file opens with the right default app — mp4 for
+    /// video, m4a for audio-only. Strip filesystem-unsafe characters
+    /// from the title (slashes, colons on older filesystems) before
+    /// using it.
+    ///
+    /// **Errors are silent in v1.** A failure here would be unusual
+    /// (disk full, permissions, simultaneous deletion), and the user
+    /// will notice the file isn't where they expected. Adding a
+    /// proper error alert is straightforward later if it comes up
+    /// in practice.
+    private func exportMedia(engine: TranscriptionEngine) {
+        guard let sourceURL = engine.playbackMediaURL else { return }
 
         let panel = NSSavePanel()
         panel.title = "Export Media"
+        panel.canCreateDirectories = true
+
+        // Derive extension from the source URL. Fall back to mp4
+        // (the most common cache format) if the URL has none — this
+        // shouldn't happen with our cache filenames but is harmless
+        // belt-and-suspenders.
+        let ext = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
+
+        // Sanitize the title for use as a filename. Strips POSIX path
+        // separators and control characters. Doesn't try to handle
+        // every edge case (windows-style invalid chars, length limits)
+        // — NSSavePanel does additional validation and the user can
+        // edit the suggestion before confirming.
+        let rawTitle = engine.detectedTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title: String = {
+            guard let t = rawTitle, !t.isEmpty else { return "StreamScribe Media" }
+            let bad = CharacterSet(charactersIn: "/\\:")
+                .union(.controlCharacters)
+            return t.components(separatedBy: bad).joined(separator: " ")
+        }()
+        panel.nameFieldStringValue = "\(title).\(ext)"
+
         if let contentType = UTType(filenameExtension: ext) {
             panel.allowedContentTypes = [contentType]
         }
-        panel.nameFieldStringValue = "\(baseName).\(ext)"
 
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-
-        do {
-            // NSSavePanel guarantees the user confirmed overwrite if the file
-            // exists, but it doesn't actually remove the old file for us when
-            // we're copying — FileManager.copyItem refuses to overwrite. So
-            // we clear the destination first; ignore "no such file" errors
-            // from removeItem since that's the common case.
-            try? FileManager.default.removeItem(at: destination)
-            try FileManager.default.copyItem(at: mediaURL, to: destination)
-        } catch {
-            print("[Export] Media copy failed: \(error.localizedDescription)")
+        panel.begin { response in
+            guard response == .OK, let destURL = panel.url else { return }
+            do {
+                // If the user picked a destination that already
+                // exists, NSSavePanel has already confirmed the
+                // overwrite with them — we just need to remove the
+                // existing file before copyItem (which errors on
+                // existing destination).
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.copyItem(at: sourceURL, to: destURL)
+            } catch {
+                print("[ExportMedia] copy failed: \(error.localizedDescription)")
+            }
         }
-
-        showExportSheet = false
-    }
-
-    /// Strip characters that are illegal or awkward in filenames on macOS
-    /// (and that confuse downstream tools). Keeps Unicode letters and most
-    /// punctuation; collapses whitespace runs to a single space.
-    private func sanitizeFilename(_ raw: String) -> String {
-        let banned: Set<Character> = ["/", ":", "\\", "?", "*", "\"", "<", ">", "|"]
-        let cleaned = String(raw.map { banned.contains($0) ? "-" : $0 })
-        let collapsed = cleaned.split(whereSeparator: { $0.isWhitespace })
-            .joined(separator: " ")
-        // Cap length to a sane limit — APFS allows 255 bytes but very long
-        // names look terrible in Save dialogs and Finder.
-        return String(collapsed.prefix(120))
     }
 }

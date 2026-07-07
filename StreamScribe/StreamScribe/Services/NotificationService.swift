@@ -134,4 +134,50 @@ final class NotificationService: ObservableObject {
             }
         }
     }
+
+    /// Post a local notification for a Speaker Spotter hit — fired when
+    /// an automatically-identified segment matches a name in the
+    /// engine's `spottedSpeakers` list (and only the first such match
+    /// per speaker per session; the engine handles that debounce).
+    ///
+    /// **Title vs body choice.** The speaker name goes in the TITLE so
+    /// it's visible at a glance in Notification Center — the speaker
+    /// IS the watched thing here, mirroring how `postKeywordHit` puts
+    /// the keyword in the title. The transcript snippet goes in the
+    /// body for context: which moment matched. No subtitle, unlike
+    /// keyword hits — for speaker spotting the speaker IS the headline,
+    /// not a "who said it" addendum.
+    ///
+    /// **Separate thread identifier from keyword hits.** Both feature
+    /// types deliver to the user but represent different signals
+    /// (a keyword appearing vs a person arriving). Grouping them
+    /// separately in Notification Center keeps the stacks meaningful
+    /// when both fire in the same session.
+    @MainActor
+    func postSpeakerHit(speaker: String, snippet: String) {
+        guard isAuthorized else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Speaker Spotted: \(speaker)"
+        // Same trim+truncate treatment as postKeywordHit. Notifications
+        // get system-truncated anyway; a tight snippet keeps the toast
+        // readable on glance.
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        content.body = trimmed.count > 240
+            ? String(trimmed.prefix(237)) + "…"
+            : trimmed
+        content.sound = .default
+        content.threadIdentifier = "streamscribe.speaker.hits"
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                print("[NotificationService] add() failed: \(error)")
+            }
+        }
+    }
 }

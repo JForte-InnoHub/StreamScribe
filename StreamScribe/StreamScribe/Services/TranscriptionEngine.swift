@@ -105,8 +105,21 @@ final class TranscriptionEngine: ObservableObject {
     /// When multi-pass refinement is on AND `useSplitRefinedEngine` is true,
     /// the refined pass uses `refinedTranscriptionEngine` instead. Otherwise
     /// both passes use this property (the Phase 3 "option β" default).
-    @Published var transcriptionEngine: TranscriptionEngineKind = .whisperKit
-    @Published var diarizationEngine: DiarizationEngineKind = .speakerKit
+    /// **Default: Parakeet.** TDT-CTC 1.1B produces native PnC with strong
+    /// throughput on Apple Silicon — a better baseline than WhisperKit for
+    /// most StreamScribe use cases (hearings, podcasts, conference audio).
+    /// WhisperKit remains available via the picker for users who want it
+    /// (e.g. multilingual content where Parakeet's English-only training
+    /// hurts) or as the refined-pass engine when split refinement is on.
+    @Published var transcriptionEngine: TranscriptionEngineKind = .parakeet
+
+    /// **Default: FluidAudio.** Offline pyannote-community-1 pipeline (static)
+    /// + LS-EEND streaming (live) — superior speaker accuracy to SpeakerKit
+    /// in most scenarios, fully local, no Apple Intelligence dependency.
+    /// SpeakerKit and Sortformer remain available via the picker. Sortformer
+    /// is still the best low-latency streaming option (MLX-accelerated); use
+    /// it if FluidAudio's LS-EEND streaming feels slow on a given session.
+    @Published var diarizationEngine: DiarizationEngineKind = .fluidAudio
 
     /// Opt-in toggle for using a different engine on the refined pass than the
     /// raw pass. Only meaningful when `refinementEnabled` is true. Default
@@ -136,35 +149,83 @@ final class TranscriptionEngine: ObservableObject {
     /// the split (Parakeet-raw) wants Whisper on the refined side.
     @Published var refinedTranscriptionEngine: TranscriptionEngineKind = .whisperKit
 
+    /// Whisper model used by the refined pass when the refined engine is
+    /// `.whisperKit` AND `useSplitRefinedEngine` is on. Independent from
+    /// `whisperModelName` (which the raw pass uses) so the user can pair
+    /// e.g. Whisper Medium on the raw side for speed with Whisper Large v3
+    /// Turbo on the refined side for accuracy — or any other pairing.
+    ///
+    /// Defaults to the same value as the raw default. Users who never
+    /// enable split mode never see this property; users who do see two
+    /// independent Whisper pickers in the sidebar (one per slot).
+    ///
+    /// **Why a separate property rather than passing the name through
+    /// to the factory.** SwiftUI bindings (`$engine.refinedWhisperModelName`)
+    /// need a stable property to bind against. The picker UI is a direct
+    /// binding; routing the value through a transient parameter would
+    /// require a state object somewhere else.
+    @Published var refinedWhisperModelName: String = TranscriptionEngine.defaultWhisperModel
+
+    /// Parakeet model used by the refined pass — same independence
+    /// semantics as `refinedWhisperModelName`. Used when the refined
+    /// engine is `.parakeet` AND `useSplitRefinedEngine` is on.
+    @Published var refinedParakeetModelName: String = TranscriptionEngine.defaultParakeetModel
+
     /// Live-mode post-finish re-diarization toggle. When `true` AND the session
     /// is live AND a diarizer is enabled, the engine accumulates the entire
     /// audio stream into `fullPcmBuffer` (same buffer static-mode uses) and,
     /// after transcription completes (user stop, stream end, or other natural
     /// termination), runs one final whole-file diarization pass with a
-    /// fresh `SpeakerKitBackend`. The resulting turns replace `allSpeakerTurns`
+    /// freshly-instantiated backend of the user's choice (see
+    /// `rediarizeEngine` below). The resulting turns replace `allSpeakerTurns`
     /// and every segment in `segments` gets re-attributed to the new labels.
     ///
-    /// Rationale: Sortformer (the streaming MLX diarizer that pairs with
-    /// Parakeet) is fast and low-latency but its speaker IDs are derived
-    /// chunk-by-chunk, so identity can drift or fragment across long
-    /// sessions. SpeakerKit's whole-file pyannote clustering produces more
-    /// stable, globally-consistent speaker labels at the cost of needing
-    /// the whole audio at once — which is fine at the end of the session.
+    /// Rationale: streaming diarizers (Sortformer, LS-EEND) are fast and
+    /// low-latency but their speaker IDs are derived chunk-by-chunk, so
+    /// identity can drift or fragment across long sessions. Whole-file
+    /// algorithms (SpeakerKit's pyannote 4, FluidAudio's offline
+    /// pyannote-community-1 + VBx) produce more stable, globally-consistent
+    /// speaker labels at the cost of needing the whole audio at once —
+    /// which is fine at the end of the session.
     ///
-    /// This is always SpeakerKit on the finalization pass regardless of the
-    /// live diarizer choice; the whole point is to use the more accurate
-    /// whole-file algorithm as a cleanup step.
+    /// The rediarize engine is independent of the live diarizer. A user can
+    /// run Sortformer for low-latency streaming labels and FluidAudio
+    /// offline for the final relabel pass, or any other combination. See
+    /// `rediarizeEngine`.
     ///
     /// Memory cost: 64 KB/s of audio retained for the entire session
     /// (16 kHz mono Float32). ~230 MB/hour. For multi-hour livestreams the
     /// user should weigh the accuracy gain against the RSS footprint. The
     /// default is false so opting in is explicit.
     ///
-    /// No-op in static mode (whole-file SpeakerKit already runs there) and
+    /// No-op in static mode (whole-file diarization already runs there) and
     /// when `diarizationEngine == .off` (nothing to re-diarize). The UI
     /// disables the toggle in those configurations rather than letting the
     /// flag silently do nothing.
     @Published var postFinishRediarizeEnabled: Bool = false
+
+    /// Which diarization backend to use for the post-finish whole-file
+    /// re-diarization pass. Independent of `diarizationEngine` (the live
+    /// streaming diarizer) so the user can mix-and-match — e.g. Sortformer
+    /// streaming for live latency + FluidAudio offline for the final pass.
+    ///
+    /// **Default: `.speakerKit`** — preserves the legacy behavior of the
+    /// rediarize toggle, which previously hardcoded SpeakerKit as the
+    /// post-finish backend. Users with `postFinishRediarizeEnabled = true`
+    /// from before this property existed see no behavior change at first
+    /// launch.
+    ///
+    /// **Picker scope: any DiarizationEngineKind except `.off`** — running
+    /// rediarize with `.off` would defeat the purpose. The sidebar's
+    /// picker filters out `.off` accordingly.
+    ///
+    /// **Why a separate property rather than inferring from
+    /// `diarizationEngine`:** users may want different engines for the two
+    /// passes. The live pass is a latency-vs-accuracy trade-off; the
+    /// rediarize pass is a "pay any cost for the best result, we have all
+    /// the time in the world now" trade-off. Different requirements,
+    /// different engine choices.
+    @Published var rediarizeEngine: DiarizationEngineKind = .speakerKit
 
     /// Multi-pass live-mode toggle. When `true` AND `resolvedSessionMode == .live`,
     /// the engine will eventually run a small-chunk raw pass alongside a 30s
@@ -245,6 +306,27 @@ final class TranscriptionEngine: ObservableObject {
     /// to happen without having to commit to an explicit override.
     @Published private(set) var resolvedSessionMode: SessionMode = .live
 
+    /// Wall-clock time the current session started, captured at the top
+    /// of `start()` when the guard succeeds. Cleared back to nil when
+    /// the session reaches a terminal state (stopped/finished/error).
+    ///
+    /// **Used by the miniplayer for live-mode time mapping.** The
+    /// miniplayer maps `AVPlayerItem.currentDate()` (HLS wall-clock from
+    /// EXT-X-PROGRAM-DATE-TIME tags) onto session-relative time by
+    /// computing `currentDate - sessionStartedAt`. This is what lets
+    /// transcript highlighting follow miniplayer playback when the user
+    /// pauses or seeks back through the buffered window, and what
+    /// drives the "Live" / "30s behind" indicator + Return to Live button.
+    ///
+    /// **Cleared on stop intentionally.** When a live session ends, the
+    /// playback URL transitions from the live HLS to the post-session
+    /// .mkv recording. The miniplayer then needs to fall back to
+    /// VOD-style time interpretation (currentTime.seconds == engine
+    /// time, since the .mkv starts at 0 == session start). Nil
+    /// sessionStartedAt + non-nil playbackMediaURL is the signal for
+    /// "VOD mode."
+    @Published private(set) var sessionStartedAt: Date? = nil
+
     /// Selected model name per engine. We keep separate selections so switching engines
     /// preserves what the user picked for each.
     @Published var whisperModelName: String = TranscriptionEngine.defaultWhisperModel
@@ -264,6 +346,23 @@ final class TranscriptionEngine: ObservableObject {
     ]
     static let defaultWhisperModel = "openai_whisper-large-v3-v20240930_turbo_632MB"
 
+    /// Subset shown in the model picker by default. The smaller Whisper
+    /// variants (tiny, base, small, large-v3 non-turbo) are kept in
+    /// `availableWhisperModels` so the picker logic still recognizes
+    /// them as valid selections, but the dropdown hides them unless
+    /// the user enables "Show all models" in Settings → Advanced.
+    ///
+    /// Curation rationale: Medium handles most general-purpose use,
+    /// Large v3 Turbo is the accuracy ceiling, and Large v3 Turbo (4-bit)
+    /// is the speed/quality sweet spot (and the default). Users who want
+    /// the smaller models for slower hardware can still find them by
+    /// flipping the toggle.
+    static let essentialWhisperModels: [String] = [
+        "openai_whisper-medium.en",
+        "openai_whisper-large-v3-v20240930_turbo",
+        "openai_whisper-large-v3-v20240930_turbo_632MB",
+    ]
+
     /// Parakeet variants on HuggingFace's mlx-community. TDT (token-and-duration) variants
     /// are usually the best speed/accuracy point; CTC is simpler/faster; RNN-T is the
     /// classic trade-off. Sizes are 0.6B (~600MB-1GB) and 1.1B (~1-2GB) parameters.
@@ -278,7 +377,49 @@ final class TranscriptionEngine: ObservableObject {
         "mlx-community/parakeet-rnnt-0.6b",
         "mlx-community/parakeet-rnnt-1.1b",
     ]
-    static let defaultParakeetModel = "mlx-community/parakeet-tdt-0.6b-v3"
+
+    /// **Default Parakeet model: TDT-CTC 1.1B.** Produces punctuation and
+    /// capitalization natively via its CTC head — no post-processing pass
+    /// needed. Was previously unloadable due to a bug in mlx-audio-swift:
+    /// the model's FastConformer encoder uses `rel_pos_local_attn` as
+    /// its self-attention variant, but the upstream library only matched
+    /// the exact string `"rel_pos"` when picking which attention class
+    /// to instantiate, sending `rel_pos_local_attn` down the non-rel-pos
+    /// path that has no slots for the `linear_pos`/`posBiasU`/`posBiasV`
+    /// weights in the safetensors. Fixed in our fork
+    /// (`JForte-InnoHub/mlx-audio-swift`) by changing the string compare
+    /// to `hasPrefix("rel_pos")`, which matches both `"rel_pos"` and
+    /// `"rel_pos_local_attn"`. Both variants share the same architecture
+    /// — the local variant just adds runtime masking — so the weights
+    /// load cleanly into the full attention class.
+    ///
+    /// Memory note: full attention over the whole sequence uses more
+    /// memory than local windowed attention would, especially for very
+    /// long inputs. In practice, StreamScribe chunks audio before
+    /// inference, so this never matters. If we ever see OOM on long
+    /// chunks, the next step would be implementing the local windowing
+    /// mask in the fork.
+    ///
+    /// **Alternatives** still available in the picker:
+    ///   - `parakeet-tdt-0.6b-v3`: smaller (~600MB vs ~2GB), no native PnC
+    ///     so requires `PnCRestorer` post-processing (Foundation Models
+    ///     on macOS 26+ with Apple Intelligence enabled). Kept as a
+    ///     fallback for users on machines that can't run 1.1B or that
+    ///     can't enable Apple Intelligence.
+    ///   - `parakeet-tdt-1.1b`: same size as the default but no CTC head,
+    ///     so no native PnC. Slightly faster inference.
+    static let defaultParakeetModel = "mlx-community/parakeet-tdt_ctc-1.1b"
+
+    /// Subset shown in the Parakeet model picker by default. TDT-CTC 1.1B
+    /// is the recommended/default (native PnC, ~2GB); TDT 0.6B v3 is the
+    /// lightweight fallback (smaller, requires PnC restoration);
+    /// TDT 1.1B is the no-PnC alternative for users who don't need
+    /// punctuation/capitalization.
+    static let essentialParakeetModels: [String] = [
+        "mlx-community/parakeet-tdt_ctc-1.1b",
+        "mlx-community/parakeet-tdt-0.6b-v3",
+        "mlx-community/parakeet-tdt-1.1b",
+    ]
 
     /// Common languages Whisper handles well. The first option is "Auto-detect" (nil).
     /// "en" forces English, which avoids unreliable per-chunk language detection on
@@ -371,20 +512,149 @@ final class TranscriptionEngine: ObservableObject {
     /// hitting Start on a new source (which clears them like any other session state).
     @Published private(set) var pinnedQuotes: [PinnedQuote] = []
 
+    // MARK: - Speaker spotter
+
+    /// Speakers (by name, matching a voiceprint template) the user
+    /// wants flagged when they start speaking. Mirrors the
+    /// `watchedKeywords` pattern but operates on identified
+    /// speaker names rather than transcript text. The list is
+    /// user-editable from the sidebar's Speaker Spotter section
+    /// and persists across Start/Stop cycles — it's a setting,
+    /// not session state.
+    ///
+    /// **Adds DON'T retroactively scan.** Unlike keywords (where
+    /// adding a keyword mid-session scans existing segments), adding
+    /// a speaker to this list does NOT fire notifications for
+    /// already-identified segments. The user just configured the
+    /// list — they're actively at the screen and don't need to be
+    /// notified about content they can already see. Only FUTURE
+    /// identifications trigger notifications.
+    ///
+    /// **Validation is at the UI layer.** This array only holds
+    /// strings, but the sidebar enforces that strings can only come
+    /// from `VoiceprintService.templates` — there's no way to add a
+    /// free-form name. If a name in this list doesn't match any
+    /// template (because the template was deleted), the matching
+    /// logic silently ignores it — no harm, no notification.
+    @Published var spottedSpeakers: [String] = []
+
+    /// When true, every spotter-driven identification also fires a
+    /// system notification. Off by default — notifications are
+    /// opt-in. Parallel to `notifyOnKeywordHit`.
+    @Published var notifyOnSpeakerHit: Bool = false
+
+    /// Speakers we've already notified about THIS session. Prevents
+    /// notification spam when a spotted speaker speaks repeatedly
+    /// across many segments — the user only needs to know they're
+    /// here, not every time they take another turn.
+    ///
+    /// Cleared on session start in tandem with the rest of the
+    /// session-scoped state.
+    @MainActor private var notifiedSpeakers: Set<String> = []
+
     // MARK: - Miniplayer / audio playback
 
-    /// URL the miniplayer should play back. Two sources:
+    /// URL the miniplayer should play back. Three sources:
     ///   - **Local file transcriptions:** the original file path the user
     ///     imported. Set in `start()` immediately so the miniplayer is
     ///     usable mid-transcription too if the user opens it.
-    ///   - **Live / URL transcriptions:** the .mkv file ffmpeg wrote to
-    ///     disk as a side output during the transcription. Set when the
-    ///     pipeline reaches the natural-end / cancellation branch and
-    ///     `runPipeline` confirms the file exists.
+    ///   - **Live transcriptions (HLS preview):** the resolved HLS m3u8
+    ///     URL of the live stream, set in `start()` shortly after the
+    ///     session mode resolves to `.live` for sources we can resolve
+    ///     cheaply (`.senateGov` via `SenateGovExtractor`, `.hls` and
+    ///     `.directAudio` via the input URL itself). AVPlayer plays HLS
+    ///     live streams natively — handles segment fetching, buffering,
+    ///     and live-edge tracking. Sources requiring yt-dlp resolution
+    ///     (`.youtube`, `.twitter`, etc.) currently don't get a live
+    ///     preview in this basic version.
+    ///   - **Live transcriptions (post-finish recording):** the .mkv file
+    ///     ffmpeg wrote to disk as a side output during the transcription.
+    ///     Replaces the HLS URL set above when the pipeline reaches the
+    ///     natural-end / cancellation branch and `runPipeline` confirms
+    ///     the file exists. The transition happens via AVPlayer's
+    ///     `onChange(of: url)` reload — user sees live preview during
+    ///     the session, then the recorded file after stop.
     /// Cleared (set to nil) at the top of `start()` so the previous
     /// run's URL doesn't leak into the new session before the new
     /// pipeline completes.
     @Published private(set) var playbackMediaURL: URL?
+
+    /// Resolve an HLS m3u8 URL for the live miniplayer preview and set
+    /// `playbackMediaURL`. Called from `start()` as a detached task so
+    /// the resolve latency (~500 ms for senate.gov, near-zero for direct
+    /// HLS) doesn't delay the transcription pipeline startup.
+    ///
+    /// Failure semantics: all paths silently no-op on error. Live
+    /// preview is a "nice to have"; the transcription session itself
+    /// works fine without it. We log failures so they're visible in
+    /// diagnostics but don't surface them to the user — they'd see an
+    /// alert for a feature they didn't ask for, which is worse than
+    /// quietly degrading.
+    ///
+    /// Concurrency: marked `@MainActor` because `playbackMediaURL` is a
+    /// `@Published` property on this `ObservableObject`, and SwiftUI
+    /// observers expect main-actor publication. The senate.gov resolve
+    /// is itself async but happens off the main actor; only the
+    /// publication step touches main.
+    @MainActor
+    private func setupLivePreviewURL(for url: URL, source: StreamSource) async {
+        switch source {
+        case .senateGov:
+            do {
+                let resolved = try await SenateGovExtractor.resolve(url: url)
+                // Belt-and-suspenders: only publish if a session is still
+                // active. If the user already stopped between resolve
+                // start and now, don't pollute the post-stop state.
+                guard self.state.isActive else {
+                    print("[LivePreview] Senate.gov resolved but session no longer active; skipping URL set.")
+                    return
+                }
+                self.playbackMediaURL = resolved.m3u8URL
+                print("[LivePreview] Senate.gov live URL set: \(resolved.m3u8URL.absoluteString)")
+            } catch {
+                print("[LivePreview] Senate.gov extractor failed: \(error.localizedDescription) — no live preview this session.")
+            }
+        case .criticalMention:
+            // Critical Mention clips are static (finite duration), not
+            // live — but they still benefit from the same "give the
+            // miniplayer the resolved stream URL" wiring since AVPlayer
+            // renders HLS regardless of live/static classification.
+            // The resolve step is expensive (3-8s of WebKit) so we run
+            // it inline here rather than duplicating it in the audio
+            // pipeline; AudioStreamExtractor's own extraction call
+            // happens moments later and hits the same page again —
+            // acceptable because the browser extractor tears down its
+            // WKWebView between calls (no state to share).
+            do {
+                let resolved = try await CriticalMentionExtractor.resolve(url: url)
+                guard self.state.isActive else {
+                    print("[LivePreview] Critical Mention resolved but session no longer active; skipping URL set.")
+                    return
+                }
+                self.playbackMediaURL = resolved.m3u8URL
+                print("[LivePreview] Critical Mention URL set: \(resolved.m3u8URL.absoluteString)")
+            } catch {
+                print("[LivePreview] Critical Mention extractor failed: \(error.localizedDescription) — no live preview this session.")
+            }
+        case .hls, .directAudio:
+            // Input URL is already directly playable by AVPlayer. .hls
+            // is an m3u8; .directAudio is typically an mp3/aac stream.
+            // Both work as-is via AVURLAsset.
+            guard self.state.isActive else { return }
+            self.playbackMediaURL = url
+            print("[LivePreview] Direct stream URL set: \(url.absoluteString)")
+        case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
+            // Sources that need `yt-dlp -g` to resolve an m3u8 URL. We
+            // don't have that path plumbed in this basic version of live
+            // preview. Transcription proceeds normally; just no in-session
+            // video preview for these.
+            print("[LivePreview] Source \(source.rawValue) doesn't have a direct HLS resolve path — no live preview this session.")
+        case .localFile:
+            // Not reachable for live sessions (local files are always
+            // static), but listed for switch exhaustiveness.
+            break
+        }
+    }
 
     /// Pin a whole segment group as a single quote. Convenience for the right-click
     /// context menu in the transcript view. The combined text and timestamps are
@@ -548,14 +818,146 @@ final class TranscriptionEngine: ObservableObject {
         return ordered
     }
 
-    /// Resolve a machine label to its display name, falling back to the machine label.
+    /// Resolve a machine label to its display name, in priority order:
+    ///   1. User's explicit per-session rename via `speakerNames` (the
+    ///      existing "Rename Speaker" UI) — always wins
+    ///   2. VoiceprintService cluster-level identification (manual
+    ///      reassignment via the "Identify Speaker" context menu)
+    ///   3. Machine label itself — fallback when nothing matches
+    ///
+    /// **This is the CLUSTER-LEVEL path.** Callers with a specific
+    /// segment in hand should prefer `displayName(forSegment:)` below,
+    /// which factors in per-segment identifications and produces
+    /// finer-grained names when the diarizer merged speakers.
+    /// Cluster-level is correct for exports and for callers that don't
+    /// have a segment UUID (notifications, pin titles, etc).
     func displayName(for machineLabel: String?) -> String? {
         guard let label = machineLabel else { return nil }
+        // Manual rename takes priority — explicit user intent.
         if let custom = speakerNames[label]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !custom.isEmpty {
             return custom
         }
+        // Cluster-level voiceprint identification.
+        let info = VoiceprintService.shared.displayInfo(forClusterId: label)
+        if info.isIdentified {
+            return info.name
+        }
         return label
+    }
+
+    /// Resolve a segment's display name, considering per-segment
+    /// identifications in addition to cluster-level ones. Use this
+    /// when you have a segment UUID — produces correct names through
+    /// diarizer-merge scenarios where multiple speakers share a
+    /// cluster ID but have been individually identified.
+    ///
+    /// **Precedence:**
+    ///   1. `speakerNames[clusterId]` — engine's manual cluster rename
+    ///   2. Per-segment + cluster identifications via
+    ///      `VoiceprintService.displayInfo(forSegmentId:clusterId:)`
+    ///      (which has its own internal precedence: segment-manual >
+    ///      cluster-manual > segment-auto > cluster ID)
+    ///   3. **Cluster majority smoothing** (when `clusterMajorities`
+    ///      is provided): if this segment is unidentified but its
+    ///      cluster has a clear majority identification across its
+    ///      OTHER segments, propagate that name. Catches cases where
+    ///      short segments fall below the extraction duration gate
+    ///      or fail to match cleanly while the surrounding cluster
+    ///      mates DO match — preventing fragmented "Bernie Sanders /
+    ///      Speaker 1 / Bernie Sanders" alternation on continuous
+    ///      single-speaker audio.
+    ///   4. The cluster ID itself — final fallback
+    ///
+    /// **About `clusterMajorities`.** Callers that resolve many
+    /// segments in one pass (visible group computation, export
+    /// rendering) should compute this once via
+    /// `clusterMajorityIdentifications()` and pass it in to avoid
+    /// O(N²) majority recomputation per segment. One-off callers
+    /// (notifications, pin labels) can omit it and accept no
+    /// smoothing — they typically resolve a single segment, not a
+    /// batch.
+    func displayName(forSegment segment: TranscriptSegment,
+                     clusterMajorities: [String: String]? = nil) -> String? {
+        // Manual rename via the existing "Reassign Speaker" UI
+        // always wins. This is the path users have known for years
+        // and we shouldn't surprise them by letting auto-matching
+        // override it.
+        if let cluster = segment.speaker,
+           let custom = speakerNames[cluster]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !custom.isEmpty {
+            return custom
+        }
+        let info = VoiceprintService.shared.displayInfo(
+            forSegmentId: segment.id,
+            clusterId: segment.speaker
+        )
+        if info.isIdentified {
+            return info.name
+        }
+
+        // Cluster majority smoothing: inherit the cluster's
+        // majority-identified name when available. Only fires when
+        // VoiceprintService says this segment is unidentified —
+        // explicit per-segment IDs win.
+        if let cluster = segment.speaker,
+           let majority = clusterMajorities?[cluster] {
+            return majority
+        }
+
+        return info.name  // falls back to cluster ID per displayInfo's contract
+    }
+
+    /// Compute the majority-identified name per cluster, used for
+    /// smoothing unidentified segments to match the consensus of
+    /// their cluster-mates. Returns only the clusters where:
+    ///   - At least 3 segments have been identified, AND
+    ///   - At least 75% of identified segments agree on one name
+    ///
+    /// **Why both thresholds.** The 3-segment minimum guards against
+    /// false confidence from tiny samples ("100% of 1 segment" is
+    /// not evidence). The 75% majority threshold preserves cluster-
+    /// merge detection: a cluster containing two different speakers
+    /// produces ~50/50 identification splits, which fails the
+    /// majority test and leaves unidentified segments correctly
+    /// labeled as the cluster ID. Without this guard, merged
+    /// clusters would get the dominant speaker's name applied to
+    /// the OTHER speaker's segments.
+    ///
+    /// **Cost.** O(N) over segments, single pass. Caller is expected
+    /// to call once per render and reuse the result across all
+    /// segments — avoiding the O(N²) trap of calling per-segment.
+    func clusterMajorityIdentifications() -> [String: String] {
+        // Gather identified names per cluster.
+        var namesByCluster: [String: [String]] = [:]
+        for seg in segments {
+            guard let cluster = seg.speaker else { continue }
+            let info = VoiceprintService.shared.displayInfo(
+                forSegmentId: seg.id,
+                clusterId: cluster
+            )
+            guard info.isIdentified else { continue }
+            namesByCluster[cluster, default: []].append(info.name)
+        }
+
+        // Apply thresholds and return the majority name per qualifying
+        // cluster.
+        var result: [String: String] = [:]
+        for (cluster, names) in namesByCluster {
+            guard names.count >= 3 else { continue }
+
+            var counts: [String: Int] = [:]
+            for name in names {
+                counts[name, default: 0] += 1
+            }
+
+            guard let topEntry = counts.max(by: { $0.value < $1.value }) else { continue }
+            let fraction = Double(topEntry.value) / Double(names.count)
+            if fraction >= 0.75 {
+                result[cluster] = topEntry.key
+            }
+        }
+        return result
     }
 
     /// Total duration of the source audio in seconds, when known up-front. nil for
@@ -811,6 +1213,27 @@ final class TranscriptionEngine: ObservableObject {
     func start(urlString: String) async {
         guard !state.isActive else { return }
 
+        // Capture session start wall-clock immediately. The miniplayer
+        // uses this to map AVPlayer's `currentDate()` (HLS wall-clock)
+        // to session-relative time when the user pauses/seeks a live
+        // stream. Capturing here (before any probe or backend prep) is
+        // intentional: it represents "when the user clicked Start,"
+        // which matches the user's mental model of t=0 for the session
+        // even if backend warm-up adds a few seconds before audio
+        // actually starts flowing.
+        await MainActor.run { self.sessionStartedAt = Date() }
+
+        // Reset the voiceprint identification registry. Without this,
+        // both cluster-level and per-segment identifications from
+        // session A would carry into session B — meaningless and
+        // misleading since segment UUIDs and cluster IDs are session-
+        // local. Same applies to the spotter's notified-speakers set
+        // (per-session debounce; resets each Start).
+        await MainActor.run {
+            VoiceprintService.shared.resetForNewSession()
+            self.notifiedSpeakers.removeAll()
+        }
+
         // Even though state is .idle, a previous session's `pipelineTask`
         // might still be unwinding (the watchdog sets state to .idle
         // immediately when force-cancelling, but the cancelled task's
@@ -950,7 +1373,21 @@ final class TranscriptionEngine: ObservableObject {
             // we give them up to 12s; ffmpeg probes finish in under a
             // second so 3s is plenty.
             if probeStatus == .probing {
-                let timeout: TimeInterval = source.requiresYTDlp ? 12.0 : 3.0
+                // Per-source probe-wait timeout. ffmpeg-only probes resolve
+                // in <1 s so 3 s is plenty. yt-dlp probes can take 6-9 s
+                // for the URL-resolution fallback path (wrapper-page URLs
+                // requiring two yt-dlp invocations), so we wait 12 s.
+                // Senate.gov goes through `SenateGovExtractor` plus a
+                // post-resolution ffmpeg probe — typically 1-2 s, with a
+                // bigger ceiling if the senate.gov page fetch is slow on
+                // a contended network.
+                let timeout: TimeInterval
+                switch source {
+                case .senateGov:                   timeout = 6.0
+                case .criticalMention:             timeout = 18.0
+                case _ where source.requiresYTDlp: timeout = 12.0
+                default:                           timeout = 3.0
+                }
                 let deadline = Date().addingTimeInterval(timeout)
                 while Date() < deadline, probeStatus == .probing {
                     try? await Task.sleep(nanoseconds: 100_000_000)
@@ -964,7 +1401,94 @@ final class TranscriptionEngine: ObservableObject {
             // direct/programmatic Start calls; the sidebar's onChange
             // would have triggered one.
             if totalDurationSeconds == nil, probeStatus == .idle {
-                if source.requiresYTDlp {
+                if source == .senateGov {
+                    // Resolve via SenateGovExtractor to get the m3u8, then
+                    // ffmpeg-probe that. Same fast path as `beginProbe`,
+                    // duplicated here for the direct-Start case where
+                    // the eager probe never fired.
+                    print("[Pipeline] Probing U.S. Senate duration via direct extractor (start-time)…")
+                    do {
+                        let resolved = try await SenateGovExtractor.resolve(url: url)
+                        if let title = resolved.title, !title.isEmpty, self.detectedTitle == nil {
+                            self.detectedTitle = title
+                        }
+                        if resolved.isLive {
+                            print("[Pipeline] Senate.gov: live stream (type=live).")
+                        } else {
+                            // Try primary + alternatives. See beginProbe for
+                            // the full rationale on why we iterate — archived
+                            // content sometimes lives on a different CDN
+                            // than current live streams, and the extractor's
+                            // alternatives list covers the known fallbacks.
+                            var probeResult: FFmpegProbeResult = .failed("no candidates")
+                            let candidates = resolved.alternativeURLs.isEmpty
+                                ? [resolved.m3u8URL]
+                                : resolved.alternativeURLs
+                            for (idx, candidate) in candidates.enumerated() {
+                                probeResult = await TranscriptionEngine.probeRemoteDurationViaFFmpeg(url: candidate)
+                                if case .finite = probeResult {
+                                    if idx > 0 {
+                                        print("[Pipeline] Senate.gov: primary unreachable; alternative \(idx) succeeded.")
+                                    }
+                                    break
+                                }
+                                if case .live = probeResult { break }
+                            }
+                            if case .finite(let s) = probeResult {
+                                totalDurationSeconds = s
+                                print("[Pipeline] Senate.gov + ffmpeg probe: \(String(format: "%.1f", s))s")
+                            } else {
+                                print("[Pipeline] Senate.gov m3u8 probe inconclusive across \(candidates.count) alternatives — but isLive=false from extractor, so trusting that signal.")
+                                // Set a sentinel so the auto-mode resolution
+                                // below classifies as static rather than live.
+                                // The sentinel is "10 seconds" which clears
+                                // the `knownDurationOK >= 10` threshold without
+                                // claiming a specific archive length. The
+                                // UI's progress bar will be inaccurate for
+                                // this session — but live-mode would be
+                                // wholly wrong, and unknown-but-static is
+                                // recoverable (user gets to transcribe the
+                                // archive correctly; only the progress
+                                // estimate is off).
+                                totalDurationSeconds = 10
+                            }
+                        }
+                    } catch {
+                        print("[Pipeline] Senate.gov direct extractor failed (\(error.localizedDescription)) — falling back to yt-dlp.")
+                        if let meta = await TranscriptionEngine.probeYTDlpMetadata(url: url) {
+                            if let seconds = meta.duration {
+                                totalDurationSeconds = seconds
+                                print("[Pipeline] yt-dlp duration: \(String(format: "%.1f", seconds))s")
+                            }
+                            if let title = meta.title, !title.isEmpty, self.detectedTitle == nil {
+                                self.detectedTitle = title
+                            }
+                        }
+                    }
+                } else if source == .criticalMention {
+                    // Same rationale as beginProbe's criticalMention
+                    // branch — resolve first, then ffmpeg-probe the
+                    // m3u8. Hit when the direct-Start path bypassed
+                    // the eager probe (rare; usually beginProbe fired
+                    // when the user pasted the URL).
+                    print("[Pipeline] Probing Critical Mention duration via direct extractor (start-time)…")
+                    do {
+                        let resolved = try await CriticalMentionExtractor.resolve(url: url)
+                        if let title = resolved.title, !title.isEmpty, self.detectedTitle == nil {
+                            self.detectedTitle = title
+                        }
+                        let probeResult = await TranscriptionEngine.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL)
+                        if case .finite(let s) = probeResult {
+                            totalDurationSeconds = s
+                            print("[Pipeline] Critical Mention + ffmpeg probe: \(String(format: "%.1f", s))s")
+                        } else {
+                            print("[Pipeline] Critical Mention m3u8 probe inconclusive — proceeding with unknown duration.")
+                            totalDurationSeconds = 10  // sentinel; same pattern as senate.gov fallback
+                        }
+                    } catch {
+                        print("[Pipeline] Critical Mention extraction failed (\(error.localizedDescription)) — proceeding with unknown duration.")
+                    }
+                } else if source.requiresYTDlp {
                     print("[Pipeline] Probing \(source.rawValue) duration via yt-dlp (start-time)…")
                     if let meta = await TranscriptionEngine.probeYTDlpMetadata(url: url) {
                         if let seconds = meta.duration {
@@ -1042,6 +1566,35 @@ final class TranscriptionEngine: ObservableObject {
         }
         // Publish the resolved mode so the sidebar can show it as the auto subtitle.
         resolvedSessionMode = effectiveMode
+
+        // Live miniplayer preview. For live sessions on sources where we
+        // can cheaply resolve an HLS m3u8 URL, kick off an async task to
+        // set `playbackMediaURL` so the miniplayer (if the user opens it)
+        // shows the live video alongside transcription. AVPlayer plays
+        // HLS live streams natively — handles segment fetching, buffer
+        // management, and live-edge tracking.
+        //
+        // Supported sources for live preview:
+        //   - .senateGov: SenateGovExtractor.resolve() returns the m3u8
+        //   - .hls: input URL is already an m3u8 — use directly
+        //   - .directAudio: input URL is a playable audio stream — use directly
+        //
+        // Unsupported (but live-mode is still valid for transcription):
+        //   - .youtube, .twitter, .facebook, .instagram, .applePodcast,
+        //     .soundcloud, .unknown — these need a `yt-dlp -g` resolution
+        //     that we don't have plumbed for the preview path. Live
+        //     transcription still works for these; just no video preview
+        //     during the session. The post-session .mkv replacement
+        //     (set in runPipeline's natural-end branch) still applies
+        //     for these.
+        //
+        // Failures here are non-fatal — live preview is best-effort.
+        // The transcription pipeline continues regardless.
+        if effectiveMode == .live, !url.isFileURL {
+            Task { [weak self] in
+                await self?.setupLivePreviewURL(for: url, source: source)
+            }
+        }
 
         // Use whole-file diarization when in static mode AND a diarizer is enabled.
         // This gives the diarizer global context and produces stable speaker IDs
@@ -1344,7 +1897,7 @@ final class TranscriptionEngine: ObservableObject {
         // guarantee that isolation cheaply.
         if useMultiPassLive {
             let refinedKind = effectiveRefinedEngine
-            refinedTranscriber = makeTranscriber(kind: refinedKind, role: "refined")
+            refinedTranscriber = makeTranscriber(kind: refinedKind, role: "refined", isRefined: true)
             refinedDiarizer = makeDiarizer(kind: diarizationEngine)
             if refinedKind == transcriptionEngine {
                 print("[Pipeline] Multi-pass live: built refined pair (transcriber=\(refinedKind.rawValue), diarizer=\(diarizationEngine.rawValue)).")
@@ -1369,21 +1922,37 @@ final class TranscriptionEngine: ObservableObject {
     /// caller could pass `.cpuAndNeuralEngine` for raw and `.cpuAndGPU` for
     /// refined to spread CoreML load across compute units; the plumbing
     /// supports it.
+    /// Factory for transcription backends. Pulled out of `rebuildBackends`
+    /// so the raw + refined slots can share the same construction logic
+    /// while each slot independently routes to the right model.
+    ///
+    /// **`isRefined` parameter** selects between the raw model properties
+    /// (`whisperModelName` / `parakeetModelName`) and the refined ones
+    /// (`refinedWhisperModelName` / `refinedParakeetModelName`). The
+    /// refined properties only have an effect when `useSplitRefinedEngine`
+    /// is on — otherwise we use the raw model on both slots so the
+    /// refined slot's saved model is effectively dormant. This matches
+    /// the engine-kind behavior (refined engine kind ignored unless
+    /// split is on).
     @MainActor
     private func makeTranscriber(kind: TranscriptionEngineKind,
                                  computeUnits: ComputeUnits = .auto,
-                                 role: String = "") -> TranscriptionBackend {
+                                 role: String = "",
+                                 isRefined: Bool = false) -> TranscriptionBackend {
+        let useRefinedModel = isRefined && useSplitRefinedEngine
         switch kind {
         case .whisperKit:
+            let modelName = useRefinedModel ? refinedWhisperModelName : whisperModelName
             return WhisperKitBackend(
-                modelName: whisperModelName,
+                modelName: modelName,
                 languageCode: selectedLanguageCode,
                 computeUnits: computeUnits,
                 role: role
             )
         case .parakeet:
+            let modelRepo = useRefinedModel ? refinedParakeetModelName : parakeetModelName
             return ParakeetBackend(
-                modelRepo: parakeetModelName,
+                modelRepo: modelRepo,
                 chunkDuration: chunkSeconds
             )
         }
@@ -1399,6 +1968,8 @@ final class TranscriptionEngine: ObservableObject {
             return SpeakerKitBackend()
         case .sortformer:
             return SortformerBackend()
+        case .fluidAudio:
+            return FluidAudioBackend()
         }
     }
 
@@ -1408,11 +1979,24 @@ final class TranscriptionEngine: ObservableObject {
     /// nil for engine kinds we haven't wired into the manager — today every
     /// kind maps, but this keeps the call sites safe if a future engine is
     /// added before its manager support lands.
+    ///
+    /// **`isRefined` parameter** — same role as in `makeTranscriber`: when
+    /// `true` AND `useSplitRefinedEngine`, returns the model key for the
+    /// refined-slot model name. Otherwise uses the raw model name. This
+    /// matters because the status indicator/download surfaces should
+    /// reflect whichever model is actually loaded for that slot, not always
+    /// the raw one.
     @MainActor
-    private func transcriberKey(kind: TranscriptionEngineKind) -> ModelDownloadManager.ModelKey? {
+    private func transcriberKey(kind: TranscriptionEngineKind,
+                                isRefined: Bool = false) -> ModelDownloadManager.ModelKey? {
+        let useRefinedModel = isRefined && useSplitRefinedEngine
         switch kind {
-        case .whisperKit: return .whisper(modelName: whisperModelName)
-        case .parakeet:   return .parakeet(modelRepo: parakeetModelName)
+        case .whisperKit:
+            let name = useRefinedModel ? refinedWhisperModelName : whisperModelName
+            return .whisper(modelName: name)
+        case .parakeet:
+            let repo = useRefinedModel ? refinedParakeetModelName : parakeetModelName
+            return .parakeet(modelRepo: repo)
         }
     }
 
@@ -1424,6 +2008,7 @@ final class TranscriptionEngine: ObservableObject {
         case .off:        return nil
         case .speakerKit: return .speakerKit
         case .sortformer: return .sortformer
+        case .fluidAudio: return .fluidAudio
         }
     }
 
@@ -1541,7 +2126,7 @@ final class TranscriptionEngine: ObservableObject {
                 // diarizer the user picked — so `refinedDiarizerKey` always
                 // mirrors `rawDiarizerKey`.
                 let refinedTKey: ModelDownloadManager.ModelKey? = self.useSplitRefinedEngine
-                    ? self.transcriberKey(kind: self.refinedTranscriptionEngine)
+                    ? self.transcriberKey(kind: self.refinedTranscriptionEngine, isRefined: true)
                     : self.transcriberKey(kind: self.transcriptionEngine)
                 return PipelineSnapshot(
                     rawTranscriber: self.rawTranscriber,
@@ -1824,28 +2409,49 @@ final class TranscriptionEngine: ObservableObject {
                 // nil or empty (which shouldn't happen if the toggle was on
                 // from the start, but the guard is cheap insurance for
                 // edge cases like an immediate stop before any audio
-                // arrived). The state label + SpeakerKit setup costs are
+                // arrived). The state label + backend setup costs are
                 // paid eagerly so the user sees feedback even on the
                 // no-audio edge case.
-                await setState(.preparing("Re-identifying speakers with SpeakerKit…"))
-                print("[Pipeline] Post-finish re-diarization: spinning up SpeakerKit for whole-file pass.")
-                let finalizer = SpeakerKitBackend()
+                //
+                // Engine selection: `rediarizeEngine` is the user's choice
+                // for this pass (defaults to `.speakerKit` for backward
+                // compat). Independent of `diarizationEngine` — a user can
+                // run Sortformer streaming for low-latency live labels
+                // and FluidAudio offline for the final relabel.
+                //
+                // The choice is captured at session start (snapshot), not
+                // read live here, so changing the picker mid-session
+                // doesn't take effect until the next session. Matches how
+                // every other engine/model selection on this object works.
+                let engineForRediarize = await MainActor.run { self.rediarizeEngine }
+                let engineLabel = engineForRediarize.rawValue
+
+                await setState(.preparing("Re-identifying speakers with \(engineLabel)…"))
+                print("[Pipeline] Post-finish re-diarization: spinning up \(engineLabel) for whole-file pass.")
+                let finalizer = await MainActor.run { self.makeDiarizer(kind: engineForRediarize) }
                 do {
-                    // Even though this SpeakerKit instance is ephemeral, route
-                    // its prepare() through the status helper so the sidebar's
-                    // SpeakerKit indicator shows the download/load activity. A
-                    // user who turned on rediarize without ever using
-                    // SpeakerKit as the primary diarizer would otherwise see
-                    // no indication that a model load was happening here.
-                    try await preparingWithStatusReport(key: .speakerKit) {
+                    // Route prepare() through the status helper so the
+                    // sidebar's model indicator shows download/load activity.
+                    // A user who turned on rediarize with an engine they
+                    // don't otherwise use as primary diarizer would
+                    // otherwise see no indication that a model load was
+                    // happening here. Uses `diarizerKey` so the indicator
+                    // matches the selected engine, not the (hardcoded
+                    // legacy) SpeakerKit one.
+                    let key = await MainActor.run { self.diarizerKey(kind: engineForRediarize) }
+                    try await preparingWithStatusReport(key: key) {
                         try await finalizer.prepare()
                     }
                     await runWholeFileDiarization(diarizer: finalizer)
                 } catch {
-                    // Don't fail the whole session if SpeakerKit can't load
-                    // post-hoc — the live transcript with its per-chunk
-                    // diarizer labels is still useful. Log and move on.
-                    print("[Pipeline] Post-finish SpeakerKit prepare failed: \(error.localizedDescription). Keeping live diarization labels.")
+                    // Don't fail the whole session if the rediarize backend
+                    // can't load post-hoc — the live transcript with its
+                    // per-chunk diarizer labels is still useful. Log and
+                    // move on. (FluidAudio's first-run download in
+                    // particular can be slow if the user hasn't pre-cached
+                    // the models; this protects the session from being
+                    // held up by that.)
+                    print("[Pipeline] Post-finish \(engineLabel) prepare failed: \(error.localizedDescription). Keeping live diarization labels.")
                 }
             }
 
@@ -2045,11 +2651,32 @@ final class TranscriptionEngine: ObservableObject {
                 return copy
             }
         }
+
+        // Voiceprint identification runs AFTER all segment + pin
+        // reconciliation is done. Order matters: identification reads
+        // the segments' final cluster assignments and looks for the
+        // longest stretches per cluster. Re-running diarization,
+        // de-shouting, and pin re-resolution may change those
+        // cluster IDs (the deshout pass doesn't, but a future
+        // diarizer refinement might), so we identify last to make
+        // sure we're matching against the version the user actually
+        // sees in the transcript.
+        await runVoiceprintIdentificationStatic()
     }
 
     /// Hop to MainActor and set state. The shorthand we use throughout the pipeline.
     private func setState(_ newState: EngineState) async {
-        await MainActor.run { self.state = newState }
+        await MainActor.run {
+            self.state = newState
+            // When session reaches a terminal state, clear the wall-clock
+            // start. This isn't strictly required (miniplayer detects
+            // mode from URL extension), but matches the documented
+            // contract on `sessionStartedAt` and keeps the property
+            // honest for any future readers.
+            if !newState.isActive {
+                self.sessionStartedAt = nil
+            }
+        }
     }
 
     /// While the buffer has at least one full chunk, pull a chunk off, transcribe + diarize, advance.
@@ -2331,6 +2958,13 @@ final class TranscriptionEngine: ObservableObject {
         // only need to overwrite when the multi-pass pipeline is active.
         let stampAsRaw = useMultiPassLive
 
+        // Snapshot `segments.count` so we can identify which segments
+        // this chunk added — needed by `runVoiceprintIdentification`
+        // to update per-cluster speech accumulators for only the new
+        // material rather than re-counting the whole session every
+        // chunk.
+        let segmentsBeforeAppend = segments.count
+
         for var seg in incoming {
             // Trim any leading words that overlap with the tail of the previous segment.
             // Whisper transcribes our overlap window twice (once at the end of chunk N,
@@ -2387,6 +3021,16 @@ final class TranscriptionEngine: ObservableObject {
             if stampAsRaw {
                 seg.refinementState = .raw
             }
+
+            // Apply user's custom dictionary substitutions (e.g.
+            // "Jamie Diamond" → "Jamie Dimon"). Runs here, after PnC
+            // restoration but before append, so the user sees corrected
+            // text immediately in live mode. The dictionary applies
+            // case-insensitively to the find pattern and inserts the
+            // replacement verbatim. No-op (returns input unchanged) if
+            // the user has no entries configured.
+            seg.text = CustomDictionary.shared.apply(to: seg.text)
+
             segments.append(seg)
 
             // Multi-pass: stamp wall-clock "raw pass produced output" so the
@@ -2408,6 +3052,396 @@ final class TranscriptionEngine: ObservableObject {
             // runWholeFileDiarization.)
             checkKeywordsAndAutoPin(segment: seg)
         }
+
+        // Voiceprint identification pass. Runs once per chunk via
+        // `runVoiceprintIdentification`, which walks active clusters,
+        // applies the gate (≥3s of speech, not high-confidence-
+        // identified yet, ≥30s since last extraction), slices
+        // per-cluster audio from FluidAudio's accumulated buffer,
+        // and runs WeSpeaker via the side-channel extractor.
+        //
+        // **Why per-chunk rather than per-segment.** Cluster speech
+        // accumulates across segments; checking the gate once per
+        // chunk is the natural granularity. Per-segment would
+        // re-evaluate the gate 10-30 times more often with no
+        // additional new information.
+        //
+        // **Static mode bypass.** The gate hinges on
+        // `FluidAudioBackend.sliceAccumulatedBuffer` having audio
+        // for recent cluster time ranges; in static mode the offline
+        // diarizer doesn't populate that buffer the same way, so
+        // we run identification separately at end-of-session via
+        // `runVoiceprintIdentificationStatic` (called from
+        // `runWholeFileDiarization`).
+        let newSegments = Array(segments.suffix(segments.count - segmentsBeforeAppend))
+        await runVoiceprintIdentification(newSegments: newSegments)
+    }
+
+    // MARK: - Voiceprint identification
+
+    /// Run per-segment voiceprint identification for the live session.
+    /// Called from the per-chunk append loop after segments have been
+    /// added.
+    ///
+    /// **The gate.** For each new segment, identification fires only if:
+    ///   1. The segment is ≥1.5 seconds long. WeSpeaker embeddings
+    ///      under 1.5s are too noisy to be useful — extraction wastes
+    ///      compute on bad data.
+    ///   2. The segment doesn't already have an identification.
+    ///      Segment identifications are stable once made; the audio
+    ///      doesn't change after the segment is finalized.
+    ///   3. The cluster doesn't have a manual cluster-level
+    ///      reassignment. If the user said "all Speaker 1 segments
+    ///      are Senator Warren," there's no point computing per-
+    ///      segment IDs that would be overridden anyway.
+    ///
+    /// **Why per-segment rather than per-cluster.** Cluster-level
+    /// matching couldn't disambiguate diarizer-merged speakers — when
+    /// Senator A and Senator B got lumped into "Speaker 1," the
+    /// cluster's running-mean embedding landed somewhere between them
+    /// and matched neither well. Per-segment matching catches them
+    /// individually and the transcript view groups by effective name,
+    /// visually splitting the merge.
+    ///
+    /// **Compute cost.** For a typical Senate hearing producing ~300
+    /// segments, maybe 150 segments are ≥1.5s. At ~150ms per
+    /// extraction = ~22 seconds of work distributed across the
+    /// session. Sequential, no concurrent extractions — WeSpeaker on
+    /// ANE serializes anyway.
+    private func runVoiceprintIdentification(newSegments: [TranscriptSegment]) async {
+        guard VoiceprintService.shared.isEnabled else { return }
+
+        // **Defer to the refined pass when multi-pass refinement is
+        // active.** Three wins from this skip:
+        //
+        //   1. **Latency.** Per-chunk WeSpeaker work (~150ms per
+        //      qualifying segment, ANE-serialized) blocks the raw
+        //      append loop and pushes display latency. Refined-pass
+        //      runs on its own scheduler with its own latency budget,
+        //      off the critical display path.
+        //
+        //   2. **Segmentation quality.** Refined segments come from a
+        //      30s-window transcriber with cleaner boundaries and
+        //      better timing than raw per-chunk segments. WeSpeaker
+        //      embeddings extracted from better-bounded audio match
+        //      more reliably.
+        //
+        //   3. **No double work.** Without this skip, raw identifies
+        //      a segment, then refinement replaces it (new UUID) and
+        //      identifies again — the old identification becomes an
+        //      orphan in `segmentIdentifications` and we pay for two
+        //      WeSpeaker calls per segment.
+        //
+        // **Trade-off:** segments that never get refined (refinement
+        // failure, or the session ends before the window covers them)
+        // stay unidentified. Acceptable — refinement failures are
+        // rare, and `clusterMajorityIdentifications()` typically fills
+        // the visual gap from neighbors anyway.
+        guard !useMultiPassLive else { return }
+
+        guard let fluidAudio = rawDiarizer as? FluidAudioBackend else { return }
+
+        let minDurationSeconds: Double = 1.5
+
+        for seg in newSegments {
+            // Gate 1 — minimum duration.
+            guard (seg.end - seg.start) >= minDurationSeconds else { continue }
+
+            // Gate 2 — already identified (manual or auto).
+            if VoiceprintService.shared.segmentIdentifications[seg.id] != nil {
+                continue
+            }
+
+            // Gate 3 — cluster-level manual reassignment skips
+            // per-segment matching to save compute.
+            if let clusterId = seg.speaker,
+               let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+               clusterIdent.isManual {
+                continue
+            }
+
+            await extractAndIdentifySegment(seg, via: fluidAudio)
+        }
+    }
+
+    /// Slice a single segment's audio out of FluidAudio's accumulated
+    /// buffer, run WeSpeaker, and feed the result into VoiceprintService.
+    /// Silent on extraction failure — the segment stays unidentified
+    /// and falls back to its cluster's display name. Failures are
+    /// frequent and uninteresting (short segments where the buffer
+    /// already trimmed past, contested audio at speaker boundaries);
+    /// logging each one would drown the console.
+    private func extractAndIdentifySegment(
+        _ segment: TranscriptSegment,
+        via fluidAudio: FluidAudioBackend
+    ) async {
+        let audio = await fluidAudio.sliceAccumulatedBuffer(
+            from: segment.start,
+            to: segment.end
+        )
+
+        // Need at least 1 second after slicing — buffer may have
+        // trimmed older audio away even though the segment metadata
+        // says it was 2s long.
+        guard audio.count >= 16_000 else { return }
+
+        do {
+            let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
+            VoiceprintService.shared.identifySegment(
+                segmentId: segment.id,
+                embedding: embedding,
+                clusterId: segment.speaker
+            )
+
+            // Only log successful identifications (matches above
+            // threshold). Misses are uninteresting and noisy.
+            if let id = VoiceprintService.shared.segmentIdentifications[segment.id] {
+                let shortID = String(segment.id.uuidString.prefix(8))
+                print("[Voiceprint] Seg \(shortID) (\(segment.speaker ?? "?")) → \(id.name) (conf \(String(format: "%.3f", id.confidence)))")
+
+                // Spotter check — runs only on automatic per-segment
+                // matching, not manual identifications. The user
+                // setting a manual ID via context menu IS the
+                // notification (they're at the screen interacting
+                // with the app); the spotter exists for the
+                // "walked away from a long hearing" case where the
+                // automatic matcher catches a target speaker.
+                checkSpeakerSpotter(identifiedName: id.name, segment: segment)
+            }
+        } catch {
+            // Quietly drop. See method docstring for why.
+        }
+    }
+
+    /// Per-segment voiceprint identification for a freshly-refined
+    /// window. Called from `performRefinementPass` after the refined
+    /// segments have been swapped into the transcript via
+    /// `replaceSegments`. Operates on the window audio the refinement
+    /// pass already has in hand — no second buffer slice, no second
+    /// audio source plumbing.
+    ///
+    /// **Same gating rules as the raw-pass path:** ≥1.5s segment
+    /// duration, skip already-identified segments, skip if the
+    /// cluster has a manual cluster-level identification. The
+    /// extraction-failure handling is also identical — silent skip,
+    /// segment stays unidentified.
+    ///
+    /// **Why a separate method instead of reusing
+    /// `runVoiceprintIdentification`.** Different audio source (window
+    /// buffer in scope here vs. FluidAudio's accumulated buffer in the
+    /// raw path) and different segment-collection logic (this method
+    /// walks all segments within a time range; the raw path takes the
+    /// chunk's appended segments as input). Sharing more would require
+    /// generalizing both audio access AND segment selection through
+    /// parameters; keeping them as siblings is cleaner.
+    @MainActor
+    private func runVoiceprintIdentificationForRefinedWindow(
+        windowAudio: [Float],
+        windowStart: TimeInterval,
+        windowEnd: TimeInterval
+    ) async {
+        guard VoiceprintService.shared.isEnabled else { return }
+
+        let minDurationSeconds: Double = 1.5
+        let sampleRate: Double = 16_000
+        let minSamples = Int(1.0 * sampleRate)
+
+        // Collect segments that fall within this window. The block-
+        // replacement done above means every refined segment now in
+        // `self.segments` for this time range is fresh — we don't
+        // need to filter on refinementState because the replacement
+        // dropped any leftover .raw/.pending segments in this range.
+        let candidates = self.segments.filter { seg in
+            seg.start >= windowStart && seg.end <= windowEnd
+        }
+
+        for seg in candidates {
+            // Gate 1 — minimum duration.
+            guard (seg.end - seg.start) >= minDurationSeconds else { continue }
+
+            // Gate 2 — already identified. Refined-pass replacement
+            // produces NEW segment UUIDs, so this gate normally just
+            // means "manual override touched this segment after
+            // replacement" — a rare corner case but cheap to check.
+            if VoiceprintService.shared.segmentIdentifications[seg.id] != nil {
+                continue
+            }
+
+            // Gate 3 — cluster-level manual ID skips per-segment work.
+            if let clusterId = seg.speaker,
+               let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+               clusterIdent.isManual {
+                continue
+            }
+
+            // Slice audio for this segment from the window buffer.
+            // Time → sample-index conversion is straightforward since
+            // we know the window's start time and the audio is at the
+            // canonical 16kHz mono rate.
+            let startIdx = Int((seg.start - windowStart) * sampleRate)
+            let endIdx = Int((seg.end - windowStart) * sampleRate)
+            guard startIdx >= 0,
+                  endIdx <= windowAudio.count,
+                  startIdx < endIdx else {
+                continue
+            }
+            let audio = Array(windowAudio[startIdx..<endIdx])
+            guard audio.count >= minSamples else { continue }
+
+            do {
+                let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
+                VoiceprintService.shared.identifySegment(
+                    segmentId: seg.id,
+                    embedding: embedding,
+                    clusterId: seg.speaker
+                )
+
+                // Cluster identification may have just landed. Check
+                // whether the segment's cluster now has a name and
+                // fire the spotter if so — since cluster IDs now flow
+                // to every segment via `displayInfo`, this is where
+                // the spotter check anchors.
+                if let clusterId = seg.speaker,
+                   let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+                   !clusterIdent.isManual {
+                    let shortID = String(seg.id.uuidString.prefix(8))
+                    print("[Voiceprint] Refined seg \(shortID) (\(seg.speaker ?? "?")) → \(clusterIdent.name) (cluster, conf \(String(format: "%.3f", clusterIdent.confidence)))")
+
+                    // Same spotter check as the raw-pass path. Per-
+                    // session debounce in `checkSpeakerSpotter` makes
+                    // this safe even if a speaker's audio crosses
+                    // multiple refinement windows.
+                    checkSpeakerSpotter(identifiedName: clusterIdent.name, segment: seg)
+                }
+            } catch {
+                // Quietly skip — see extractAndIdentifySegment's docstring.
+            }
+        }
+    }
+
+    /// Spotter notification path. Called after a segment is
+    /// automatically identified — if the identified name matches a
+    /// spotted speaker AND notifications are enabled AND we haven't
+    /// already notified for this speaker in the current session,
+    /// post a system notification.
+    ///
+    /// **Per-session debounce.** Spotted speakers in a long hearing
+    /// likely speak across many segments — notifying on every one
+    /// would be spammy. We notify once per (speaker, session) pair,
+    /// signaling "they're here" rather than "they spoke again." The
+    /// `notifiedSpeakers` set tracks which speakers have fired this
+    /// session; cleared at session start.
+    ///
+    /// **Why not unify with keyword auto-pin's check.** Keywords fire
+    /// per-match (an interesting moment); speaker spotter fires
+    /// per-arrival (a person's presence). Different semantics, so
+    /// the two paths stay separate even though the wiring looks
+    /// similar.
+    @MainActor
+    private func checkSpeakerSpotter(identifiedName: String, segment: TranscriptSegment) {
+        // Cheapest checks first — most invocations exit at one of these.
+        guard notifyOnSpeakerHit else { return }
+        guard !spottedSpeakers.isEmpty else { return }
+        guard spottedSpeakers.contains(identifiedName) else { return }
+
+        // Per-session dedupe.
+        guard !notifiedSpeakers.contains(identifiedName) else { return }
+        notifiedSpeakers.insert(identifiedName)
+
+        NotificationService.shared.postSpeakerHit(
+            speaker: identifiedName,
+            snippet: segment.text
+        )
+    }
+
+    /// Static-mode identification. Called once at the end of
+    /// `runWholeFileDiarization` after segments + pins are finalized.
+    /// Walks every segment, applies the same gates as live mode, and
+    /// runs WeSpeaker on segments that qualify. Source audio comes
+    /// from `fullPcmBuffer` (the whole-session PCM the static
+    /// pipeline operates on).
+    ///
+    /// **Identical gating to live mode.** Same 1.5s minimum, same
+    /// skip-if-cluster-manual, same skip-if-already-identified. The
+    /// audio source is the only difference: `fullPcmBuffer` instead
+    /// of FluidAudio's rolling accumulated buffer.
+    ///
+    /// **Compute envelope.** For an 8-speaker, 90-minute hearing with
+    /// ~300 segments after diarization, maybe 150 qualify. At ~150ms
+    /// each → ~22s added to end-of-session processing. The user sees
+    /// the spinner extend by that amount; acceptable trade for
+    /// catching diarizer merges visually.
+    private func runVoiceprintIdentificationStatic() async {
+        guard VoiceprintService.shared.isEnabled else { return }
+
+        let (pcm, allSegments) = await MainActor.run {
+            (self.fullPcmBuffer ?? [], self.segments)
+        }
+
+        guard !pcm.isEmpty else {
+            print("[Voiceprint] Static identification: no PCM buffer, skipping")
+            return
+        }
+        guard !allSegments.isEmpty else {
+            print("[Voiceprint] Static identification: no segments, skipping")
+            return
+        }
+
+        let sampleRate: Double = 16_000
+        let minDurationSeconds: Double = 1.5
+        var identifiedCount = 0
+        var attemptedCount = 0
+
+        for seg in allSegments {
+            guard (seg.end - seg.start) >= minDurationSeconds else { continue }
+            if VoiceprintService.shared.segmentIdentifications[seg.id] != nil { continue }
+            if let clusterId = seg.speaker,
+               let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+               clusterIdent.isManual {
+                continue
+            }
+
+            let startIdx = Int(seg.start * sampleRate)
+            let endIdx = Int(seg.end * sampleRate)
+            guard startIdx >= 0,
+                  endIdx <= pcm.count,
+                  startIdx < endIdx else {
+                continue
+            }
+
+            let audio = Array(pcm[startIdx..<endIdx])
+            guard audio.count >= 16_000 else { continue }
+
+            attemptedCount += 1
+            do {
+                let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
+                VoiceprintService.shared.identifySegment(
+                    segmentId: seg.id,
+                    embedding: embedding,
+                    clusterId: seg.speaker
+                )
+                // Count as identified if the CLUSTER has an identification
+                // (cluster-level matching is the new primary path) OR a
+                // per-segment manual override is set (backward compat).
+                if let cluster = seg.speaker,
+                   VoiceprintService.shared.identifications[cluster] != nil {
+                    identifiedCount += 1
+                } else if VoiceprintService.shared.segmentIdentifications[seg.id] != nil {
+                    identifiedCount += 1
+                }
+            } catch {
+                // Quietly skip — same rationale as live mode.
+            }
+        }
+
+        print("[Voiceprint] Static identification: \(identifiedCount)/\(attemptedCount) segments identified via clusters")
+
+        // Final pass: force-identify any cluster that still has an
+        // aggregated embedding but hasn't been matched yet (below the
+        // 5-since-last-match threshold). At session end we want to run
+        // one final match on everything to make sure short clusters
+        // get their chance.
+        VoiceprintService.shared.forceMatchAllPendingClusters()
     }
 
     // MARK: - Refinement scheduler (Phase 4, multi-pass live)
@@ -2719,6 +3753,17 @@ final class TranscriptionEngine: ObservableObject {
                         excludingRange: refinementWindow
                     )
                     copy.refinementState = .refined
+                    // Apply custom dictionary to the refined text. Same
+                    // hook as the raw-append path, but for the refined
+                    // pass. Without this, the dictionary would only
+                    // affect live segments but get overwritten when
+                    // the refined pass landed — users would see their
+                    // "Jamie Diamond → Jamie Dimon" correction vanish
+                    // a few seconds after each segment appeared. The
+                    // hook runs after refinement (i.e. the refined
+                    // pass also gets to use its own better word choice
+                    // before our dictionary applies on top).
+                    copy.text = CustomDictionary.shared.apply(to: copy.text)
                     return copy
                 }
 
@@ -2808,6 +3853,18 @@ final class TranscriptionEngine: ObservableObject {
         await MainActor.run {
             self.replaceSegments(in: bufferStartTime...windowEndTime, with: refinedSegments)
         }
+
+        // Voiceprint identification for this window's refined segments.
+        // The raw pass skips per-segment matching when multi-pass is
+        // active (see `runVoiceprintIdentification`'s defer guard); this
+        // is where that deferred work happens. We pass the same audio
+        // window the transcriber operated on — already in scope — and
+        // slice per-segment for WeSpeaker extraction.
+        await runVoiceprintIdentificationForRefinedWindow(
+            windowAudio: sampleWindow,
+            windowStart: bufferStartTime,
+            windowEnd: windowEndTime
+        )
 
         // Refined pair stays loaded for subsequent windows — no per-pass
         // unload. The session-end teardown happens implicitly when the actor
@@ -3939,6 +4996,41 @@ final class TranscriptionEngine: ObservableObject {
     ///
     /// Logs each reabsorb under `[Refinement/Reabsorb]` so the
     /// behavior is auditable when diagnosing later issues.
+    /// Re-apply the user's custom dictionary to every segment currently
+    /// in `self.segments`. Triggered by the "Re-apply Dictionary"
+    /// button in Settings. Used when the user added/edited rules after
+    /// segments were already finalized and wants the corrections to
+    /// land retroactively.
+    ///
+    /// **Why this is a separate operation from the per-segment hook.**
+    /// The hook in `processChunk` and the refinement landing path runs
+    /// dictionary application at transcribe-time, when text is first
+    /// produced. Once segments are in `self.segments`, the dictionary
+    /// isn't re-applied automatically on every entry edit — that would
+    /// be expensive (re-running the regex pass for every keystroke in
+    /// the editor) and surprising (users editing a rule wouldn't expect
+    /// every past segment to mutate underfoot). The explicit button
+    /// gives the user control over when retroactive application happens.
+    ///
+    /// **Side effects.** Mutates `self.segments` in place. Triggers a
+    /// SwiftUI update via the @Published wrapper. Logs the count of
+    /// segments that actually changed (vs were left as-is because no
+    /// rule matched them) so the user can confirm the operation did
+    /// something.
+    @MainActor
+    func reapplyCustomDictionary() {
+        var changed = 0
+        for idx in segments.indices {
+            let original = segments[idx].text
+            let rewritten = CustomDictionary.shared.apply(to: original)
+            if rewritten != original {
+                segments[idx].text = rewritten
+                changed += 1
+            }
+        }
+        print("[CustomDictionary] retroactive apply: \(changed) segment(s) updated, \(segments.count - changed) unchanged")
+    }
+
     @MainActor
     private func reabsorbTinyTrailingFragments(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
         guard segments.count >= 3 else { return segments }
@@ -4467,7 +5559,125 @@ final class TranscriptionEngine: ObservableObject {
             // assigning a new one.
             let probeResult: ProbeOutcome
             let probedTitle: String?
-            if source.requiresYTDlp {
+            if source == .senateGov {
+                // Senate.gov: resolve to m3u8 + title via our own extractor,
+                // then duration-probe the m3u8 with ffmpeg (sub-second).
+                // Total ~500 ms-1 s vs ~6-9 s for yt-dlp + fallback. On
+                // extractor failure, fall through to yt-dlp — same as
+                // AudioStreamExtractor does for the download path.
+                do {
+                    let resolved = try await SenateGovExtractor.resolve(url: url)
+                    probedTitle = resolved.title
+                    if resolved.isLive {
+                        // type=live on the ISVP URL — no need to probe
+                        // duration; we know it's a live stream.
+                        probeResult = .live
+                    } else {
+                        // Archived hearing. Probe the m3u8 for duration
+                        // — ffmpeg reads the manifest header in <1 s.
+                        //
+                        // Try the primary URL first, then fall through to
+                        // the alternatives if it fails. Older archived
+                        // content sometimes lives on a different CDN
+                        // (msl3archive instead of media-srs, or legacy
+                        // akamaihd paths) than current live streams. The
+                        // extractor produces all viable candidates in
+                        // `alternativeURLs` (primary first, then backups);
+                        // we try each until one returns a finite duration.
+                        var ff: FFmpegProbeResult = .failed("no candidates")
+                        let candidates = resolved.alternativeURLs.isEmpty
+                            ? [resolved.m3u8URL]
+                            : resolved.alternativeURLs
+                        for (idx, candidate) in candidates.enumerated() {
+                            ff = await Self.probeRemoteDurationViaFFmpeg(url: candidate)
+                            if case .finite = ff {
+                                if idx > 0 {
+                                    print("[Probe] U.S. Senate: primary m3u8 unreachable; alternative \(idx) (\(candidate.host ?? "?")) succeeded.")
+                                }
+                                break
+                            }
+                            if case .live = ff { break } // explicit live signal — no point continuing
+                        }
+                        switch ff {
+                        case .finite(let s): probeResult = .finite(s)
+                        case .live:          probeResult = .live
+                        case .failed:
+                            // All m3u8 alternatives failed ffmpeg probe.
+                            // Two possibilities:
+                            //   1. Network/firewall blocking the akamaized/akamaihd
+                            //      CDNs (corporate proxy, captive portal).
+                            //   2. Archive content lives at a URL pattern we
+                            //      don't know about yet.
+                            // BUT — we already know from `type=arch` on the ISVP
+                            // URL that this is archived content, not live. So
+                            // we don't fall through to `.live` (which would
+                            // misclassify the session and run live-mode
+                            // transcription on a recording). Instead, surface
+                            // as `.failed` with a clear message — the user
+                            // gets feedback that something's wrong with the
+                            // probe and can either retry or manually choose
+                            // Static mode (which proceeds with unknown
+                            // duration since this is yt-dlp-source-eligible).
+                            print("[Probe] U.S. Senate: all \(candidates.count) m3u8 alternatives failed ffmpeg probe for archived hearing. Reporting as failed rather than defaulting to Live (extractor confirmed type=arch).")
+                            probeResult = .failed("Senate.gov archived hearing m3u8 unreachable — network or firewall may be blocking the akamaized/akamaihd CDN. Try again, or manually select Static mode.")
+                        }
+                    }
+                } catch {
+                    // Extractor failed (unknown committee, parse failure,
+                    // page structure changed). Fall back to the yt-dlp
+                    // probe path with URL-resolution fallback.
+                    print("[Probe] U.S. Senate direct extractor failed (\(error.localizedDescription)) — falling back to yt-dlp probe.")
+                    if let meta = await Self.probeYTDlpMetadata(url: url) {
+                        probedTitle = meta.title
+                        if let seconds = meta.duration {
+                            probeResult = .finite(seconds)
+                        } else {
+                            probeResult = .live
+                        }
+                    } else {
+                        probedTitle = nil
+                        probeResult = .failed("Senate.gov resolution failed and yt-dlp probe also failed — check URL or network.")
+                    }
+                }
+            } else if source == .criticalMention {
+                // Critical Mention: resolve the SPA clip page to its
+                // signed HLS URL via our browser extractor, then
+                // ffmpeg-probe the m3u8 for duration. Without this
+                // branch the probe fell through to the generic HLS
+                // path on the ORIGINAL page URL — which is HTML, not
+                // media, so ffmpeg gave up and the outer `case .failed`
+                // silently fell back to `.live`. That misclassified
+                // clips as live streams and hid the duration.
+                //
+                // Every Critical Mention clip is static (they're
+                // recordings from broadcast archives, never live
+                // feeds), so there's no `isLive` branch — if
+                // extraction succeeds and the m3u8 probe reports a
+                // finite duration, we use it. On extractor timeout,
+                // surface `.failed` with a hint about clip privacy
+                // — there's no yt-dlp fallback since yt-dlp has no
+                // CriticalMention extractor.
+                do {
+                    let resolved = try await CriticalMentionExtractor.resolve(url: url)
+                    probedTitle = resolved.title
+                    let ff = await Self.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL)
+                    switch ff {
+                    case .finite(let s):
+                        probeResult = .finite(s)
+                    case .live, .failed:
+                        // "Live" from ffmpeg on a CM stream just
+                        // means "no duration in the manifest," which
+                        // for CM clips shouldn't happen but if it
+                        // does we surface as failed rather than
+                        // classifying as live (which would run
+                        // live-mode transcription on a finite clip).
+                        probeResult = .failed("Critical Mention m3u8 has no duration — clip may be malformed or still being processed.")
+                    }
+                } catch {
+                    probedTitle = nil
+                    probeResult = .failed("Critical Mention extraction failed: \(error.localizedDescription). The clip may be private (requires login), or the page couldn't load.")
+                }
+            } else if source.requiresYTDlp {
                 if let meta = await Self.probeYTDlpMetadata(url: url) {
                     probedTitle = meta.title
                     if let seconds = meta.duration {
@@ -4565,7 +5775,9 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     /// Result envelope for an ffmpeg-based duration probe.
-    private enum FFmpegProbeResult {
+    /// Result of an ffmpeg remote duration probe. Internal so callers
+    /// outside the engine can pattern-match on the same cases.
+    enum FFmpegProbeResult {
         case finite(TimeInterval)
         case live
         case failed(String)
@@ -4586,7 +5798,12 @@ final class TranscriptionEngine: ObservableObject {
     /// Timeout: 8 seconds. HLS manifests are small; if ffmpeg hasn't
     /// finished a header read in 8 seconds the stream is either dead or
     /// hung. Falling back to Live is safe.
-    private static func probeRemoteDurationViaFFmpeg(url: URL) async -> FFmpegProbeResult {
+    /// ffmpeg-probe of a remote media URL for duration. Fast (sub-
+    /// second usually) since it just reads the header/manifest, not
+    /// the full content. Internal so adjacent services
+    /// (VideoDownloadService for HLS-download progress calculation)
+    /// can share the same probe path.
+    static func probeRemoteDurationViaFFmpeg(url: URL) async -> FFmpegProbeResult {
         // Resolve ffmpeg path. If it's not available, we can't probe.
         guard let ffmpegPath = await MainActor.run(body: { ToolManager.shared.ffmpegPath }),
               FileManager.default.isExecutableFile(atPath: ffmpegPath) else {
@@ -4862,6 +6079,8 @@ final class TranscriptionEngine: ObservableObject {
                 args.append(contentsOf: ["--impersonate", "chrome"])
             }
             args.append(contentsOf: [
+                "--ignore-config",
+                "--no-mark-watched",
                 "--quiet",
                 "--no-warnings",
                 "-g",
@@ -4965,6 +6184,10 @@ final class TranscriptionEngine: ObservableObject {
                 probeArgs.append(contentsOf: ["--impersonate", "chrome"])
             }
             probeArgs.append(contentsOf: [
+                // Warm-up speedup flags. See class-level explanation
+                // at `ytDlpWarmupFlags` rationale.
+                "--ignore-config",
+                "--no-mark-watched",
                 "--quiet",
                 "--no-warnings",
                 "--print", "%(live_status)s",

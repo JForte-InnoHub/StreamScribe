@@ -3,8 +3,17 @@ import SwiftUI
 /// Right-hand panel listing distinct speakers in the current transcript with editable
 /// name fields. Edits propagate live to the transcript view and exporter via the
 /// engine's `speakerNames` map (machine label → display name).
+///
+/// **Identity awareness.** Rows show the resolved display name (manual rename OR
+/// voiceprint identification OR machine label, in priority order) rather than the
+/// raw "Speaker N" label. So once a cluster is voice-matched to "Rep. Hal Rogers,"
+/// the panel row shows "Rep. Hal Rogers" — same as the badges in the transcript.
+/// The `@ObservedObject` on VoiceprintService ensures the panel re-renders when a
+/// cluster's identification changes (auto-match landing, manual override, or
+/// clearing).
 struct SpeakerPanel: View {
     @EnvironmentObject var engine: TranscriptionEngine
+    @ObservedObject private var voiceprints = VoiceprintService.shared
     let onClose: () -> Void
 
     var body: some View {
@@ -92,6 +101,7 @@ struct SpeakerPanel: View {
 
 private struct SpeakerRow: View {
     @EnvironmentObject var engine: TranscriptionEngine
+    @ObservedObject private var voiceprints = VoiceprintService.shared
     let machineLabel: String
 
     var body: some View {
@@ -100,23 +110,64 @@ private struct SpeakerRow: View {
                 Circle()
                     .fill(speakerColor)
                     .frame(width: 8, height: 8)
-                Text(machineLabel)
+
+                // Primary display name — resolves to (in priority order):
+                //   1. Manual rename from the TextField below
+                //   2. Voiceprint-identified name (auto or manual)
+                //   3. Machine label ("Speaker 1", "Speaker 2", …)
+                //
+                // The identified name gets the same styling as a
+                // manual rename would — no visual distinction — because
+                // once the identification lands, it's the same as
+                // "the user telling us who this is." If it's wrong,
+                // the TextField below lets them override.
+                Text(displayName)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
+
+                // Only show the raw "Speaker N" as a subtle hint IF
+                // the display name has been resolved to something
+                // different (either identified or manually renamed).
+                // Prevents redundant "Speaker 1  ·  Speaker 1" when
+                // there's no override.
+                if displayName != machineLabel {
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                    Text(machineLabel)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+
                 Spacer()
                 Text("\(segmentCount) segment\(segmentCount == 1 ? "" : "s")")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             }
 
-            TextField(machineLabel, text: nameBinding)
+            // TextField for manual rename override. Placeholder shows
+            // the current effective display name — so if voiceprint
+            // identified this cluster as "Rep. Hal Rogers," typing
+            // in the field OVERRIDES that (user disagrees with the
+            // auto-ID), and clearing the field falls back to the
+            // voiceprint identification, then to machine label.
+            TextField(displayName, text: nameBinding)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 13))
         }
     }
 
+    /// Effective display name for this row. Same priority order as
+    /// the transcript badge — manual rename beats voiceprint ID beats
+    /// machine label. Wraps `engine.displayName(for:)` and falls back
+    /// gracefully if it returns nil.
+    private var displayName: String {
+        engine.displayName(for: machineLabel) ?? machineLabel
+    }
+
     /// Two-way binding that reads/writes through the engine's speakerNames dict.
-    /// Empty string clears the entry so the row falls back to the machine label.
+    /// Empty string clears the entry so the row falls back to the machine label
+    /// (or the voiceprint-identified name, if one exists).
     private var nameBinding: Binding<String> {
         Binding(
             get: { engine.speakerNames[machineLabel] ?? "" },

@@ -54,6 +54,7 @@ enum DiarizationEngineKind: String, CaseIterable, Identifiable, Codable {
     case off        = "Off"
     case speakerKit = "SpeakerKit (pyannote 4)"
     case sortformer = "Sortformer (MLX, streaming)"
+    case fluidAudio = "FluidAudio (pyannote / LS-EEND)"
 
     var id: String { rawValue }
 
@@ -65,6 +66,8 @@ enum DiarizationEngineKind: String, CaseIterable, Identifiable, Codable {
             return "Argmax pyannote port. Offline-style; ~30s warm-up before first labels appear."
         case .sortformer:
             return "NVIDIA Sortformer via MLX. True streaming, up to 4 speakers."
+        case .fluidAudio:
+            return "FluidAudio CoreML/ANE diarization. Auto-routes: offline pyannote-community-1 for static sessions (unlimited speakers, VBx clustering), LS-EEND for live (up to 10 speakers, 100ms updates)."
         }
     }
 }
@@ -162,22 +165,40 @@ struct SpeakerTurn: Equatable, Sendable {
 /// `prepare()` to apply the limit before the model loads.
 let mlxCacheLimitMBKey = "mlx.cacheLimitMB"
 
-/// Default cache limit, in MB. 512 MB is comfortably above a single Parakeet
-/// or Sortformer chunk's intermediate-buffer working set on Apple Silicon
-/// while still bounded enough to prevent the unbounded-cache slowdown we hit
-/// in session 5 (where chunk #176 took 82s of inference for 5s of audio).
-/// Reference: MLX-Swift LLM examples ship with 20 MB for iOS and 512 MB for
-/// desktop LLM apps; ASR backends are lighter than LLMs so 512 MB has
-/// generous headroom.
-let mlxCacheLimitDefaultMB = 512
+/// Default cache limit, in MB. 1024 MB is comfortably above a single
+/// Parakeet or Sortformer chunk's intermediate-buffer working set on
+/// Apple Silicon while still bounded enough to prevent the unbounded-
+/// cache slowdown we hit in session 5 (where chunk #176 took 82s of
+/// inference for 5s of audio).
+///
+/// Reference: MLX-Swift LLM examples ship with 20 MB for iOS and 512 MB
+/// for desktop LLM apps; ASR backends are lighter than LLMs so 1024 MB
+/// has very generous headroom.
+///
+/// Bumped from 512 MB → 1024 MB alongside the TDT-CTC 1.1B default
+/// transition. The 1.1B model is 2x the parameter count of the prior
+/// 0.6B v3 default, and the slightly higher cache ceiling keeps more
+/// of its intermediates resident between chunks — measurably reducing
+/// per-chunk latency on long sessions where the cache would otherwise
+/// thrash. Users who specifically want the lower ceiling can drag the
+/// slider in Settings → Advanced.
+let mlxCacheLimitDefaultMB = 1024
 
-/// Minimum/maximum bounds for the user-facing slider. Below 128 MB MLX starts
-/// thrashing as it evicts useful intermediates between chunks; above 2048 MB
-/// defeats the purpose of capping the cache at all. The actual safe ceiling
-/// depends on the user's machine memory; the slider's job is to keep them
-/// within a sane range, not to enforce a hardware-aware budget.
+/// Minimum/maximum bounds for the user-facing slider. Below 128 MB MLX
+/// starts thrashing as it evicts useful intermediates between chunks;
+/// above the max defeats the purpose of capping the cache at all. The
+/// actual safe ceiling depends on the user's machine memory; the
+/// slider's job is to keep them within a sane range, not to enforce a
+/// hardware-aware budget.
+///
+/// Max bumped from 2048 MB → 4096 MB to give power users on
+/// higher-memory Macs (M-series Pros/Maxes with 32-128 GB unified
+/// memory) headroom to keep more of the larger 1.1B model's
+/// intermediates resident if they want to. Most users should never
+/// need to touch this — the 1024 MB default works for typical
+/// hardware.
 let mlxCacheLimitMinMB = 128
-let mlxCacheLimitMaxMB = 2048
+let mlxCacheLimitMaxMB = 4096
 
 /// Read the current cache limit from UserDefaults and apply it via
 /// `MLX.GPU.set(cacheLimit:)`. Both `ParakeetBackend` and `SortformerBackend`

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct TranscriptPaneView: View {
     @EnvironmentObject var engine: TranscriptionEngine
@@ -6,6 +7,46 @@ struct TranscriptPaneView: View {
     @Binding var openRightPanel: ContentView.RightPanel?
     @Binding var scrollToSegmentID: UUID?
     @State private var autoScroll: Bool = true
+
+    /// Most recently scrolled-to group ID. Used to dedupe redundant
+    /// scroll animations driven by `playingSegmentID` changes —
+    /// without this, AVPlayer's post-seek time oscillation flips the
+    /// playing segment between adjacent segments of the same group,
+    /// each flip triggering a fresh scroll animation that interrupts
+    /// the previous one, producing visible jitter in the transcript.
+    ///
+    /// Group IDs are stable (assigned from the group's first segment's
+    /// UUID), so comparing the new target against this cached value
+    /// catches within-group oscillation cleanly. Cross-group oscillation
+    /// is rare in practice — groups are typically 30+ seconds long,
+    /// while AVPlayer post-seek oscillation is under a second.
+    @State private var lastScrolledPlayheadSegmentID: UUID? = nil
+
+    /// Debounce task for playing-segment scroll updates. Cancelled and
+    /// re-scheduled on every new `playingSegmentID` change. Fires the
+    /// actual scroll only after ~120ms of quiet, so rapid updates
+    /// during miniplayer scrubbing collapse into a single scroll
+    /// rather than triggering dozens of overlapping animations. See
+    /// `handlePlayingSegmentChange` docstring for the full rationale.
+    @State private var pendingScrollTask: Task<Void, Never>? = nil
+
+    /// The transcript ScrollView's backing NSScrollView, captured via
+    /// `ScrollViewGrabber` in the content. Used to scope the
+    /// `willStartLiveScrollNotification` observer to OUR scroll view —
+    /// without this comparison, scrolling the sidebar (or any other
+    /// scrollable in the window) would also suspend Follow.
+    @State private var transcriptNSScrollView: NSScrollView? = nil
+
+    /// Live-scroll notifications are ignored until this instant.
+    /// Every programmatic scroll (playhead follow, tail follow,
+    /// pin-jump, Follow snap-back) opens a suppression window slightly
+    /// longer than its animation, because SwiftUI's animated
+    /// `scrollTo` on macOS can drive the backing NSScrollView through
+    /// machinery that posts `willStartLiveScrollNotification` — i.e.
+    /// our own scrolls can masquerade as user scrolls. Without the
+    /// window, the first playhead scroll suspends Follow itself and
+    /// every subsequent jump silently does nothing.
+    @State private var suppressLiveScrollUntil: Date = .distantPast
     @State private var searchText: String = ""
 
     /// Current miniplayer playback time in seconds. Driven by
@@ -205,9 +246,7 @@ struct TranscriptPaneView: View {
             scrollContent
                 .onChange(of: engine.segments.count) { _, _ in
                     guard autoScroll else { return }
-                    withAnimation(.easeOut(duration: 0.25)) {
-                        proxy.scrollTo("BOTTOM", anchor: .bottom)
-                    }
+                    performProgrammaticScroll(proxy, to: "BOTTOM", anchor: .bottom, duration: 0.25)
                 }
                 .onChange(of: scrollToSegmentID) { _, newValue in
                     handleScrollToSegmentRequest(newValue, proxy: proxy)
@@ -217,6 +256,51 @@ struct TranscriptPaneView: View {
                 }
                 .onChange(of: autoScroll, initial: true) { _, newValue in
                     engine.userIsFollowingTranscript = newValue
+                    // Re-enabling Follow snaps back to wherever the
+                    // playhead currently is. Clearing the dedupe
+                    // anchor first is essential: the last playback
+                    // scroll may have targeted the same group we're
+                    // in now, and without the reset the snap-back
+                    // would be deduped away.
+                    if newValue {
+                        lastScrolledPlayheadSegmentID = nil
+                        if let segID = playingSegmentID {
+                            handlePlayingSegmentChange(segID, proxy: proxy)
+                        }
+                    }
+                }
+                // Manual-scroll detection: a user-initiated scroll
+                // gesture suspends Follow so playback updates don't
+                // yank the transcript away from wherever they scrolled
+                // to read. The Follow button visibly flips off, making
+                // the suspension discoverable and the remedy obvious
+                // (click Follow to resume).
+                //
+                // Implemented via AppKit's live-scroll notifications
+                // rather than SwiftUI's `onScrollPhaseChange`: the
+                // SwiftUI modifier changes how the backing NSScrollView
+                // routes events, which broke the tap-to-seek gestures
+                // on the transcript rows (taps stopped reaching the
+                // miniplayer-seek handler). `willStartLiveScroll` is
+                // purely observational — posted only for USER scroll
+                // gestures, never for programmatic `scrollTo` — so it
+                // can't interfere with anything. The object comparison
+                // scopes it to the transcript's own scroll view; other
+                // scrollables (sidebar, settings) don't suspend Follow.
+                .onReceive(NotificationCenter.default.publisher(
+                    for: NSScrollView.willStartLiveScrollNotification
+                )) { note in
+                    guard let sv = note.object as? NSScrollView,
+                          sv === transcriptNSScrollView else { return }
+                    // Ignore notifications generated by our own
+                    // programmatic scrolls — see the docstring on
+                    // `suppressLiveScrollUntil`.
+                    guard Date() >= suppressLiveScrollUntil else { return }
+                    guard autoScroll else { return }
+                    print("[Follow] Suspended — user scrolled the transcript.")
+                    autoScroll = false
+                    pendingScrollTask?.cancel()
+                    pendingScrollTask = nil
                 }
                 .onReceive(NotificationCenter.default.publisher(for: .miniplayerTimeUpdate)) { note in
                     handlePlaybackTimeUpdate(note)
@@ -238,6 +322,13 @@ struct TranscriptPaneView: View {
             }
             .padding(.horizontal, 28)
             .padding(.vertical, 20)
+            // Invisible shim that walks the AppKit view hierarchy to
+            // find the NSScrollView backing this SwiftUI ScrollView.
+            // Powers the scoped live-scroll observer in
+            // `transcriptScrollView` — see the comment there.
+            .background(ScrollViewGrabber { scrollView in
+                transcriptNSScrollView = scrollView
+            })
         }
     }
 
@@ -265,6 +356,25 @@ struct TranscriptPaneView: View {
         })
     }
 
+    /// The single funnel for every programmatic transcript scroll.
+    /// Opens the live-scroll suppression window (animation duration +
+    /// a safety margin covering momentum/settling) BEFORE the scroll,
+    /// so the animation can't be misread as a user gesture and
+    /// self-suspend Follow. All four scroll paths route through here:
+    /// tail-follow (BOTTOM), playhead follow, pin-jump, and the
+    /// Follow-toggle snap-back.
+    private func performProgrammaticScroll<Target: Hashable>(
+        _ proxy: ScrollViewProxy,
+        to target: Target,
+        anchor: UnitPoint,
+        duration: Double = 0.3
+    ) {
+        suppressLiveScrollUntil = Date().addingTimeInterval(duration + 0.4)
+        withAnimation(.easeOut(duration: duration)) {
+            proxy.scrollTo(target, anchor: anchor)
+        }
+    }
+
     /// Post a seek notification for the given group's first segment.
     /// No-op when no playable media is loaded so taps on the transcript
     /// during live transcription don't queue stale notifications.
@@ -276,19 +386,30 @@ struct TranscriptPaneView: View {
 
     /// Pin-jump or pin-clear → scroll the targeted group to the top of
     /// the viewport. Disables auto-bottom-follow since the user is
-    /// navigating manually now.
+    /// navigating manually now. (No dedupe-anchor sync needed: since
+    /// pin-jump suspends Follow, playhead scrolls can't fire until the
+    /// user re-enables it — and re-enabling clears the anchor anyway.)
     private func handleScrollToSegmentRequest(_ id: UUID?, proxy: ScrollViewProxy) {
         guard let id = id else { return }
         // The group's id is its first segment's id, which matches
         // PinnedQuote.sourceSegmentID. If the segment lives partway
         // through a group, fall back to whichever group contains it.
-        let targetID = visibleGroups.first(where: { group in
+        let resolvedGroupID = visibleGroups.first(where: { group in
             group.segments.contains(where: { $0.id == id })
-        })?.id ?? id
+        })?.id
+        let scrollTarget = resolvedGroupID ?? id
+
+        // Cancel any pending debounced scroll from the miniplayer's
+        // playing-segment updates. Without this, a user pin-jump would
+        // land at the pinned quote, then ~100ms later a pending playback
+        // scroll would fire and yank the transcript back to wherever
+        // playback was. Pin-jump is user-initiated — it wins over
+        // whatever the playback was targeting.
+        pendingScrollTask?.cancel()
+        pendingScrollTask = nil
+
         autoScroll = false
-        withAnimation(.easeInOut(duration: 0.35)) {
-            proxy.scrollTo(targetID, anchor: .top)
-        }
+        performProgrammaticScroll(proxy, to: scrollTarget, anchor: .top, duration: 0.35)
         DispatchQueue.main.async {
             scrollToSegmentID = nil
         }
@@ -297,16 +418,125 @@ struct TranscriptPaneView: View {
     /// When the miniplayer's playing segment changes, scroll the
     /// containing group into view (centered) so the user can read
     /// along.
+    ///
+    /// **Dedupe by target group.** Without the `lastScrolledPlayheadSegmentID`
+    /// check, AVPlayer's post-seek time oscillation rapid-fires this
+    /// handler with `playingSegmentID` flipping between adjacent
+    /// segments of the same group. Each call would kick off a fresh
+    /// 0.3s scroll animation, interrupting the previous one in flight,
+    /// producing the visible jitter the user reported. With the dedupe,
+    /// only the FIRST change to a group triggers a scroll; subsequent
+    /// segment-id flips that resolve to the same group are silently
+    /// ignored until playback actually crosses into a different group.
+    ///
+    /// **When dedupe doesn't fire:** when `target != lastScrolledPlayheadSegmentID`
+    /// (genuine group transition during natural playback, or a seek
+    /// that lands on a new group). Normal scroll behavior applies.
+    /// Handle a change in `playingSegmentID` — the segment currently
+    /// under the playhead. Delegates to `scrollTo(target:)` after a
+    /// short debounce.
+    ///
+    /// **Debounce rationale.** Two scenarios drive `playingSegmentID`
+    /// updates:
+    ///   1. **Natural playback:** the miniplayer emits time updates
+    ///      every ~500ms. Segments transition every few seconds. One
+    ///      scroll per transition, no overlap.
+    ///   2. **Scrubbing:** the user drags the miniplayer scrubber.
+    ///      Time updates come every 10-50ms as the scrubber moves.
+    ///      Without debouncing, every intermediate position triggers
+    ///      a scroll, animations pile up, and the transcript
+    ///      appears to shake/jitter as animations fight each other.
+    ///
+    /// The 120ms debounce eliminates the scrubbing case entirely
+    /// (rapid updates cancel each other, only the last one fires)
+    /// while adding no perceptible latency to natural playback
+    /// (500ms interval >> 120ms debounce).
+    ///
+    /// **Dedupe by SEGMENT.** Earlier revisions deduped by group,
+    /// which meant a long single-speaker paragraph scrolled once
+    /// (centered) and then sat still while the highlight walked out
+    /// of view. Segment-level dedupe + a fractional anchor keeps the
+    /// playing sentence at a proportional viewport position: as
+    /// playback moves through a tall group, the anchor fraction
+    /// advances 0→1 and the group slides smoothly so the highlight
+    /// stays on screen. Short groups get the same treatment — the
+    /// per-step movement is just tiny.
     private func handlePlayingSegmentChange(_ segID: UUID?, proxy: ScrollViewProxy) {
-        guard let segID = segID else { return }
-        let targetGroupID = visibleGroups.first(where: { group in
-            group.segments.contains(where: { $0.id == segID })
-        })?.id
-        guard let target = targetGroupID else { return }
-        autoScroll = false
-        withAnimation(.easeOut(duration: 0.3)) {
-            proxy.scrollTo(target, anchor: .center)
+        guard let segID = segID else {
+            // Playback stopped or segment cleared. Cancel any pending
+            // scroll and reset the dedupe anchor.
+            pendingScrollTask?.cancel()
+            pendingScrollTask = nil
+            lastScrolledPlayheadSegmentID = nil
+            return
         }
+
+        // Follow governs playhead-following. When it's off — either
+        // toggled off by the user or auto-suspended because they
+        // manually scrolled elsewhere (see the scroll-phase handler)
+        // — playback position changes update the inline highlight but
+        // never move the scroll position. Re-enabling Follow snaps
+        // back to the playhead (see the autoScroll onChange).
+        guard autoScroll else { return }
+
+        guard let group = visibleGroups.first(where: { g in
+            g.segments.contains(where: { $0.id == segID })
+        }) else { return }
+
+        // Dedupe on the segment: skip only if we already scrolled for
+        // this exact segment. Different segment in the SAME group now
+        // schedules a scroll (with an updated anchor fraction).
+        guard segID != lastScrolledPlayheadSegmentID else { return }
+
+        let groupID = group.id
+        let anchorFraction = playheadAnchorFraction(forSegment: segID, in: group)
+
+        // Cancel any in-flight debounced scroll from a previous update.
+        // If the user is actively scrubbing, this cancellation happens
+        // dozens of times — each call takes microseconds, so there's
+        // no perceptible cost.
+        pendingScrollTask?.cancel()
+        pendingScrollTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)  // 120ms
+            guard !Task.isCancelled else { return }
+
+            // Re-check dedupe AND follow state at fire time. During
+            // the 120ms wait, the user may have scrolled manually
+            // (suspending follow) or another path may have scrolled
+            // (updating the dedupe anchor).
+            guard autoScroll, segID != lastScrolledPlayheadSegmentID else { return }
+            lastScrolledPlayheadSegmentID = segID
+
+            performProgrammaticScroll(
+                proxy,
+                to: groupID,
+                anchor: UnitPoint(x: 0.5, y: anchorFraction)
+            )
+        }
+    }
+
+    /// Where the playing segment sits within its group, as a 0...1
+    /// fraction of the group's TIME span (segment midpoint over group
+    /// duration). Used as the scrollTo anchor's y-component:
+    /// `scrollTo(id, anchor: UnitPoint(y: f))` aligns the point f-way
+    /// down the group view with the point f-way down the viewport —
+    /// so early segments render near the top of the viewport, late
+    /// segments near the bottom, and the highlight tracks smoothly
+    /// through tall groups instead of drifting off-screen below a
+    /// fixed center anchor.
+    ///
+    /// Time-fraction is a proxy for text-position-fraction; the two
+    /// diverge when speech density varies within a group, but at
+    /// segment granularity the error is a line or two — invisible in
+    /// practice.
+    private func playheadAnchorFraction(forSegment segID: UUID, in group: SpeakerGroup) -> Double {
+        guard let seg = group.segments.first(where: { $0.id == segID }),
+              let first = group.segments.first,
+              let last = group.segments.last else { return 0.5 }
+        let span = last.end - first.start
+        guard span > 0.5 else { return 0.5 }
+        let mid = (seg.start + seg.end) / 2 - first.start
+        return min(max(mid / span, 0), 1)
     }
 
     /// Receive a `.miniplayerTimeUpdate` notification and recompute
@@ -334,8 +564,72 @@ struct TranscriptPaneView: View {
     /// Group consecutive same-speaker segments into paragraph blocks.
     /// Uses the shared `groupedBySpeaker()` extension from the model so this matches
     /// what the exporter produces.
+    /// Group segments into visible paragraphs, splitting on
+    /// EFFECTIVE speaker name rather than cluster ID. This is what
+    /// causes diarizer-merged speakers to visually split: if
+    /// "Speaker 1" contains segments identified as Senator A and
+    /// Senator B at the per-segment level, those segments end up in
+    /// separate visual groups even though they share a cluster ID.
+    ///
+    /// **The grouping key** is `engine.displayName(forSegment:)`,
+    /// which factors in (in priority order) manual cluster rename,
+    /// manual segment ID, manual cluster ID, automatic segment ID,
+    /// and finally falls back to the cluster ID itself. Consecutive
+    /// segments with identical resolved names group together;
+    /// transitions create new groups.
+    ///
+    /// **Each visible group's `speaker` field carries the effective
+    /// name**, not the cluster ID. The cluster ID is still available
+    /// via the first segment's `speaker` field, which is what the
+    /// "Reassign Speaker" and "Identify Speaker" context menus use
+    /// for cluster-level actions.
     private var visibleGroups: [SpeakerGroup] {
-        filteredSegments.groupedBySpeaker()
+        let segments = filteredSegments
+        guard !segments.isEmpty else { return [] }
+
+        // Compute cluster majorities once for this render. Used by
+        // `displayName(forSegment:clusterMajorities:)` to smooth
+        // unidentified segments into their cluster's majority — keeps
+        // continuous single-speaker stretches from fragmenting into
+        // alternating "Bernie Sanders / Speaker 1 / Bernie Sanders"
+        // groups when short segments fail to extract or match.
+        // Computed once here rather than per-segment to avoid O(N²)
+        // recomputation.
+        let majorities = engine.clusterMajorityIdentifications()
+
+        // Resolve each segment's effective name once, then walk
+        // through and accumulate runs of identical resolved names.
+        // O(N) over segments; the displayName resolution is O(1)
+        // per call (dict lookups in VoiceprintService + majorities).
+        var groups: [SpeakerGroup] = []
+        var currentSegments: [TranscriptSegment] = []
+        var currentName: String? = nil
+
+        for seg in segments {
+            let resolvedName = engine.displayName(
+                forSegment: seg,
+                clusterMajorities: majorities
+            ) ?? seg.speaker
+            if resolvedName == currentName {
+                currentSegments.append(seg)
+            } else {
+                if !currentSegments.isEmpty {
+                    groups.append(SpeakerGroup(
+                        speaker: currentName,
+                        segments: currentSegments
+                    ))
+                }
+                currentSegments = [seg]
+                currentName = resolvedName
+            }
+        }
+        if !currentSegments.isEmpty {
+            groups.append(SpeakerGroup(
+                speaker: currentName,
+                segments: currentSegments
+            ))
+        }
+        return groups
     }
 
     private var filteredSegments: [TranscriptSegment] {
@@ -381,6 +675,54 @@ private struct SpeakerGroupView: View {
     /// nothing playing, no highlight.
     let playingSegmentID: UUID?
 
+    /// True when the cursor is hovering over this group's row. Drives
+    /// the visibility of the inline pin/unpin button — hidden when
+    /// not hovering (to avoid cluttering the transcript), visible on
+    /// hover so users can pin during live transcription without
+    /// hunting for the right-click target.
+    ///
+    /// Hover-reveal is the standard macOS affordance for row-level
+    /// actions (Finder list view, Mail, Messages all do this) — users
+    /// recognize it intuitively. The right-click context menu still
+    /// exists as a backup for keyboard-driven workflows or users with
+    /// pointing devices that don't track hover (trackpads do; some
+    /// mice don't).
+    @State private var isHovered: Bool = false
+
+    /// Settings gate for double-click-to-seek. Shares the key with
+    /// the toggle in Settings → Miniplayer. Checked at click time in
+    /// `seekToSegment(atFraction:)`, so flipping the setting takes
+    /// effect immediately without restarting anything.
+    @AppStorage("miniplayer.doubleClickSeek")
+    private var doubleClickSeekEnabled: Bool = true
+
+    // Identify Speaker sheet state. Replaces the old context-menu-with-
+    // hundreds-of-items pattern that made macOS's AppKit menu tracking
+    // unresponsive (the `didChangeSubmenu: rep returned item view with
+    // wrong item:` log spam). NSMenu chokes on any menu with several
+    // hundred items, even when the items are split across submenus —
+    // it's a bridge-layer issue between SwiftUI's Menu and NSMenu, not
+    // fixed by categorization alone.
+    //
+    // Sheets sidestep NSMenu entirely. The right-click context menu
+    // shows "Identify Speaker (entire cluster)…" and "Identify These
+    // Segments…" as single-line entries that trigger a sheet with a
+    // searchable, categorized list. Users search by typing the
+    // person's name, hit Enter or click to identify. Same functional
+    // outcome as the menu, dramatically better UX for large libraries.
+    @State private var showIdentifySheet: Bool = false
+    @State private var identifyMode: IdentifyMode = .cluster
+    @State private var identifyClusterID: String? = nil
+    @State private var identifySegmentIDs: [UUID] = []
+    @State private var identifyCurrentName: String? = nil
+
+    /// Which "identify" action opened the sheet. Determines which
+    /// VoiceprintService method the sheet's confirm action calls.
+    enum IdentifyMode {
+        case cluster    // sets manual identification for the whole cluster
+        case segments   // sets manual identification for specific segments only
+    }
+
     /// True when this group contains the currently-playing segment.
     private var isPlaying: Bool {
         guard let id = playingSegmentID else { return false }
@@ -390,10 +732,53 @@ private struct SpeakerGroupView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                if let machineLabel = group.speaker {
+                if let displayedName = group.speaker {
+                    // `group.speaker` carries the EFFECTIVE name now
+                    // (after per-segment identification), not the raw
+                    // cluster ID. For uncertainty rendering, we look
+                    // at the first segment's identification state —
+                    // since all segments in this visible group share
+                    // the same effective name, sampling the first is
+                    // representative.
+                    //
+                    // For the color seed, we use the cluster ID
+                    // (from the first segment's raw `speaker` field)
+                    // when there's an identified speaker. Same person
+                    // identified across different clusters → same
+                    // color. Different people in the same cluster
+                    // (the merge case we're solving for) → different
+                    // effective names → still different colors
+                    // because the badge logic computes color from the
+                    // CLUSTER for unidentified groups but from the
+                    // NAME for identified ones — keeping color tied
+                    // to identity, not to raw clustering.
+                    let firstSeg = group.segments.first
+                    let clusterId = firstSeg?.speaker
+                    let isIdentified: Bool = {
+                        if let seg = firstSeg {
+                            return VoiceprintService.shared.displayInfo(
+                                forSegmentId: seg.id,
+                                clusterId: clusterId
+                            ).isIdentified
+                        }
+                        return false
+                    }()
+                    let isUncertain: Bool = {
+                        if let seg = firstSeg, let cid = clusterId {
+                            let hasManualRename = engine.speakerNames[cid]?.isEmpty == false
+                            if hasManualRename { return false }
+                            return VoiceprintService.shared.displayInfo(
+                                forSegmentId: seg.id,
+                                clusterId: cid
+                            ).isUncertain
+                        }
+                        return false
+                    }()
+                    let colorSeed = isIdentified ? displayedName : (clusterId ?? displayedName)
                     SpeakerBadge(
-                        displayName: engine.displayName(for: machineLabel) ?? machineLabel,
-                        colorSeed: machineLabel
+                        displayName: displayedName,
+                        colorSeed: colorSeed,
+                        isUncertain: isUncertain
                     )
                 }
                 Text(group.formattedTimeRange)
@@ -408,11 +793,32 @@ private struct SpeakerGroupView: View {
                 if group.refinementState != .refined {
                     RefinementIndicator(state: group.refinementState)
                 }
-                if isPinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.orange)
-                        .help("Pinned")
+                // Pin/unpin button. Visible when EITHER hovered OR
+                // already pinned. Behavior:
+                //   - Pinned + hovered: filled orange icon; click to unpin
+                //   - Pinned + not hovered: filled orange icon (passive
+                //     indicator; still clickable as a bonus)
+                //   - Not pinned + hovered: outline gray icon; click to pin
+                //   - Not pinned + not hovered: nothing (hidden)
+                //
+                // The .plain button style strips macOS's default button
+                // chrome so the icon reads as an inline affordance rather
+                // than a styled button. Same pattern Finder uses for
+                // the hover-revealed Quick Look button on file rows.
+                if isPinned || isHovered {
+                    Button {
+                        if isPinned {
+                            for q in matchingPins { engine.unpin(q.id) }
+                        } else {
+                            engine.pinGroup(group)
+                        }
+                    } label: {
+                        Image(systemName: isPinned ? "pin.fill" : "pin")
+                            .font(.system(size: 11))
+                            .foregroundStyle(isPinned ? Color.orange : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(isPinned ? "Unpin quote" : "Pin quote")
                 }
             }
             Text(highlightedText)
@@ -420,6 +826,32 @@ private struct SpeakerGroupView: View {
                 .lineSpacing(5)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+                // Double-click → seek playback to the clicked SEGMENT.
+                // Word-level seeking would need per-word timestamps and
+                // text-layout hit-testing SwiftUI doesn't expose;
+                // segment granularity (a sentence-ish chunk) is the
+                // practical unit.
+                //
+                // **Why an AppKit event monitor instead of SwiftUI
+                // gestures.** With `.textSelection(.enabled)`, mouse
+                // events over the text glyphs are consumed by AppKit's
+                // selection machinery before SwiftUI's gesture system
+                // sees them — both `SpatialTapGesture(count: 2)` AND
+                // manual two-tap detection silently never fire over
+                // the text. The overlay below is an invisible NSView
+                // (hitTest returns nil, so it blocks nothing) that
+                // watches raw `.leftMouseDown` events app-wide via a
+                // local monitor, filters for clickCount == 2 landing
+                // inside its own bounds, and reports the click's
+                // y-fraction. Raw NSEvents can't be swallowed by the
+                // text selection — the monitor sees them first. The
+                // event passes through unconsumed, so the word still
+                // gets visually selected as confirmation.
+                .overlay(
+                    DoubleClickCatcher { yFraction in
+                        seekToSegment(atFraction: yFraction)
+                    }
+                )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         // Subtle background tint for the currently-playing group.
@@ -439,6 +871,14 @@ private struct SpeakerGroupView: View {
         // faded without making text harder to read.
         .opacity(group.refinementState == .refined ? 1.0 : 0.65)
         .contentShape(Rectangle())  // make whole row right-clickable, not just text bounds
+        .onHover { hovering in
+            // Cheap state update — no animation here so the pin button
+            // appears/disappears instantly rather than fading, matching
+            // the snappy feel of Finder's hover-reveal affordances.
+            // If we ever want a softer feel, wrap in
+            // withAnimation(.easeInOut(duration: 0.1)).
+            isHovered = hovering
+        }
         .contextMenu {
             Button {
                 if isPinned {
@@ -473,24 +913,32 @@ private struct SpeakerGroupView: View {
             // — same source as the SpeakerPanel's renaming list. Display
             // name (user's chosen name) shown when set; machine label is
             // the fallback.
+            //
+            // **`groupClusterId` vs `group.speaker`.** Since the switch to
+            // per-segment matching, `group.speaker` is the EFFECTIVE
+            // identified name (e.g. "Bernie Sanders"), not the cluster
+            // label ("Speaker 1"). For cluster-level reassignment we
+            // need the raw cluster — sourced from the first segment's
+            // `speaker` field. A visible group can theoretically span
+            // multiple clusters if per-segment matching identified
+            // segments from different clusters as the same person; we
+            // use the first segment's cluster, accepting the rare
+            // multi-cluster case.
+            let groupClusterId = group.segments.first?.speaker
             Divider()
             Menu {
                 ForEach(engine.distinctMachineSpeakers, id: \.self) { machineLabel in
                     Button {
                         engine.reassignSpeaker(segmentIDs: groupSegmentIDs, to: machineLabel)
                     } label: {
-                        // Use a checkmark-style affordance via Label so the
-                        // currently-assigned speaker is visually distinct.
-                        // SwiftUI doesn't have a first-class "checked menu
-                        // item" — checkmark via systemImage approximates it.
-                        if machineLabel == group.speaker {
+                        if machineLabel == groupClusterId {
                             Label(engine.displayName(for: machineLabel) ?? machineLabel,
                                   systemImage: "checkmark")
                         } else {
                             Text(engine.displayName(for: machineLabel) ?? machineLabel)
                         }
                     }
-                    .disabled(machineLabel == group.speaker)
+                    .disabled(machineLabel == groupClusterId)
                 }
 
                 // Sentinel options — appear under their own divider since
@@ -501,26 +949,166 @@ private struct SpeakerGroupView: View {
                 Button {
                     engine.reassignSpeaker(segmentIDs: groupSegmentIDs, to: "UNKNOWN")
                 } label: {
-                    if group.speaker == "UNKNOWN" {
+                    if groupClusterId == "UNKNOWN" {
                         Label("UNKNOWN", systemImage: "checkmark")
                     } else {
                         Text("UNKNOWN")
                     }
                 }
-                .disabled(group.speaker == "UNKNOWN")
+                .disabled(groupClusterId == "UNKNOWN")
 
                 Button {
                     engine.reassignSpeaker(segmentIDs: groupSegmentIDs, to: nil)
                 } label: {
-                    if group.speaker == nil {
+                    if groupClusterId == nil {
                         Label("No Speaker", systemImage: "checkmark")
                     } else {
                         Text("No Speaker")
                     }
                 }
-                .disabled(group.speaker == nil)
+                .disabled(groupClusterId == nil)
             } label: {
                 Label("Reassign Speaker", systemImage: "person.crop.circle.badge.questionmark")
+            }
+
+            // Cluster-level voice identification menu. Sets the
+            // identified name for the WHOLE cluster (every segment
+            // sharing this cluster ID, even if some of those segments
+            // live in different visible groups due to per-segment
+            // matching). Use this when the diarizer's clustering is
+            // correct and we just want to put a name on it.
+            //
+            // For correcting individual segments where the diarizer
+            // merged two speakers, use the "Identify These Segments"
+            // menu below instead — it acts at the visible-group level.
+            if let clusterId = groupClusterId {
+                Menu {
+                    let currentInfo = VoiceprintService.shared.displayInfo(forClusterId: clusterId)
+                    let sessionSpeakers = VoiceprintService.shared.sessionSpeakerHistory.sorted()
+
+                    if currentInfo.isIdentified {
+                        Button {
+                            VoiceprintService.shared.clearIdentification(clusterId: clusterId)
+                        } label: {
+                            Label("Clear current: \(currentInfo.name)",
+                                  systemImage: "xmark.circle")
+                        }
+                        Divider()
+                    }
+
+                    // Speakers already identified in this session.
+                    // Small list — no NSMenu tracking issues — so
+                    // this can be a flat submenu without any special
+                    // handling. Empty on a fresh session; grows as
+                    // the user identifies people (manually or
+                    // automatically).
+                    if !sessionSpeakers.isEmpty {
+                        ForEach(sessionSpeakers, id: \.self) { name in
+                            Button {
+                                VoiceprintService.shared.setManualIdentification(
+                                    clusterId: clusterId,
+                                    name: name
+                                )
+                            } label: {
+                                if currentInfo.isIdentified && currentInfo.name == name {
+                                    Label(name, systemImage: "checkmark")
+                                } else {
+                                    Text(name)
+                                }
+                            }
+                        }
+                        Divider()
+                    }
+
+                    // "Other speaker…" opens the searchable sheet
+                    // for the full voice-template library. Once the
+                    // user picks a name, it gets added to
+                    // sessionSpeakerHistory (via
+                    // setManualIdentification) so subsequent right-
+                    // clicks show it in the immediate list without
+                    // needing to search again.
+                    Button {
+                        identifyMode = .cluster
+                        identifyClusterID = clusterId
+                        identifySegmentIDs = []
+                        identifyCurrentName = currentInfo.isIdentified ? currentInfo.name : nil
+                        showIdentifySheet = true
+                    } label: {
+                        Label(sessionSpeakers.isEmpty ? "Choose speaker…" : "Other speaker…",
+                              systemImage: "magnifyingglass")
+                    }
+                    .disabled(VoiceprintService.shared.templates.isEmpty)
+                } label: {
+                    Label("Identify Speaker (entire cluster)", systemImage: "person.crop.circle.badge.checkmark")
+                }
+            }
+
+            // Per-segment voice identification menu. Applies to the
+            // segments in THIS visible group only, not the whole
+            // cluster. Used to correct individual mistakes from
+            // per-segment automatic matching — common case is a
+            // single mis-identified segment in the middle of an
+            // otherwise correctly-identified run, where the user
+            // wants to fix just that segment without nuking the
+            // good identifications around it.
+            //
+            // Sets a manual segment-level identification on every
+            // segment in the group. Since manual segment IDs take
+            // priority over both automatic IDs and cluster IDs in
+            // VoiceprintService's display precedence, the override
+            // sticks.
+            if !VoiceprintService.shared.templates.isEmpty {
+                Menu {
+                    let sessionSpeakers = VoiceprintService.shared.sessionSpeakerHistory.sorted()
+                    let groupSegmentIdentifications = group.segments.compactMap {
+                        VoiceprintService.shared.segmentIdentifications[$0.id]
+                    }
+
+                    if !groupSegmentIdentifications.isEmpty {
+                        Button {
+                            for seg in group.segments {
+                                VoiceprintService.shared.clearSegmentIdentification(segmentId: seg.id)
+                            }
+                        } label: {
+                            Label("Clear segment IDs in this group",
+                                  systemImage: "xmark.circle")
+                        }
+                        Divider()
+                    }
+
+                    // Session speakers directly — same treatment as
+                    // the cluster menu above.
+                    if !sessionSpeakers.isEmpty {
+                        ForEach(sessionSpeakers, id: \.self) { name in
+                            Button {
+                                for seg in group.segments {
+                                    VoiceprintService.shared.setManualSegmentIdentification(
+                                        segmentId: seg.id,
+                                        name: name
+                                    )
+                                }
+                            } label: {
+                                Text(name)
+                            }
+                        }
+                        Divider()
+                    }
+
+                    Button {
+                        identifyMode = .segments
+                        identifyClusterID = nil
+                        identifySegmentIDs = group.segments.map { $0.id }
+                        identifyCurrentName = VoiceprintService.shared
+                            .segmentIdentifications[group.segments.first?.id ?? UUID()]?.name
+                        showIdentifySheet = true
+                    } label: {
+                        Label(sessionSpeakers.isEmpty ? "Choose speaker…" : "Other speaker…",
+                              systemImage: "magnifyingglass")
+                    }
+                    .disabled(VoiceprintService.shared.templates.isEmpty)
+                } label: {
+                    Label("Identify These Segments", systemImage: "text.badge.checkmark")
+                }
             }
 
             // Per-sentence reassignment. The paragraph-level menu above
@@ -597,6 +1185,34 @@ private struct SpeakerGroupView: View {
                 }
             }
         }
+        .sheet(isPresented: $showIdentifySheet) {
+            IdentifySpeakerSheet(
+                mode: identifyMode,
+                clusterID: identifyClusterID,
+                segmentIDs: identifySegmentIDs,
+                currentName: identifyCurrentName,
+                onCancel: { showIdentifySheet = false },
+                onConfirm: { chosenName in
+                    switch identifyMode {
+                    case .cluster:
+                        if let cid = identifyClusterID {
+                            VoiceprintService.shared.setManualIdentification(
+                                clusterId: cid,
+                                name: chosenName
+                            )
+                        }
+                    case .segments:
+                        for segId in identifySegmentIDs {
+                            VoiceprintService.shared.setManualSegmentIdentification(
+                                segmentId: segId,
+                                name: chosenName
+                            )
+                        }
+                    }
+                    showIdentifySheet = false
+                }
+            )
+        }
     }
 
     /// Short preview of a segment's text for the per-sentence reassign
@@ -639,8 +1255,86 @@ private struct SpeakerGroupView: View {
         !matchingPins.isEmpty
     }
 
+    /// Map a double-click's vertical position (as a 0...1 fraction of
+    /// the text block's height, reported by `DoubleClickCatcher`) to
+    /// a segment, and seek the miniplayer to that segment's start.
+    ///
+    /// **The mapping.** Click y-fraction ≈ character-fraction of the
+    /// combined text (uniform line height; wrapped-line variance
+    /// averages out at segment granularity). Walk the segments
+    /// accumulating their trimmed character counts (+1 per joining
+    /// space, matching `combinedText` construction) until the target
+    /// character index falls inside one — that's the clicked segment.
+    /// Off-by-a-line errors land on an adjacent segment, a couple of
+    /// seconds of seek error — acceptable for "jump to what I
+    /// clicked."
+    private func seekToSegment(atFraction yFraction: Double) {
+        guard doubleClickSeekEnabled else { return }
+        guard engine.playbackMediaURL != nil else { return }
+        let combined = group.combinedText
+        let totalChars = combined.count
+        guard totalChars > 0 else { return }
+
+        let targetChar = Int(Double(totalChars) * min(max(yFraction, 0), 1))
+
+        var cursor = 0
+        var chosen: TranscriptSegment? = group.segments.first
+        for seg in group.segments {
+            let t = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            let end = cursor + t.count
+            if targetChar <= end {
+                chosen = seg
+                break
+            }
+            cursor = end + 1  // the joining space in combinedText
+            chosen = seg      // fall through to last non-empty segment
+        }
+
+        guard let seg = chosen else { return }
+        NotificationCenter.default.post(name: .miniplayerSeek, object: seg.start as NSNumber)
+    }
+
     private var highlightedText: AttributedString {
         var attr = AttributedString(group.combinedText)
+
+        // Segment-level playback highlight. The group-level tint (the
+        // rounded-rect background on the whole paragraph) tells you
+        // WHICH paragraph is playing; this tells you WHERE within it.
+        // Long single-speaker stretches — a senator holding the floor
+        // for five minutes produces one paragraph spanning dozens of
+        // segments — were previously untrackable: the group tint never
+        // moved, so scrubbing gave no positional feedback within the
+        // paragraph.
+        //
+        // **Range location by ordered search.** `combinedText` joins
+        // the segments' trimmed texts with single spaces and then
+        // collapses double spaces, so precomputing character offsets
+        // arithmetically would desync wherever the collapse fired.
+        // Instead we search for each segment's trimmed text in order,
+        // advancing the search start past each match. Duplicate
+        // segment texts ("Yeah." twice in a paragraph) resolve
+        // correctly because the search window only moves forward.
+        //
+        // Cost: O(paragraph length) per render, only for the playing
+        // group (guard below). Non-playing groups skip this entirely.
+        if isPlaying, let playingID = playingSegmentID {
+            let plain = String(attr.characters)
+            var searchStart = plain.startIndex
+            for seg in group.segments {
+                let needle = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !needle.isEmpty else { continue }
+                guard let range = plain.range(of: needle, range: searchStart..<plain.endIndex) else { break }
+                if seg.id == playingID {
+                    if let aRange = Range(range, in: attr) {
+                        attr[aRange].backgroundColor = Color.accentColor.opacity(0.28)
+                    }
+                    break
+                }
+                searchStart = range.upperBound
+            }
+        }
+
         let q = highlight.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return attr }
         let plain = String(attr.characters)
@@ -713,6 +1407,13 @@ private struct SpeakerBadge: View {
     /// String used to derive the badge color. Should be the *machine label*, not the
     /// display name, so that renaming a speaker doesn't change their color.
     let colorSeed: String
+    /// When true, render the display name in italics to signal that
+    /// the identification is below the high-confidence threshold. The
+    /// voiceprint matcher provides this flag via
+    /// `VoiceprintService.displayInfo(forClusterId:)`. False for
+    /// manual reassignments, high-confidence matches, and unidentified
+    /// speakers (all of which render normally).
+    var isUncertain: Bool = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -721,6 +1422,7 @@ private struct SpeakerBadge: View {
                 .frame(width: 6, height: 6)
             Text(displayName)
                 .font(.system(size: 10, weight: .semibold))
+                .italic(isUncertain)
                 .tracking(0.3)
                 .foregroundStyle(color)
         }
@@ -732,6 +1434,9 @@ private struct SpeakerBadge: View {
         .overlay(
             Capsule().stroke(color.opacity(0.25), lineWidth: 0.5)
         )
+        .help(isUncertain
+              ? "Identified as \(displayName) (low confidence — right-click to confirm or change)"
+              : displayName)
     }
 
     /// Stable color per colorSeed.
@@ -744,5 +1449,283 @@ private struct SpeakerBadge: View {
             hash = (hash &* 31) &+ Int(char.value)
         }
         return palette[abs(hash) % palette.count]
+    }
+}
+
+// MARK: - IdentifySpeakerSheet
+
+/// Sheet-based UI for identifying a speaker from the voice-template
+/// library. Replaces the old context-menu-with-hundreds-of-items
+/// approach that made AppKit's menu tracking unresponsive when the
+/// library grew past ~200 templates.
+///
+/// **Why a sheet instead of a Menu.** SwiftUI's `Menu` bridges to
+/// `NSMenu`, and NSMenu tracking chokes on any menu containing more
+/// than a few hundred items regardless of how they're nested. The
+/// symptom is `didChangeSubmenu: rep returned item view with wrong
+/// item:` log spam while the menu becomes unresponsive to clicks. A
+/// sheet is regular SwiftUI content — no NSMenu bridge, no tracking
+/// system to break.
+///
+/// **UX benefits beyond the fix.** Users can search by typing (much
+/// faster than scrolling through hundreds of names) and see the full
+/// category structure at once. The full library becomes usable at
+/// any size — 660 templates today, 6000 tomorrow.
+private struct IdentifySpeakerSheet: View {
+    let mode: SpeakerGroupView.IdentifyMode
+    let clusterID: String?
+    let segmentIDs: [UUID]
+    let currentName: String?
+    let onCancel: () -> Void
+    let onConfirm: (String) -> Void
+
+    @State private var searchText: String = ""
+    @FocusState private var searchFieldFocused: Bool
+    @ObservedObject private var voiceprints = VoiceprintService.shared
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(mode == .cluster ? "Identify Speaker" : "Identify These Segments")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+
+            Divider()
+
+            // Search
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search names", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .focused($searchFieldFocused)
+                    .onSubmit {
+                        // Enter → identify to the first matching result.
+                        if let first = firstMatch {
+                            onConfirm(first.name)
+                        }
+                    }
+                if !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(10)
+            .background(Color(nsColor: .textBackgroundColor))
+
+            Divider()
+
+            // List
+            List {
+                ForEach(filteredCategories) { catGroup in
+                    Section(header: Text("\(catGroup.name) (\(catGroup.templates.count))")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)) {
+                        ForEach(catGroup.templates) { template in
+                            Button {
+                                onConfirm(template.name)
+                            } label: {
+                                HStack {
+                                    Text(template.name)
+                                        .font(.system(size: 12))
+                                    Spacer()
+                                    if template.name == currentName {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(Color.accentColor)
+                                    }
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .listStyle(.plain)
+        }
+        .frame(width: 380, height: 520)
+        .onAppear {
+            searchFieldFocused = true
+        }
+    }
+
+    private var subtitle: String {
+        switch mode {
+        case .cluster:
+            return "Pick a name to assign this speaker cluster."
+        case .segments:
+            return "Pick a name to assign the selected segments."
+        }
+    }
+
+    /// Categorized templates filtered by the search text. Case-
+    /// insensitive substring match on the template name. Categories
+    /// with zero matches are dropped from the display.
+    private var filteredCategories: [VoiceprintService.CategoryGroup] {
+        let trimmed = searchText.trimmingCharacters(in: .whitespaces)
+        let source = voiceprints.categorizedTemplates.isEmpty
+            ? [VoiceprintService.CategoryGroup(name: "All", templates: voiceprints.templates)]
+            : voiceprints.categorizedTemplates
+
+        guard !trimmed.isEmpty else { return source }
+        let needle = trimmed.lowercased()
+        return source.compactMap { group in
+            let matched = group.templates.filter { $0.name.lowercased().contains(needle) }
+            guard !matched.isEmpty else { return nil }
+            return VoiceprintService.CategoryGroup(name: group.name, templates: matched)
+        }
+    }
+
+    /// First matching template across all filtered categories. Used
+    /// for the Enter-to-confirm shortcut.
+    private var firstMatch: VoiceprintService.Voiceprint? {
+        filteredCategories.first?.templates.first
+    }
+}
+
+// MARK: - ScrollViewGrabber
+
+/// Invisible NSViewRepresentable that locates the NSScrollView backing
+/// the SwiftUI ScrollView it's embedded in, and hands it to the
+/// callback. Used by the transcript pane to scope its
+/// `willStartLiveScrollNotification` observer (which suspends Follow
+/// on user-initiated scrolling) to the transcript's own scroll view.
+///
+/// **Why this exists instead of `onScrollPhaseChange`.** The SwiftUI
+/// scroll-phase modifier changes how the backing NSScrollView routes
+/// events on macOS, which broke the transcript rows' tap-to-seek
+/// gestures (clicks stopped reaching the miniplayer seek handler).
+/// This approach is purely observational — an invisible zero-size
+/// view walks `superview` pointers once after insertion, then AppKit
+/// notifications do the rest. Nothing about event routing changes.
+///
+/// **Timing.** The superview walk runs on the next runloop turn after
+/// `makeNSView` — at make-time the view isn't in the hierarchy yet.
+/// One retry via `updateNSView` covers lazy re-parenting.
+private struct ScrollViewGrabber: NSViewRepresentable {
+    let onFound: (NSScrollView) -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView(frame: .zero)
+        DispatchQueue.main.async {
+            reportEnclosingScrollView(from: v)
+        }
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            reportEnclosingScrollView(from: nsView)
+        }
+    }
+
+    private func reportEnclosingScrollView(from view: NSView) {
+        var current: NSView? = view.superview
+        while let c = current {
+            if let scrollView = c as? NSScrollView {
+                onFound(scrollView)
+                return
+            }
+            current = c.superview
+        }
+    }
+}
+
+// MARK: - DoubleClickCatcher
+
+/// Invisible AppKit overlay that detects double-clicks on the view it
+/// covers and reports the click's vertical position as a 0...1
+/// fraction of the view's height.
+///
+/// **Why this exists.** SwiftUI Text with `.textSelection(.enabled)`
+/// consumes mouse events over the glyphs at the AppKit layer — no
+/// SwiftUI gesture (count-2 taps, manual two-tap tracking) ever fires
+/// there. A local NSEvent monitor sees every `.leftMouseDown` BEFORE
+/// the responder chain gets it, so nothing can swallow it. The catcher
+/// view itself returns nil from `hitTest`, making it completely
+/// transparent to event routing: text selection, hover, and the row's
+/// existing single-click seek all keep working exactly as before, and
+/// the double-click event is passed through unconsumed (so the word
+/// still gets visually selected).
+///
+/// **Coordinates.** The view is flipped (top-left origin) so
+/// `convert(_:from: nil)` on the window location yields a local point
+/// whose y grows downward — matching how text lays out and what the
+/// segment-mapping math expects.
+///
+/// One monitor per visible group row; each fires only for
+/// clickCount == 2 in its own window, then does one rect test.
+/// Negligible cost even with dozens of rows rendered.
+private struct DoubleClickCatcher: NSViewRepresentable {
+    let onDoubleClick: (_ yFraction: Double) -> Void
+
+    func makeNSView(context: Context) -> CatcherView {
+        let v = CatcherView()
+        v.onDoubleClick = onDoubleClick
+        return v
+    }
+
+    func updateNSView(_ nsView: CatcherView, context: Context) {
+        nsView.onDoubleClick = onDoubleClick
+    }
+
+    final class CatcherView: NSView {
+        var onDoubleClick: ((Double) -> Void)?
+        private var monitor: Any?
+
+        override var isFlipped: Bool { true }
+
+        /// Fully transparent to hit-testing — this view never
+        /// participates in event routing. Detection happens purely
+        /// through the event monitor.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil {
+                removeMonitor()
+                return
+            }
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                guard let self,
+                      event.clickCount == 2,
+                      event.window === self.window else { return event }
+                let local = self.convert(event.locationInWindow, from: nil)
+                if self.bounds.contains(local), self.bounds.height > 0 {
+                    let fraction = min(max(Double(local.y / self.bounds.height), 0), 1)
+                    self.onDoubleClick?(fraction)
+                }
+                // Never consume — word selection and everything else
+                // downstream proceeds normally.
+                return event
+            }
+        }
+
+        private func removeMonitor() {
+            if let m = monitor {
+                NSEvent.removeMonitor(m)
+                monitor = nil
+            }
+        }
+
+        deinit {
+            removeMonitor()
+        }
     }
 }

@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import Combine
 
 /// Lightweight GitHub-Releases-backed update checker. Polls
 /// `JForte-InnoHub/StreamScribe` once per app launch (subject to a 24-hour
