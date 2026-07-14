@@ -716,12 +716,10 @@ private struct SpeakerGroupView: View {
     @State private var identifySegmentIDs: [UUID] = []
     @State private var identifyCurrentName: String? = nil
 
-    /// Which "identify" action opened the sheet. Determines which
-    /// VoiceprintService method the sheet's confirm action calls.
-    enum IdentifyMode {
-        case cluster    // sets manual identification for the whole cluster
-        case segments   // sets manual identification for specific segments only
-    }
+    /// Which "identify" action opened the sheet — hoisted to file
+    /// scope (TranscriptIdentifyMode) so the document renderer can
+    /// share the sheet; aliased here for existing references.
+    typealias IdentifyMode = TranscriptIdentifyMode
 
     /// True when this group contains the currently-playing segment.
     private var isPlaying: Bool {
@@ -1471,8 +1469,16 @@ private struct SpeakerBadge: View {
 /// faster than scrolling through hundreds of names) and see the full
 /// category structure at once. The full library becomes usable at
 /// any size — 660 templates today, 6000 tomorrow.
-private struct IdentifySpeakerSheet: View {
-    let mode: SpeakerGroupView.IdentifyMode
+/// Which "identify" action opened the identify sheet. File-scope so
+/// both transcript renderers (classic SwiftUI pane and the document
+/// renderer) share the sheet.
+enum TranscriptIdentifyMode {
+    case cluster    // sets manual identification for the whole cluster
+    case segments   // sets manual identification for specific segments only
+}
+
+struct IdentifySpeakerSheet: View {
+    let mode: TranscriptIdentifyMode
     let clusterID: String?
     let segmentIDs: [UUID]
     let currentName: String?

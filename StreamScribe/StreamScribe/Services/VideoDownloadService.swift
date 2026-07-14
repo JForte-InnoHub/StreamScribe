@@ -166,15 +166,18 @@ final class VideoDownloadService: ObservableObject {
         let source = StreamSource.detect(from: sourceURL)
         let downloadedPath: String
 
-        if source == .criticalMention {
-            // Critical Mention flow: resolve SPA page → signed HLS URL
-            // → ffmpeg copies the stream to disk. ffmpeg reads the
-            // m3u8, downloads segments in order, and remuxes to mp4
-            // without re-encoding — same bit-exact copy semantics as
-            // yt-dlp would provide, but via a path that doesn't
-            // depend on yt-dlp knowing about the source.
+        if source == .criticalMention || source == .granicus {
+            // Browser-extractor flow (Critical Mention + Granicus):
+            // resolve the player page → HLS URL → ffmpeg copies the
+            // stream to disk. ffmpeg reads the m3u8, downloads
+            // segments in order, and remuxes to mp4 without
+            // re-encoding — same bit-exact copy semantics as yt-dlp
+            // would provide, but via a path that doesn't depend on
+            // yt-dlp knowing about the source.
             await MainActor.run {
-                self.statusText = "Resolving Critical Mention clip…"
+                self.statusText = source == .granicus
+                    ? "Resolving Granicus stream…"
+                    : "Resolving Critical Mention clip…"
             }
             let resolved = try await CriticalMentionExtractor.resolve(url: sourceURL)
             downloadedPath = try await runFFmpegHLSDownload(

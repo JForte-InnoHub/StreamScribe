@@ -36,8 +36,23 @@ enum ComputeUnits: String, Codable, Equatable {
 enum TranscriptionEngineKind: String, CaseIterable, Identifiable, Codable {
     case whisperKit = "WhisperKit"
     case parakeet   = "Parakeet (MLX)"
+    case parakeetEOU = "Parakeet EOU (Streaming)"
 
     var id: String { rawValue }
+
+    /// Compact label for space-constrained UI (the sidebar's segmented
+    /// picker). Segmented controls can't compress below their labels'
+    /// intrinsic width — three full-length names ("Parakeet EOU
+    /// (Streaming)" etc.) forced the sidebar wider than its frame and
+    /// clipped it. The full name still appears in the blurb under the
+    /// picker and anywhere a menu-style picker is used.
+    var shortName: String {
+        switch self {
+        case .whisperKit:  return "Whisper"
+        case .parakeet:    return "Parakeet"
+        case .parakeetEOU: return "EOU"
+        }
+    }
 
     var blurb: String {
         switch self {
@@ -45,6 +60,8 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable, Codable {
             return "OpenAI Whisper via CoreML/ANE. Multilingual, mature, with timestamps."
         case .parakeet:
             return "NVIDIA Parakeet via MLX. English, very fast on Apple Silicon."
+        case .parakeetEOU:
+            return "Parakeet EOU 120M via FluidAudio. True streaming with end-of-utterance detection. English only, no punctuation — best as the raw pass in multi-pass live mode with a heavier refined model."
         }
     }
 }

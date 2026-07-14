@@ -63,10 +63,23 @@ final class CriticalMentionBrowserExtractor: NSObject {
     private var timeoutTask: Task<Void, Never>?
     private var finished = false
 
+    /// Whether the page being resolved is a Critical Mention page —
+    /// selects the strict CM-CDN host filter vs. the permissive
+    /// filter used for other sources (Granicus). Set in `start`.
+    /// Read from the (nonisolated) message handler; benign because
+    /// it's written once before navigation begins and never changes
+    /// during a resolve.
+    private var pageIsCriticalMention = false
+
     private override init() { super.init() }
 
     private func start(pageURL: URL, timeout: TimeInterval, completion: @escaping (ExtractionResult?) -> Void) {
         self.completion = completion
+        // Drives the message handler's host filter — strict CDN
+        // matching for CM pages, scheme-only for everything else
+        // (Granicus streams live on third-party CDNs like Wowza).
+        self.pageIsCriticalMention =
+            (pageURL.host?.lowercased().hasSuffix("criticalmention.com")) ?? false
 
         let config = WKWebViewConfiguration()
 
@@ -124,18 +137,29 @@ final class CriticalMentionBrowserExtractor: NSObject {
 
     // MARK: - The injected JavaScript
 
-    /// JS shim overriding `fetch` and `XMLHttpRequest.open` to report
-    /// stream URLs back to native code via the `stream` message
-    /// handler. Matches TWO patterns:
+    /// JS shim reporting stream URLs back to native code via the
+    /// `stream` message handler. Three observation layers, because
+    /// different players load HLS differently:
     ///
-    ///   1. URL contains `.m3u8` (standard HLS convention)
-    ///   2. URL contains `fmt=m3u8` (Critical Mention's convention —
-    ///      stream.php serves HLS content but the URL path doesn't
-    ///      end in .m3u8, only the query param signals it)
+    ///   1. **fetch/XHR hooks** — catches JS-driven players that
+    ///      request the playlist themselves (Critical Mention's SPA,
+    ///      hls.js-based players on browsers without native HLS).
+    ///   2. **Media-element hooks** (`HTMLMediaElement.src` setter +
+    ///      `setAttribute` on video/source) — WebKit plays HLS
+    ///      NATIVELY, so players like Granicus/Wowza assign the m3u8
+    ///      straight to a `<video>` and the load happens inside
+    ///      AVFoundation, invisible to fetch/XHR. The setter hook
+    ///      catches the assignment itself.
+    ///   3. **Periodic DOM scan** (500ms) of video/source `src` and
+    ///      `currentSrc` — belt-and-suspenders for anything assigned
+    ///      before our hooks installed in a late-created subframe, or
+    ///      through framework internals that bypass both hooks. The
+    ///      scan also nudges paused players with a muted `play()`,
+    ///      since some players only resolve their stream URL after a
+    ///      play attempt.
     ///
-    /// Native side filters further by host (must be criticalmention.com)
-    /// so third-party network calls (analytics, embedded video from
-    /// other domains) don't trigger false positives.
+    /// URL match: contains `.m3u8` (standard) or `fmt=m3u8`
+    /// (Critical Mention's stream.php convention).
     private static let observerJavaScript = """
     (function() {
         function report(url) {
@@ -169,6 +193,58 @@ final class CriticalMentionBrowserExtractor: NSObject {
                 return originalOpen.apply(this, arguments);
             };
         }
+
+        // Hook media element src assignment (native HLS path).
+        function hookSrcSetter(proto) {
+            try {
+                var desc = Object.getOwnPropertyDescriptor(proto, 'src');
+                if (!desc || !desc.set) return;
+                Object.defineProperty(proto, 'src', {
+                    get: desc.get,
+                    set: function(value) {
+                        try { report(String(value)); } catch (e) {}
+                        return desc.set.call(this, value);
+                    },
+                    configurable: true
+                });
+            } catch (e) {}
+        }
+        if (window.HTMLMediaElement) hookSrcSetter(HTMLMediaElement.prototype);
+        if (window.HTMLSourceElement) hookSrcSetter(HTMLSourceElement.prototype);
+
+        // Hook setAttribute for src on media/source elements.
+        if (window.Element && Element.prototype.setAttribute) {
+            var originalSetAttribute = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, value) {
+                try {
+                    if (String(name).toLowerCase() === 'src' &&
+                        (this.tagName === 'VIDEO' || this.tagName === 'AUDIO' || this.tagName === 'SOURCE')) {
+                        report(String(value));
+                    }
+                } catch (e) {}
+                return originalSetAttribute.apply(this, arguments);
+            };
+        }
+
+        // Periodic DOM scan + autoplay nudge.
+        setInterval(function() {
+            try {
+                var elements = document.querySelectorAll('video, audio, source');
+                for (var i = 0; i < elements.length; i++) {
+                    var el = elements[i];
+                    if (el.src) report(el.src);
+                    if (el.currentSrc) report(el.currentSrc);
+                    // Nudge: some players only resolve/load their
+                    // stream after a play attempt. Muted play is
+                    // permitted without a user gesture.
+                    if ((el.tagName === 'VIDEO' || el.tagName === 'AUDIO') && el.paused) {
+                        el.muted = true;
+                        var p = el.play();
+                        if (p && p.catch) p.catch(function() {});
+                    }
+                }
+            } catch (e) {}
+        }, 500);
     })();
     """
 }
@@ -181,26 +257,30 @@ extension CriticalMentionBrowserExtractor: WKScriptMessageHandler {
               let urlString = message.body as? String,
               let url = URL(string: urlString) else { return }
 
-        // Filter for Critical Mention CDN hosts. Reported URLs also
-        // include the app.criticalmention.com API calls (which contain
-        // "m3u8" in their JSON responses' URL fields — the JS shim
-        // sees the outbound request URLs, not response bodies, so this
-        // is unlikely, but defensive).
-        //
-        // The CDN pattern observed is `<subdomain>.assets.criticalmention.com`
-        // (e.g. `atl102.assets.criticalmention.com`). Match on the
-        // `criticalmention.com` suffix to catch any subdomain variation.
         guard let host = url.host?.lowercased() else { return }
-        guard host.hasSuffix("criticalmention.com") else { return }
-
-        // Additional safety: the actual stream URL will be on an
-        // `assets.` subdomain, not `app.`. The page itself lives at
-        // `app.criticalmention.com` and its own JS bundle URLs would
-        // NOT contain .m3u8 / fmt=m3u8 — but be defensive.
-        guard !host.hasPrefix("app.") else { return }
+        guard url.scheme == "https" || url.scheme == "http" else { return }
 
         Task { @MainActor [weak self] in
             guard let self, !self.finished else { return }
+
+            // Host filtering is PAGE-AWARE (checked here, on the main
+            // actor, where the flag lives). For Critical Mention pages
+            // keep the strict CDN filter: stream must be on a
+            // `*.criticalmention.com` host (their `assets.` CDN) and
+            // not the `app.` host serving the page itself. For other
+            // pages routed through this extractor (Granicus), the
+            // stream lives on third-party CDNs — Wowza
+            // (`cdn*.wowza.com`) most commonly, but deployments vary —
+            // so restricting by host would reject the very URL we're
+            // after (field bug: the first Granicus attempt captured
+            // nothing because a blanket CM-host filter dropped the
+            // Wowza playlist). For those pages, the JS-side `.m3u8`
+            // match plus the scheme check above is the filter.
+            if self.pageIsCriticalMention {
+                guard host.hasSuffix("criticalmention.com"),
+                      !host.hasPrefix("app.") else { return }
+            }
+
             let rawTitle = self.webView?.title
             let pageTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
 

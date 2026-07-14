@@ -256,7 +256,7 @@ struct SidebarView: View {
                         return nil
                     }()
                     if let reason = probeFailureReason,
-                       (liveDetectedSource.requiresYTDlp || liveDetectedSource == .criticalMention),
+                       (liveDetectedSource.requiresYTDlp || liveDetectedSource == .criticalMention || liveDetectedSource == .granicus),
                        !urlInput.trimmingCharacters(in: .whitespaces).isEmpty {
                         Button {
                             engine.beginProbe(for: urlInput)
@@ -579,7 +579,7 @@ struct SidebarView: View {
 
             Picker("", selection: $engine.transcriptionEngine) {
                 ForEach(TranscriptionEngineKind.allCases) { kind in
-                    Text(kind.rawValue).tag(kind)
+                    Text(kind.shortName).tag(kind)
                 }
             }
             .labelsHidden()
@@ -615,6 +615,14 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
 
                 switch engine.transcriptionEngine {
+                case .parakeetEOU:
+                    // Single-model engine — no picker. The 120M EOU
+                    // model downloads automatically via FluidAudio's
+                    // hub on first session start.
+                    Text("Parakeet EOU 120M — single streaming model, downloaded automatically on first use. English only, no punctuation; pair with a refined-pass model for polished text.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 case .whisperKit:
                     // Group wrapper lets us have a local `let` binding next to
                     // the Picker + modelStatusRow within a @ViewBuilder switch
@@ -849,7 +857,7 @@ struct SidebarView: View {
                         Spacer()
                         Picker("", selection: $engine.refinedTranscriptionEngine) {
                             ForEach(TranscriptionEngineKind.allCases) { kind in
-                                Text(kind.rawValue).tag(kind)
+                                Text(kind.shortName).tag(kind)
                             }
                         }
                         .labelsHidden()
@@ -1009,6 +1017,15 @@ struct SidebarView: View {
                 .foregroundStyle(.secondary)
 
             switch engine.refinedTranscriptionEngine {
+            case .parakeetEOU:
+                // EOU on the refined slot is architecturally wrong —
+                // it's a stateful streaming model, and refinement
+                // re-transcribes windows out of stream order. Steer
+                // users away rather than hard-blocking.
+                Text("Parakeet EOU is streaming-only and not suitable as a refined-pass model. Choose WhisperKit or Parakeet (MLX) here instead.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             case .whisperKit:
                 Group {
                     Picker("", selection: $engine.refinedWhisperModelName) {
@@ -2344,6 +2361,7 @@ struct SidebarView: View {
         case .soundcloud:   return "waveform.circle.fill"
         case .senateGov:    return "building.columns.fill"
         case .criticalMention: return "eye.fill"
+        case .granicus:     return "building.2.fill"
         case .hls:          return "antenna.radiowaves.left.and.right"
         case .directAudio:  return "waveform"
         case .localFile:    return "doc.fill"

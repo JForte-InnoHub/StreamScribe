@@ -85,6 +85,18 @@ struct SettingsView: View {
     @AppStorage("miniplayer.doubleClickSeek")
     private var doubleClickSeekEnabled: Bool = true
 
+    /// Default length of the miniplayer's replay-buffer clip, in
+    /// seconds. Primary-clicking the Clip button exports this many
+    /// trailing seconds; the button's menu still offers fixed preset
+    /// lengths for one-off clips. Shared key with MiniplayerWindow.
+    @AppStorage("miniplayer.clipBufferSeconds")
+    private var clipBufferSeconds: Int = 60
+
+    /// Document-renderer beta flag — shared key with ContentView,
+    /// which swaps the transcript pane implementation on it.
+    @AppStorage("transcript.documentRenderer")
+    private var useDocumentRenderer: Bool = true
+
     /// Whether the user has opted in to the Debug menu. Bound to the
     /// "Show Debug menu" toggle in the Advanced section. Same
     /// UserDefaults key the matching @AppStorage in StreamScribeApp
@@ -217,10 +229,32 @@ struct SettingsView: View {
             Section {
                 Toggle("Include video in miniplayer cache", isOn: $cacheVideoEnabled)
                 Toggle("Double-click transcript to seek", isOn: $doubleClickSeekEnabled)
+                HStack {
+                    Text("Clip buffer length")
+                    Spacer()
+                    TextField("", value: $clipBufferSeconds, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 64)
+                        .multilineTextAlignment(.trailing)
+                    Stepper("", value: $clipBufferSeconds, in: 10...600, step: 10)
+                        .labelsHidden()
+                    Text("seconds")
+                        .foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Miniplayer")
             } footer: {
-                Text("Video cache: when on, the miniplayer plays the original video alongside audio (useful for visually identifying speakers). When off, only audio is fetched and cached — saves bandwidth and disk space on long videos. Local file transcriptions are unaffected; the miniplayer plays the original file directly. Takes effect on the next transcription Start.\n\nDouble-click to seek: when on, double-clicking a sentence in the transcript jumps miniplayer playback to that spot. Turn off if it conflicts with your text-selection habits.")
+                Text("Video cache: when on, the miniplayer plays the original video alongside audio (useful for visually identifying speakers). When off, only audio is fetched and cached — saves bandwidth and disk space on long videos. Local file transcriptions are unaffected; the miniplayer plays the original file directly. Takes effect on the next transcription Start.\n\nDouble-click to seek: when on, double-clicking a sentence in the transcript jumps miniplayer playback to that spot. Turn off if it conflicts with your text-selection habits.\n\nClip buffer length: how far back the miniplayer's Clip button reaches by default. Clicking Clip saves this many trailing seconds; holding the menu open still offers other lengths for one-off clips.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Use document renderer (beta)", isOn: $useDocumentRenderer)
+            } header: {
+                Text("Transcript")
+            } footer: {
+                Text("The document renderer (default) shows the transcript as one selectable document: cross-speaker selection, ⌘F find, Copy with Attribution, Export Clip of Selection, precise double-click seek, header-click seek, and identify/pin context menus. Turn off to use the classic block renderer — currently still the only home of machine-label speaker reassignment. Takes effect immediately.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

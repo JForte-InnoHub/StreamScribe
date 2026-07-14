@@ -107,6 +107,12 @@ actor FluidAudioBackend: DiarizationBackend {
     /// RAM on any modern Mac. Sessions longer than that would warrant
     /// a streaming switch.
     private var accumulatedBuffer: [Float] = []
+
+    /// Per-speaker high-water marks of finalized segments already
+    /// returned from `diarize()` — the delta cursor that keeps the
+    /// engine's append-consumption free of duplicates. Keyed by
+    /// LS-EEND's speaker index. See the delta comment in `diarize()`.
+    private var emittedFinalizedCounts: [Int: Int] = [:]
     private var accumulatedStart: TimeInterval = 0
 
     /// Stable speaker label assignment for the live path. LS-EEND's
@@ -149,36 +155,68 @@ actor FluidAudioBackend: DiarizationBackend {
         // Offline pipeline. `prepareModels()` downloads + Core ML-compiles
         // all three model bundles (segmentation, embedding, VAD) into the
         // FluidAudio cache. Idempotent — no-op if already cached.
+        //
+        // The elapsed-time log lines below exist to make cache hits vs
+        // real downloads unambiguous: a cached prepare is pure
+        // load/compile (~1-3s); a real download of the ~250MB combined
+        // bundles takes 30s+ on most connections. If the log ever
+        // shows "cached=true" alongside a long elapsed time, suspect
+        // the CoreML compilation cache was purged (harmless, self-
+        // heals); "cached=false" on every session means the cache
+        // path or symlink is broken — check that
+        // ~/Library/Application Support/FluidAudio/Models is a
+        // symlink to the unified StreamScribe models directory.
+        let wasCached = Self.isModelCached()
+        let prepareStart = Date()
         if offlineManager == nil {
             let manager = OfflineDiarizerManager(config: OfflineDiarizerConfig())
             try await manager.prepareModels()
             self.offlineManager = manager
-            print("[FluidAudio] Offline diarizer ready.")
+            print(String(format: "[FluidAudio] Offline diarizer ready (cached=%@, %.1fs).",
+                         wasCached ? "true" : "false",
+                         Date().timeIntervalSince(prepareStart)))
         }
 
         // LS-EEND streaming diarizer. Constructor handles download +
         // compile, similar to OfflineDiarizerManager.prepareModels.
         if lseendDiarizer == nil {
+            let lseendStart = Date()
             let diarizer = try await LSEENDDiarizer(variant: .dihard3)
             self.lseendDiarizer = diarizer
-            print("[FluidAudio] LS-EEND streaming diarizer ready.")
+            print(String(format: "[FluidAudio] LS-EEND streaming diarizer ready (%.1fs).",
+                         Date().timeIntervalSince(lseendStart)))
         }
     }
 
-    /// Live-mode per-chunk diarization via LS-EEND.
+    /// Live-mode per-chunk diarization via LS-EEND's TRUE STREAMING API.
     ///
-    /// **Approach.** Accumulate samples into `accumulatedBuffer`, then run
-    /// `LSEENDDiarizer.processComplete` on the growing buffer each tick.
-    /// LS-EEND's complete-buffer API processes everything at once with
-    /// full context — correct results but O(buffer length) per call.
+    /// **History.** The initial integration used the complete-buffer
+    /// API (`processComplete`) on a growing accumulated buffer — every
+    /// tick re-processed the entire session from t=0. O(session
+    /// length) per chunk, O(n²) total: measured in the field at ~0.2s
+    /// per chunk early, ~3s by ten minutes in, extrapolating to ~18s
+    /// per chunk at the one-hour mark — past realtime, meaning the
+    /// pipeline would fall irrecoverably behind mid-hearing.
     ///
-    /// **Why this is acceptable for now.** Live diarization runs at
-    /// ~5-second chunk intervals. Even on a long session, LS-EEND's
-    /// realtime factor is high enough (~50-100x) that processing a
-    /// 30-minute accumulated buffer in <30 seconds still keeps us
-    /// comfortably ahead of the audio. For 2-hour senate hearings it
-    /// would start to lag — that's the threshold at which the
-    /// switch-to-true-streaming optimization becomes necessary.
+    /// **Now.** `process(samples:)` enqueues just the new chunk and
+    /// advances LS-EEND's internal streaming state over it; the
+    /// cumulative result lives in `diarizer.timeline`, which we read
+    /// after each call to build the full turn list (same downstream
+    /// shape as before — the engine always consumed the full timeline
+    /// per tick). Per-chunk cost is now O(chunk), flat for the whole
+    /// session.
+    ///
+    /// **Semantics delta vs the old path, deliberate and small:**
+    /// LS-EEND holds the trailing ~900ms as tentative in streaming
+    /// mode (the old processComplete finalized everything every
+    /// call). Segments near the live edge appear one tick later in
+    /// the turn list — invisible in practice, since transcription
+    /// attribution looks segments up after they exist.
+    ///
+    /// **`accumulatedBuffer` is still appended** — but never
+    /// re-processed. The voiceprint pipeline slices it by time offset
+    /// for WeSpeaker embedding extraction; it's memory (~460 MB for a
+    /// 2-hour hearing, fine), not CPU.
     ///
     /// **Sample rate.** LS-EEND expects 16 kHz mono Float32. Our pipeline
     /// already feeds 16 kHz mono samples to all backends, so no
@@ -196,20 +234,38 @@ actor FluidAudioBackend: DiarizationBackend {
         accumulatedBuffer.append(contentsOf: samples)
 
         do {
-            let timeline = try diarizer.processComplete(
-                accumulatedBuffer,
-                sourceSampleRate: 16_000
-            )
+            // Incremental step: enqueue + process ONLY this chunk.
+            _ = try diarizer.process(samples: samples, sourceSampleRate: 16_000)
 
-            // Map LS-EEND's per-speaker finalized segments into our flat
-            // SpeakerTurn array. processComplete only includes finalized
-            // segments here — the 900ms tentative preview is internal and
-            // doesn't surface, matching what Sortformer does (we don't
-            // expose tentative there either).
+            // Read the cumulative timeline the streaming session
+            // maintains internally — then return ONLY the DELTA.
+            //
+            // **The contract this preserves (field postmortem).** The
+            // engine does `allSpeakerTurns.append(contentsOf:)` with
+            // whatever this returns, once per chunk. Sortformer
+            // returns only new turns, so append is correct there.
+            // Returning the full cumulative timeline here meant chunk
+            // k appended ~k turns: after ~1,100 chunks of a 3-hour
+            // hearing, allSpeakerTurns held on the order of a MILLION
+            // duplicate entries and pickSpeaker's linear scan ran per
+            // emitted segment — per-chunk overhead grew from ~4s to
+            // ~60s and the session fell half an hour behind live.
+            // Slicing each speaker's finalizedSegments past the
+            // high-water mark of what we've already returned makes
+            // append-consumption O(new turns), flat for the session.
+            //
+            // Finalized segments are immutable once emitted (that's
+            // what "finalized" means in LS-EEND's streaming model),
+            // so a per-speaker count is a sufficient cursor.
+            let timeline = diarizer.timeline
+
             var turns: [SpeakerTurn] = []
             for (_, speaker) in timeline.speakers {
                 let label = stableLabel(forIndex: speaker.index)
-                for segment in speaker.finalizedSegments {
+                let alreadyEmitted = emittedFinalizedCounts[speaker.index, default: 0]
+                let segments = speaker.finalizedSegments
+                guard segments.count > alreadyEmitted else { continue }
+                for segment in segments[alreadyEmitted...] {
                     // Add accumulatedStart so segment times land on the
                     // absolute session timeline rather than buffer-local time.
                     turns.append(SpeakerTurn(
@@ -218,11 +274,12 @@ actor FluidAudioBackend: DiarizationBackend {
                         end: accumulatedStart + TimeInterval(segment.endTime)
                     ))
                 }
+                emittedFinalizedCounts[speaker.index] = segments.count
             }
             return turns
         } catch {
             #if DEBUG
-            print("[FluidAudio] LS-EEND processComplete error: \(error)")
+            print("[FluidAudio] LS-EEND streaming process error: \(error)")
             #endif
             return []
         }
@@ -271,6 +328,16 @@ actor FluidAudioBackend: DiarizationBackend {
         accumulatedBuffer = []
         accumulatedStart = 0
         liveLabelMap = [:]
+        emittedFinalizedCounts = [:]
+        // CRITICAL since the switch to the streaming API: the
+        // diarizer now carries cumulative session state (enqueued
+        // audio position, speaker timeline) across process() calls.
+        // Without this reset, a second session would continue the
+        // previous session's timeline — segment times offset by the
+        // old session's length and stale speaker indices bleeding
+        // through. The old processComplete path reset internally on
+        // every call, which is why this wasn't needed before.
+        lseendDiarizer?.reset()
     }
 
     /// Release model resources. Matches Sortformer / Parakeet's pattern.
@@ -281,6 +348,7 @@ actor FluidAudioBackend: DiarizationBackend {
         offlineManager = nil
         lseendDiarizer = nil
         accumulatedBuffer = []
+        emittedFinalizedCounts = [:]
         accumulatedStart = 0
         liveLabelMap = [:]
         print("[FluidAudio] unloaded models.")
@@ -432,14 +500,46 @@ extension FluidAudioBackend {
     /// start does a download anyway, with progress visible in the
     /// SDK's logs.
     static func isModelCached() -> Bool {
-        let cacheDir = fluidAudioCacheDirectory()
-        guard FileManager.default.fileExists(atPath: cacheDir.path) else {
-            return false
+        // Check BOTH candidate locations. The unified StreamScribe
+        // path is canonical, but if the SDK ever downloaded before
+        // the symlink was established (first-run ordering, symlink
+        // setup failure), the files live under the SDK's hardcoded
+        // path instead. FluidAudio's own downloader finds them there
+        // and skips downloading — but a unified-path-only check
+        // reported "not cached," making every session start LOOK
+        // like a re-download in the status label ("Downloading
+        // FluidAudio…" with a suspiciously quick few-second finish).
+        // The models were never actually re-fetched; only the label
+        // lied. Checking both paths makes the label truthful.
+        let candidates = [
+            fluidAudioCacheDirectory(),
+            sdkNativeModelsDirectory(),
+        ]
+        for dir in candidates {
+            guard FileManager.default.fileExists(atPath: dir.path) else { continue }
+            // Directory must have content — an empty dir is a wiped-
+            // install leftover, not a cache.
+            if let contents = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
+               !contents.isEmpty {
+                return true
+            }
         }
-        // Check that the directory has content. Empty cache dir doesn't
-        // count as cached — could be a leftover from a wiped install.
-        let contents = try? FileManager.default.contentsOfDirectory(atPath: cacheDir.path)
-        return (contents?.isEmpty == false)
+        return false
+    }
+
+    /// FluidAudio SDK's hardcoded download location. Normally a
+    /// symlink to the unified path (see `fluidAudioCacheDirectory`),
+    /// but consulted directly by `isModelCached` to handle the case
+    /// where the SDK downloaded here before the symlink existed.
+    static func sdkNativeModelsDirectory() -> URL {
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library")
+                .appendingPathComponent("Application Support")
+        return appSupport
+            .appendingPathComponent("FluidAudio")
+            .appendingPathComponent("Models")
     }
 
     /// Canonical path where FluidAudio's CoreML model bundles live on

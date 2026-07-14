@@ -21,6 +21,10 @@ extension NSAttributedString.Key {
     /// phases treat header ranges differently (skip in selection→clip
     /// time mapping, exclude from copy-with-attribution body, etc).
     static let ssIsHeader = NSAttributedString.Key("StreamScribe.isHeader")
+    /// Speaker color (NSColor) on the "● Name" span of a header —
+    /// the badge layout manager draws the classic tinted capsule
+    /// behind ranges carrying this attribute.
+    static let ssBadgeColor = NSAttributedString.Key("StreamScribe.badgeColor")
 }
 
 // MARK: - TranscriptDocumentModel
@@ -64,8 +68,74 @@ final class TranscriptDocumentModel {
         let displayName: String
         let contentHash: Int
         var range: NSRange
+        /// Segment IDs rendered in this group — lets sync evict the
+        /// segment-range index entries for re-rendered groups.
+        var segmentIDs: [UUID]
     }
     private var renderedGroups: [RenderedGroup] = []
+
+    /// segmentID → character range of that segment's body text in the
+    /// document. Maintained incrementally by `sync` (entries for
+    /// re-rendered groups are evicted and re-added; entries before the
+    /// divergence point are untouched since their ranges can't move).
+    /// This is Phase 2's lookup primitive: playhead time → segment →
+    /// range → highlight + scroll target, all O(1) at the 5Hz tick.
+    private var segmentRangeIndex: [UUID: NSRange] = [:]
+
+    /// Character range of a segment's body text, if rendered.
+    func range(ofSegment id: UUID) -> NSRange? {
+        segmentRangeIndex[id]
+    }
+
+    /// The rendered group containing a document character location —
+    /// the context-menu primitive: right-click anywhere in a group
+    /// (header or body) and get the group identity plus its segment
+    /// IDs for identify/pin actions. Linear scan over rendered
+    /// groups; hundreds of entries, invoked once per right-click.
+    func groupInfo(at location: Int) -> (groupID: UUID, segmentIDs: [UUID])? {
+        for group in renderedGroups where NSLocationInRange(location, group.range) {
+            return (group.groupID, group.segmentIDs)
+        }
+        return nil
+    }
+
+    /// The segments covered by a document character range, in
+    /// document order. Each entry carries: the portion of the
+    /// segment's text inside the range (trimmed, for copy), the
+    /// UNTRIMMED local character range within the segment's rendered
+    /// text (for sub-segment splitting — offsets index into
+    /// `seg.text.trimmingCharacters(...)`, which is exactly what the
+    /// renderer laid down), and the segment's rendered text length
+    /// (so consumers can tell partial coverage from full).
+    ///
+    /// Headers and separators carry no `ssSegmentID`, so selections
+    /// sweeping across them contribute nothing from those characters.
+    func segmentSlices(in range: NSRange) -> [(id: UUID, text: String, localRange: NSRange, segmentLength: Int)] {
+        guard range.length > 0,
+              NSMaxRange(range) <= textStorage.length else { return [] }
+        var out: [(UUID, NSRange)] = []
+        textStorage.enumerateAttribute(.ssSegmentID, in: range) { value, runRange, _ in
+            guard let raw = value as? String, let id = UUID(uuidString: raw) else { return }
+            // Merge continuation runs of the same segment (temporary
+            // attribute boundaries can split a segment's run).
+            if let last = out.last, last.0 == id {
+                out[out.count - 1].1 = NSUnionRange(last.1, runRange)
+            } else {
+                out.append((id, runRange))
+            }
+        }
+        return out.compactMap { (id, docRange) in
+            guard let fullRange = segmentRangeIndex[id] else { return nil }
+            let local = NSRange(
+                location: docRange.location - fullRange.location,
+                length: docRange.length
+            )
+            let text = (textStorage.string as NSString).substring(with: docRange)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return (id: id, text: text, localRange: local, segmentLength: fullRange.length)
+        }
+    }
 
     // MARK: Styling
 
@@ -83,8 +153,11 @@ final class TranscriptDocumentModel {
 
     private static let headerParagraphStyle: NSParagraphStyle = {
         let p = NSMutableParagraphStyle()
-        p.paragraphSpacing = 4
-        p.paragraphSpacingBefore = 6
+        // Extra vertical room vs. the plain-dot design: the badge
+        // capsule inflates ~3pt beyond the glyph bounds and needs
+        // clearance from the paragraph above and the body below.
+        p.paragraphSpacing = 6
+        p.paragraphSpacingBefore = 10
         return p
     }()
 
@@ -161,16 +234,35 @@ final class TranscriptDocumentModel {
         // Build replacement text for everything from the divergence on.
         let replacement = NSMutableAttributedString()
         var newRendered: [RenderedGroup] = Array(renderedGroups.prefix(divergence))
+
+        // Evict index entries for every group being re-rendered — their
+        // ranges are about to be invalidated. Entries before the
+        // divergence keep their (unmoved) ranges.
+        for stale in renderedGroups.suffix(from: divergence) {
+            for segID in stale.segmentIDs {
+                segmentRangeIndex.removeValue(forKey: segID)
+            }
+        }
+
         var cursor = rerenderLocation
         for item in fresh.suffix(from: divergence) {
             let name = item.name ?? "Speaker"
-            let rendered = Self.render(group: item.group, displayName: name)
+            let (rendered, localSegmentRanges) = Self.render(group: item.group, displayName: name)
             let range = NSRange(location: cursor, length: rendered.length)
+            var segIDs: [UUID] = []
+            for (segID, localRange) in localSegmentRanges {
+                segmentRangeIndex[segID] = NSRange(
+                    location: cursor + localRange.location,
+                    length: localRange.length
+                )
+                segIDs.append(segID)
+            }
             newRendered.append(RenderedGroup(
                 groupID: item.group.id,
                 displayName: name,
                 contentHash: item.hash,
-                range: range
+                range: range,
+                segmentIDs: segIDs
             ))
             replacement.append(rendered)
             cursor += rendered.length
@@ -182,6 +274,12 @@ final class TranscriptDocumentModel {
         textStorage.beginEditing()
         textStorage.replaceCharacters(in: replaceRange, with: replacement)
         textStorage.endEditing()
+
+        // Diagnostic (migration investigation): logs only when a
+        // re-render actually applies — absence of this line after a
+        // reassign means sync concluded "in sync," which points at
+        // name-resolution equality upstream, not rendering.
+        print("[DocRenderer] sync applied: divergence \(divergence)/\(renderedGroups.count) rendered, \(fresh.count) fresh groups; replaced \(replaceRange.length) chars with \(replacement.length).")
 
         renderedGroups = newRendered
     }
@@ -199,22 +297,36 @@ final class TranscriptDocumentModel {
 
     // MARK: Rendering
 
-    private static func render(group: SpeakerGroup, displayName: String) -> NSAttributedString {
+    private static func render(
+        group: SpeakerGroup,
+        displayName: String
+    ) -> (NSAttributedString, [(UUID, NSRange)]) {
         let out = NSMutableAttributedString()
         let groupIDString = group.id.uuidString
 
-        // Header: "● Name    00:12 – 01:30\n"
+        // Header: "● Name    00:12 – 01:30\n" — the "● Name" span
+        // carries .ssBadgeColor, which the pane's BadgeLayoutManager
+        // renders as the classic tinted capsule (12% fill, hairline
+        // stroke). Name text is color-matched and semibold 10pt with
+        // slight tracking — the same recipe as the SwiftUI
+        // SpeakerBadge, so the two renderers read identically.
         let headerColor = speakerColor(for: group.speaker ?? displayName)
         let header = NSMutableAttributedString()
-        header.append(NSAttributedString(string: "● ", attributes: [
-            .font: headerFont,
+        let badge = NSMutableAttributedString()
+        badge.append(NSAttributedString(string: "● ", attributes: [
+            .font: NSFont.systemFont(ofSize: 7, weight: .bold),
             .foregroundColor: headerColor,
+            .baselineOffset: 1.5,
         ]))
-        header.append(NSAttributedString(string: displayName, attributes: [
-            .font: headerFont,
-            .foregroundColor: NSColor.secondaryLabelColor,
+        badge.append(NSAttributedString(string: displayName, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+            .foregroundColor: headerColor,
+            .kern: 0.3,
         ]))
-        header.append(NSAttributedString(string: "   \(group.formattedTimeRange)", attributes: [
+        badge.addAttribute(.ssBadgeColor, value: headerColor,
+                           range: NSRange(location: 0, length: badge.length))
+        header.append(badge)
+        header.append(NSAttributedString(string: "     \(group.formattedTimeRange)", attributes: [
             .font: timeFont,
             .foregroundColor: NSColor.tertiaryLabelColor,
         ]))
@@ -230,7 +342,11 @@ final class TranscriptDocumentModel {
         // range carrying its own ssSegmentID. This mirrors
         // `combinedText`'s construction so the visible text is
         // identical to the old renderer's — but with per-character
-        // provenance the old renderer never had.
+        // provenance the old renderer never had. Local ranges are
+        // collected relative to `out` (header included) so the caller
+        // can offset them by the group's document location for the
+        // segment-range index.
+        var segmentRanges: [(UUID, NSRange)] = []
         let body = NSMutableAttributedString()
         var first = true
         for seg in group.segments {
@@ -243,11 +359,14 @@ final class TranscriptDocumentModel {
                 ]))
             }
             first = false
-            body.append(NSAttributedString(string: trimmed, attributes: [
+            let localStart = out.length + body.length
+            let text = NSAttributedString(string: trimmed, attributes: [
                 .font: bodyFont,
                 .foregroundColor: NSColor.labelColor,
                 .ssSegmentID: seg.id.uuidString,
-            ]))
+            ])
+            segmentRanges.append((seg.id, NSRange(location: localStart, length: text.length)))
+            body.append(text)
         }
         body.append(NSAttributedString(string: "\n", attributes: [
             .font: bodyFont,
@@ -258,7 +377,7 @@ final class TranscriptDocumentModel {
         ], range: NSRange(location: 0, length: body.length))
         out.append(body)
 
-        return out
+        return (out, segmentRanges)
     }
 
     private static func contentHash(of group: SpeakerGroup) -> Int {

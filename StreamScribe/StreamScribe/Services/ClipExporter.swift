@@ -100,6 +100,64 @@ enum ClipExporter {
         return dest
     }
 
+    /// Export an arbitrary `[start..end]` span of `source` — the
+    /// transcript-selection export path (Phase 3 of the document
+    /// renderer). Same stream-copy mechanics as the trailing clip:
+    /// `-ss` before `-i` does a fast keyframe seek, so the clip
+    /// starts at the previous keyframe (a couple of seconds of
+    /// lead-in — helpful context for a pulled quote), and no
+    /// re-encoding happens.
+    static func exportSpan(from source: URL, start: TimeInterval, end: TimeInterval) async throws -> URL {
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw ClipError.sourceMissing
+        }
+        guard end > start else {
+            throw ClipError.exportFailed("empty time span")
+        }
+        guard let ffmpeg = ToolManager.shared.ffmpegPath else {
+            throw ClipError.ffmpegMissing
+        }
+
+        try FileManager.default.createDirectory(
+            at: clipsDirectory, withIntermediateDirectories: true
+        )
+
+        let duration = end - start
+        let name = "Clip \(spanLabel(start))–\(spanLabel(end)) \(Self.timestampFormatter.string(from: Date())).mp4"
+        let dest = uniqueURL(for: clipsDirectory.appendingPathComponent(name))
+
+        let args = [
+            "-hide_banner", "-nostdin", "-y",
+            "-ss", String(format: "%.2f", start),
+            "-i", source.path,
+            "-t", String(format: "%.2f", duration),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            dest.path,
+        ]
+
+        let stderrText = try await runProcess(executable: ffmpeg, arguments: args)
+
+        guard FileManager.default.fileExists(atPath: dest.path),
+              (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? Int64 ?? 0) ?? 0 > 0 else {
+            let tail = stderrText.split(separator: "\n").suffix(4).joined(separator: " ")
+            throw ClipError.exportFailed(tail.isEmpty ? "no output produced" : tail)
+        }
+        print("[Clip] Exported span [\(spanLabel(start))–\(spanLabel(end))] → \(dest.lastPathComponent)")
+        return dest
+    }
+
+    /// "01.23.45"-style media-time label, filename-safe (dots, not
+    /// colons — colons are path separators in classic Mac semantics
+    /// and Finder rewrites them).
+    private static func spanLabel(_ t: TimeInterval) -> String {
+        let total = Int(t.rounded())
+        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+        return h > 0
+            ? String(format: "%d.%02d.%02d", h, m, s)
+            : String(format: "%d.%02d", m, s)
+    }
+
     // MARK: - Internals
 
     private static func runProcess(executable: String, arguments: [String]) async throws -> String {

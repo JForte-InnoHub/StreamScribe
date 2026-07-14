@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import AVFoundation
 
 struct ContentView: View {
     @EnvironmentObject var engine: TranscriptionEngine
@@ -38,6 +39,14 @@ struct ContentView: View {
     /// to keep the layout from getting cluttered on narrow windows.
     @State private var openRightPanel: RightPanel? = nil
 
+    /// Document-renderer flag (Settings → Transcript). DEFAULT since
+    /// Phase 4 reached feature parity (selection features, hit-tested
+    /// seek, identify/pin context menus, follow/highlight). The
+    /// classic SwiftUI pane remains available as the fallback — it
+    /// still exclusively hosts machine-label speaker reassignment.
+    @AppStorage("transcript.documentRenderer")
+    private var useDocumentRenderer: Bool = true
+
     /// Set by PinPanel when the user clicks "Show" on a pin. The transcript pane
     /// observes this and scrolls to the matching segment, then clears it.
     @State private var scrollToSegmentID: UUID? = nil
@@ -61,11 +70,19 @@ struct ContentView: View {
             )
             .frame(minWidth: 280, idealWidth: 320, maxWidth: 380)
 
-            TranscriptPaneView(
-                openRightPanel: $openRightPanel,
-                scrollToSegmentID: $scrollToSegmentID
-            )
-            .frame(minWidth: 480)
+            if useDocumentRenderer {
+                // Document renderer (default since Phase 4).
+                // scrollToSegmentID plumbing (pin-jump navigation)
+                // remains classic-pane-only — known follow-up.
+                TranscriptDocumentPaneView(openRightPanel: $openRightPanel)
+                    .frame(minWidth: 480)
+            } else {
+                TranscriptPaneView(
+                    openRightPanel: $openRightPanel,
+                    scrollToSegmentID: $scrollToSegmentID
+                )
+                .frame(minWidth: 480)
+            }
 
             if openRightPanel == .speakers {
                 SpeakerPanel(onClose: {
@@ -275,21 +292,66 @@ struct ContentView: View {
     private func exportMedia(engine: TranscriptionEngine) {
         guard let sourceURL = engine.playbackMediaURL else { return }
 
+        // Probe the source asynchronously BEFORE presenting the save
+        // panel, so the suggested filename carries the right
+        // extension. AVFoundation does this natively — no ffprobe
+        // subprocess needed.
+        Task { @MainActor in
+            let probe = await Self.probeMediaKind(url: sourceURL)
+            presentExportPanel(engine: engine, sourceURL: sourceURL, probe: probe)
+        }
+    }
+
+    /// What the media file actually contains, independent of its
+    /// container/extension. The media cache muxes EVERYTHING into
+    /// .mp4 (single-ffmpeg architecture), so a podcast session's
+    /// cache is audio-in-an-mp4 — exporting that verbatim hands the
+    /// user a ".mp4" that's really an audio file. The probe lets the
+    /// export write an honest audio container instead.
+    private struct MediaProbe {
+        let hasVideo: Bool
+        /// Preferred audio container extension when audio-only:
+        /// "mp3" when the audio codec is MP3 (stream-copies into an
+        /// .mp3 container losslessly — the typical podcast case),
+        /// "m4a" for AAC and anything else mp4-family.
+        let audioExtension: String
+    }
+
+    private static func probeMediaKind(url: URL) async -> MediaProbe {
+        let asset = AVURLAsset(url: url)
+        let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+        guard videoTracks.isEmpty else {
+            return MediaProbe(hasVideo: true, audioExtension: "m4a")
+        }
+        // Audio-only: inspect the codec to pick a container that can
+        // hold it with a pure stream copy.
+        var ext = "m4a"
+        if let audioTrack = (try? await asset.loadTracks(withMediaType: .audio))?.first,
+           let formats = try? await audioTrack.load(.formatDescriptions),
+           let format = formats.first {
+            let subtype = CMFormatDescriptionGetMediaSubType(format)
+            if subtype == kAudioFormatMPEGLayer3 {
+                ext = "mp3"
+            }
+        }
+        return MediaProbe(hasVideo: false, audioExtension: ext)
+    }
+
+    @MainActor
+    private func presentExportPanel(engine: TranscriptionEngine, sourceURL: URL, probe: MediaProbe) {
         let panel = NSSavePanel()
         panel.title = "Export Media"
         panel.canCreateDirectories = true
 
-        // Derive extension from the source URL. Fall back to mp4
-        // (the most common cache format) if the URL has none — this
-        // shouldn't happen with our cache filenames but is harmless
-        // belt-and-suspenders.
-        let ext = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
+        // Extension strategy: video content keeps the source's
+        // extension (mp4 from the cache, whatever the original was
+        // for local files). Audio-only content gets an audio
+        // extension even though the cache container is mp4 — the
+        // export remuxes below.
+        let sourceExt = sourceURL.pathExtension.isEmpty ? "mp4" : sourceURL.pathExtension
+        let ext = probe.hasVideo ? sourceExt : probe.audioExtension
+        let needsRemux = !probe.hasVideo && ext.lowercased() != sourceExt.lowercased()
 
-        // Sanitize the title for use as a filename. Strips POSIX path
-        // separators and control characters. Doesn't try to handle
-        // every edge case (windows-style invalid chars, length limits)
-        // — NSSavePanel does additional validation and the user can
-        // edit the suggestion before confirming.
         let rawTitle = engine.detectedTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         let title: String = {
             guard let t = rawTitle, !t.isEmpty else { return "StreamScribe Media" }
@@ -305,19 +367,68 @@ struct ContentView: View {
 
         panel.begin { response in
             guard response == .OK, let destURL = panel.url else { return }
-            do {
-                // If the user picked a destination that already
-                // exists, NSSavePanel has already confirmed the
-                // overwrite with them — we just need to remove the
-                // existing file before copyItem (which errors on
-                // existing destination).
-                if FileManager.default.fileExists(atPath: destURL.path) {
-                    try FileManager.default.removeItem(at: destURL)
+            Task.detached {
+                do {
+                    if FileManager.default.fileExists(atPath: destURL.path) {
+                        try FileManager.default.removeItem(at: destURL)
+                    }
+                    if needsRemux {
+                        // Audio-only in an mp4 container → remux into
+                        // the honest audio container. `-vn` drops any
+                        // stray attached-picture stream; `-acodec
+                        // copy` means no re-encode — the audio bytes
+                        // are byte-identical to the source, just in
+                        // the right box. Falls back to a verbatim
+                        // copy (with a corrected .m4a name only if
+                        // the panel ext was m4a — mp4-family, still
+                        // valid) if ffmpeg is unavailable or fails.
+                        try await Self.remuxAudio(from: sourceURL, to: destURL)
+                    } else {
+                        try FileManager.default.copyItem(at: sourceURL, to: destURL)
+                    }
+                } catch {
+                    print("[ExportMedia] export failed: \(error.localizedDescription)")
+                    // Fallback: verbatim copy so the user gets SOMETHING
+                    // at their chosen path. For the m4a case the mp4
+                    // bytes are container-compatible; for mp3 this
+                    // shouldn't be reached (remux of mp3→mp3 copy is
+                    // trivial), but a playable mislabeled file still
+                    // beats silence.
+                    try? FileManager.default.copyItem(at: sourceURL, to: destURL)
                 }
-                try FileManager.default.copyItem(at: sourceURL, to: destURL)
-            } catch {
-                print("[ExportMedia] copy failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// Stream-copy the audio of `source` into the container implied by
+    /// `dest`'s extension. No re-encoding.
+    private static func remuxAudio(from source: URL, to dest: URL) async throws {
+        guard let ffmpeg = ToolManager.shared.ffmpegPath else {
+            throw NSError(domain: "ExportMedia", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "ffmpeg unavailable for audio remux"])
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg)
+        process.arguments = [
+            "-hide_banner", "-nostdin", "-y",
+            "-i", source.path,
+            "-vn",
+            "-acodec", "copy",
+            dest.path,
+        ]
+        let errPipe = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errPipe
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: dest.path) else {
+            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = (String(data: data, encoding: .utf8) ?? "")
+                .split(separator: "\n").suffix(3).joined(separator: " ")
+            throw NSError(domain: "ExportMedia", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "remux failed: \(tail)"])
+        }
+        print("[ExportMedia] Remuxed audio-only export → \(dest.lastPathComponent)")
     }
 }

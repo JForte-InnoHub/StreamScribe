@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AVKit
 import Combine
 
@@ -60,6 +61,18 @@ struct MiniplayerWindow: View {
     /// safe SwiftUI primitives, then introduces our small
     /// Representable on the next runloop turn.
     @State private var playerReady: Bool = false
+
+    // ── Live clip (replay buffer) state ─────────────────────────────
+    /// In-flight flag for the clip export. Disables the menu while an
+    /// export runs so double-clicks don't spawn parallel ffmpegs on
+    /// the same growing file.
+    @State private var isClipping: Bool = false
+    /// Post-export feedback: the saved clip's URL (drives the brief
+    /// "Saved ✓ Reveal" affordance in the live bar), or an error
+    /// message. Auto-clears after a few seconds.
+    @State private var lastClipURL: URL? = nil
+    @State private var clipErrorMessage: String? = nil
+    @State private var clipFeedbackClearTask: Task<Void, Never>? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -140,11 +153,15 @@ struct MiniplayerWindow: View {
                         .foregroundStyle(.primary)
                 }
                 Spacer()
+                clipFeedback
+                clipMenu
             } else {
                 Text("\(Int(controller.liveLag))s behind live")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                clipFeedback
+                clipMenu
                 Button("Return to Live") {
                     controller.returnToLive()
                 }
@@ -160,6 +177,116 @@ struct MiniplayerWindow: View {
                 .frame(height: 0.5),
             alignment: .top
         )
+    }
+
+    /// Default clip length — configurable in Settings → Miniplayer.
+    /// Primary-clicking Clip uses this; the menu offers presets for
+    /// one-off other lengths.
+    @AppStorage("miniplayer.clipBufferSeconds")
+    private var clipBufferSeconds: Int = 60
+
+    /// Replay-buffer clip control — "save the last N seconds of the
+    /// stream as a video file." Only rendered when playback is coming
+    /// from the on-disk media cache (a growing local file we can cut
+    /// spans from); direct-URL playback with no cache has nothing to
+    /// clip from, so the control simply doesn't appear there.
+    ///
+    /// `Menu(primaryAction:)` gives the best of both worlds: a single
+    /// click clips the user's configured buffer length (Settings →
+    /// Miniplayer), while opening the menu offers preset lengths for
+    /// one-off clips without a trip to Settings.
+    @ViewBuilder
+    private var clipMenu: some View {
+        if let src = engine.playbackMediaURL, src.isFileURL {
+            Menu {
+                Button("Last \(durationLabel(clipBufferSeconds)) (default)") {
+                    performClip(seconds: clipBufferSeconds, from: src)
+                }
+                Divider()
+                Button("Last 30 seconds") { performClip(seconds: 30, from: src) }
+                Button("Last 1 minute") { performClip(seconds: 60, from: src) }
+                Button("Last 2 minutes") { performClip(seconds: 120, from: src) }
+                Button("Last 5 minutes") { performClip(seconds: 300, from: src) }
+            } label: {
+                Label(isClipping ? "Clipping…" : "Clip \(durationLabel(clipBufferSeconds))",
+                      systemImage: "scissors")
+                    .font(.caption)
+            } primaryAction: {
+                performClip(seconds: clipBufferSeconds, from: src)
+            }
+            .disabled(isClipping)
+            .fixedSize()
+            .help("Click: save the last \(durationLabel(clipBufferSeconds)) of the stream (configurable in Settings → Miniplayer). Menu: other lengths. Clips save to Movies → StreamScribe Clips.")
+        }
+    }
+
+    /// "45s" / "1m" / "2m 30s" style compact duration label.
+    private func durationLabel(_ seconds: Int) -> String {
+        let s = max(seconds, 1)
+        if s < 60 { return "\(s)s" }
+        let m = s / 60
+        let rem = s % 60
+        return rem == 0 ? "\(m)m" : "\(m)m \(rem)s"
+    }
+
+    /// Brief post-export feedback inline in the live bar: a "Saved ✓"
+    /// button that reveals the clip in Finder, or a short error. Auto-
+    /// clears after 6 seconds so the bar returns to its minimal state.
+    @ViewBuilder
+    private var clipFeedback: some View {
+        if let url = lastClipURL {
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } label: {
+                Label("Saved ✓", systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+            .buttonStyle(.plain)
+            .help("Reveal \(url.lastPathComponent) in Finder")
+        } else if let err = clipErrorMessage {
+            Text(err)
+                .font(.caption2)
+                .foregroundStyle(.red)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 220, alignment: .trailing)
+                .help(err)
+        }
+    }
+
+    private func performClip(seconds: Int, from source: URL) {
+        isClipping = true
+        clipErrorMessage = nil
+        lastClipURL = nil
+        Task {
+            do {
+                let url = try await ClipExporter.exportTrailingClip(
+                    from: source, duration: TimeInterval(seconds)
+                )
+                await MainActor.run {
+                    isClipping = false
+                    lastClipURL = url
+                    scheduleClipFeedbackClear()
+                }
+            } catch {
+                await MainActor.run {
+                    isClipping = false
+                    clipErrorMessage = error.localizedDescription
+                    scheduleClipFeedbackClear()
+                }
+            }
+        }
+    }
+
+    private func scheduleClipFeedbackClear() {
+        clipFeedbackClearTask?.cancel()
+        clipFeedbackClearTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled else { return }
+            lastClipURL = nil
+            clipErrorMessage = nil
+        }
     }
 
     private var noMediaPlaceholder: some View {

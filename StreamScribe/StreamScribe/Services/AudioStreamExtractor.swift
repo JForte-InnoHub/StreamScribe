@@ -201,12 +201,13 @@ actor AudioStreamExtractor {
                 inputURL = "-"
                 inputIsLocalFile = false
             }
-        } else if source == .criticalMention {
-            // Critical Mention path: the clip page is a hash-routed SPA
-            // that fetches the signed HLS stream URL via its own JS
-            // bundle. Our browser extractor watches for that URL and
-            // returns it. No yt-dlp involvement — there's no
-            // Critical Mention extractor in yt-dlp.
+        } else if source == .criticalMention || source == .granicus {
+            // Browser-extractor path (Critical Mention + Granicus):
+            // both serve pages whose JS player fetches the real HLS
+            // URL at runtime — CM a signed assets stream, Granicus a
+            // Wowza `playlist.m3u8`. Our WKWebView extractor watches
+            // network requests for the m3u8 and returns it. No yt-dlp
+            // involvement — neither site has a yt-dlp extractor.
             //
             // Extractor failure (private clip, timeout, page structure
             // change) has no yt-dlp fallback for this source. Surface

@@ -414,7 +414,11 @@ final class TranscriptionEngine: ObservableObject {
     /// is the recommended/default (native PnC, ~2GB); TDT 0.6B v3 is the
     /// lightweight fallback (smaller, requires PnC restoration);
     /// TDT 1.1B is the no-PnC alternative for users who don't need
-    /// punctuation/capitalization.
+    /// punctuation/capitalization. (CTC 0.6B was briefly listed here
+    /// while evaluating it as a raw-pass streaming model; superseded
+    /// by the Parakeet EOU engine, which is streaming-native. Still
+    /// reachable via availableParakeetModels for anyone who selects
+    /// it explicitly.)
     static let essentialParakeetModels: [String] = [
         "mlx-community/parakeet-tdt_ctc-1.1b",
         "mlx-community/parakeet-tdt-0.6b-v3",
@@ -614,7 +618,7 @@ final class TranscriptionEngine: ObservableObject {
             } catch {
                 print("[LivePreview] Senate.gov extractor failed: \(error.localizedDescription) — no live preview this session.")
             }
-        case .criticalMention:
+        case .criticalMention, .granicus:
             // Critical Mention clips are static (finite duration), not
             // live — but they still benefit from the same "give the
             // miniplayer the resolved stream URL" wiring since AVPlayer
@@ -626,15 +630,18 @@ final class TranscriptionEngine: ObservableObject {
             // acceptable because the browser extractor tears down its
             // WKWebView between calls (no state to share).
             do {
+                // Granicus rides the same browser extractor: its player
+                // pages load a Wowza playlist.m3u8 the sniffer's generic
+                // .m3u8 match captures identically.
                 let resolved = try await CriticalMentionExtractor.resolve(url: url)
                 guard self.state.isActive else {
-                    print("[LivePreview] Critical Mention resolved but session no longer active; skipping URL set.")
+                    print("[LivePreview] \(source.rawValue) resolved but session no longer active; skipping URL set.")
                     return
                 }
                 self.playbackMediaURL = resolved.m3u8URL
-                print("[LivePreview] Critical Mention URL set: \(resolved.m3u8URL.absoluteString)")
+                print("[LivePreview] \(source.rawValue) URL set: \(resolved.m3u8URL.absoluteString)")
             } catch {
-                print("[LivePreview] Critical Mention extractor failed: \(error.localizedDescription) — no live preview this session.")
+                print("[LivePreview] \(source.rawValue) extractor failed: \(error.localizedDescription) — no live preview this session.")
             }
         case .hls, .directAudio:
             // Input URL is already directly playable by AVPlayer. .hls
@@ -669,6 +676,35 @@ final class TranscriptionEngine: ObservableObject {
         )
         // Avoid duplicate pins of the same content. Same source segment + same text =
         // already pinned; ignore the request.
+        if pinnedQuotes.contains(where: {
+            $0.sourceSegmentID == quote.sourceSegmentID && $0.text == quote.text
+        }) {
+            return
+        }
+        pinnedQuotes.append(quote)
+    }
+
+    /// Pin an arbitrary selection — the literal selected text, not the
+    /// whole paragraph it came from. PinnedQuote anticipated this
+    /// ("pins from selections that span multiple segments may set
+    /// [sourceSegmentID] to the first segment"); this is the plumbing.
+    /// Same dedupe rule as pinGroup.
+    func pinSelection(
+        text: String,
+        speaker: String?,
+        start: TimeInterval,
+        end: TimeInterval,
+        sourceSegmentID: UUID?
+    ) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let quote = PinnedQuote(
+            text: trimmed,
+            speaker: speaker,
+            start: start,
+            end: end,
+            sourceSegmentID: sourceSegmentID
+        )
         if pinnedQuotes.contains(where: {
             $0.sourceSegmentID == quote.sourceSegmentID && $0.text == quote.text
         }) {
@@ -1092,6 +1128,20 @@ final class TranscriptionEngine: ObservableObject {
     // values were the original "intent" for live mode that we couldn't ship
     // until we had a refinement pass to clean up the resulting accuracy loss.
     private static let multiPassRawChunkSeconds: Double = 5.0
+
+    /// How far the refinement buffer must extend PAST a window's end
+    /// before that window is allowed to fire. Covers the gap between
+    /// "audio for time T has been processed" and "raw segments for
+    /// time T have been appended" — which are not the same moment for
+    /// streaming backends. EOU is the worst case: incremental decode
+    /// (~1 chunk of latency) plus a 1.28s end-of-utterance debounce
+    /// means tokens for [X..Y] can land while raw processing is at
+    /// Y+5..Y+7. Two chunk-lengths of margin covers that with room;
+    /// batch backends (Whisper/Parakeet-MLX) emit synchronously per
+    /// chunk and need none of it, but the margin costs them only a
+    /// slightly longer provisional-text lifetime, so it applies
+    /// uniformly rather than per-backend.
+    private static let rawEmissionLagMargin: Double = 10.0
     private static let multiPassRawOverlapSeconds: Double = 1.0
 
     // Single-pass live with Parakeet. Parakeet (NVIDIA's streaming ASR via MLX)
@@ -1384,7 +1434,7 @@ final class TranscriptionEngine: ObservableObject {
                 let timeout: TimeInterval
                 switch source {
                 case .senateGov:                   timeout = 6.0
-                case .criticalMention:             timeout = 18.0
+                case .criticalMention, .granicus:  timeout = 18.0
                 case _ where source.requiresYTDlp: timeout = 12.0
                 default:                           timeout = 3.0
                 }
@@ -1465,7 +1515,7 @@ final class TranscriptionEngine: ObservableObject {
                             }
                         }
                     }
-                } else if source == .criticalMention {
+                } else if source == .criticalMention || source == .granicus {
                     // Same rationale as beginProbe's criticalMention
                     // branch — resolve first, then ffmpeg-probe the
                     // m3u8. Hit when the direct-Start path bypassed
@@ -1955,6 +2005,16 @@ final class TranscriptionEngine: ObservableObject {
                 modelRepo: modelRepo,
                 chunkDuration: chunkSeconds
             )
+        case .parakeetEOU:
+            // Single-model streaming backend — no per-slot model name
+            // to route; the 120M EOU model is the only variant. Note
+            // it maintains streaming state across chunks, so using it
+            // on the REFINED slot would be architecturally wrong
+            // (refinement re-transcribes windows out of stream order);
+            // the sidebar picker copy steers users toward raw-slot
+            // use, but nothing hard-blocks it — a refined-slot EOU
+            // would produce garbled window text, visible immediately.
+            return EouBackend()
         }
     }
 
@@ -1997,6 +2057,13 @@ final class TranscriptionEngine: ObservableObject {
         case .parakeet:
             let repo = useRefinedModel ? refinedParakeetModelName : parakeetModelName
             return .parakeet(modelRepo: repo)
+        case .parakeetEOU:
+            // Downloaded and cached by FluidAudio's own ModelHub (like
+            // the diarizer models), not by ModelDownloadManager — no
+            // key to report. The sidebar shows no status row for this
+            // engine; first prepare() blocks on the ~100MB fetch with
+            // the standard loading state instead.
+            return nil
         }
     }
 
@@ -2733,6 +2800,55 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     @MainActor
+    /// Cheap speech-presence check for the per-chunk silence gate.
+    /// Splits the chunk into 100ms subwindows and counts how many have
+    /// a peak amplitude above the activity threshold; the chunk is
+    /// "silent" when fewer than `minActiveWindows` do.
+    ///
+    /// **Why peak-per-subwindow instead of whole-chunk RMS.** A single
+    /// RMS over 5 seconds dilutes a short utterance ("thank you") into
+    /// the noise floor — 0.5s of speech in 4.5s of silence can RMS
+    /// below a safe threshold. Subwindow peaks preserve short bursts:
+    /// any 300ms+ of real speech lights up 3+ windows and defeats the
+    /// gate. Conversely, isolated clicks/pops light up 1-2 windows and
+    /// don't.
+    ///
+    /// **Threshold calibration.** 0.008 linear ≈ -42 dBFS. Broadcast
+    /// room tone and HVAC hum on senate feeds sit well below this
+    /// (typically -55 to -60 dBFS); even quiet, distant-mic speech
+    /// peaks an order of magnitude above it. The bias is deliberate:
+    /// a chunk that's borderline gets transcribed (wasting at most a
+    /// second), never skipped (which would lose words permanently).
+    ///
+    /// Cost: one pass over the samples, ~80k comparisons for a 5s
+    /// chunk at 16kHz — microseconds. Negligible against the ~1-2s
+    /// transcription it can save.
+    static func isChunkSilent(_ samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return true }
+        let windowSize = 1600  // 100ms at 16kHz
+        let peakThreshold: Float = 0.008
+        let minActiveWindows = 3
+
+        var activeWindows = 0
+        var index = 0
+        while index < samples.count {
+            let end = min(index + windowSize, samples.count)
+            var peak: Float = 0
+            for i in index..<end {
+                let a = abs(samples[i])
+                if a > peak { peak = a }
+            }
+            if peak > peakThreshold {
+                activeWindows += 1
+                if activeWindows >= minActiveWindows {
+                    return false  // enough activity — not silent, stop early
+                }
+            }
+            index = end
+        }
+        return true
+    }
+
     private func processChunk(chunk: [Float], chunkStartTime: TimeInterval,
                               chunkAudioSeconds: TimeInterval) async throws {
         // The per-chunk pipeline always uses the raw pair. The refined pair
@@ -2742,10 +2858,46 @@ final class TranscriptionEngine: ObservableObject {
 
         let processingStart = Date()
 
+        // ── Silence gate ────────────────────────────────────────────
+        // Senate hearing streams routinely open with ~10 minutes of
+        // room tone before the gavel. When the pipeline is catching up
+        // through backlog faster than realtime, each of those silent
+        // 5s chunks still paid full transcription cost (~1-2s for
+        // Whisper) for guaranteed-empty output — the chunk COUNT, not
+        // per-chunk speed, dominated the wait. The gate below costs
+        // ~1ms of arithmetic and skips transcription for chunks with
+        // no plausible speech.
+        //
+        // **What is and isn't skipped.** Transcription only. The
+        // diarizer STILL runs on silent chunks — it appends to its
+        // accumulated buffer, which the voiceprint pipeline slices by
+        // time offset; skipping the feed would desync buffer index ↔
+        // timeline for the rest of the session. The diarizer's own
+        // internal VAD makes silence cheap for it anyway, and it
+        // emits no turns for pure room tone.
+        //
+        // **Bias: false negatives strongly preferred.** Processing a
+        // silent chunk wastes a second; skipping a speech chunk loses
+        // words permanently. The thresholds are set so only clearly
+        // silent audio skips — quiet/distant speech (peaks well above
+        // room tone even on bad senate mics) still transcribes.
+        let silent = Self.isChunkSilent(chunk)
+
         // In static-diarization mode we'll run SpeakerKit on the whole audio after
         // extraction completes — skip the per-chunk diarization to save time and to
         // avoid populating allSpeakerTurns with noisy chunk-local cluster IDs.
         if useStaticDiarization {
+            if silent {
+                totalAudioProcessed += chunkAudioSeconds
+                totalProcessingTime += Date().timeIntervalSince(processingStart)
+                if totalProcessingTime > 0 {
+                    realtimeFactor = totalAudioProcessed / totalProcessingTime
+                }
+                processedDurationSeconds = chunkStartTime + chunkAudioSeconds
+                print(String(format: "[Silence] Skipped transcription for silent chunk [%.1fs..%.1fs]",
+                             chunkStartTime, chunkStartTime + chunkAudioSeconds))
+                return
+            }
             let result = try await transcriber.transcribe(
                 samples: chunk, chunkStartTime: chunkStartTime
             )
@@ -2776,6 +2928,23 @@ final class TranscriptionEngine: ObservableObject {
         // misuse; the per-chunk timing logs below make that visible if it
         // happens.
         let chunkStarted = Date()
+
+        if silent {
+            // Silent chunk: feed the diarizer (buffer continuity — see
+            // gate comment above) but skip transcription entirely.
+            _ = await diarizer.diarize(samples: chunk, chunkStartTime: chunkStartTime)
+            let elapsed = Date().timeIntervalSince(chunkStarted)
+            totalAudioProcessed += chunkAudioSeconds
+            totalProcessingTime += elapsed
+            if totalProcessingTime > 0 {
+                realtimeFactor = totalAudioProcessed / totalProcessingTime
+            }
+            processedDurationSeconds = chunkStartTime + chunkAudioSeconds
+            print(String(format: "[Silence] Skipped transcription for silent chunk [%.1fs..%.1fs] (diarizer fed, %.2fs)",
+                         chunkStartTime, chunkStartTime + chunkAudioSeconds, elapsed))
+            return
+        }
+
         async let transcriptionTask = transcriber.transcribe(
             samples: chunk, chunkStartTime: chunkStartTime
         )
@@ -3513,26 +3682,88 @@ final class TranscriptionEngine: ObservableObject {
                 continue
             }
 
-            // Wait for enough buffered audio to cover one window.
-            if bufferSize < windowSize {
+            // Wait for enough buffered audio to cover one window PLUS
+            // the raw-emission lag margin.
+            //
+            // **Why the margin exists (EOU postmortem).** The buffer
+            // fills with audio as raw chunks are processed, but raw
+            // SEGMENTS for that audio can arrive later than the audio
+            // itself — the EOU backend decodes incrementally with
+            // ~1-chunk latency plus a 1.28s end-of-utterance debounce,
+            // so tokens timestamped inside [X..Y] may be emitted while
+            // the raw pass is processing audio past Y. Firing the
+            // refinement window for [X..Y] the moment Y's AUDIO is
+            // buffered meant `replaceSegments` ran before all of the
+            // window's raw segments existed; the late arrivals then
+            // landed in already-refined territory and persisted as
+            // unrefined text forever ("Replaced 1 segment(s) ... with
+            // 4 refined" in the field log). Requiring the buffer to
+            // extend `rawEmissionLagMargin` seconds PAST the window
+            // end guarantees the raw pass has processed well beyond
+            // the window before we replace — with 2× chunk-length
+            // margin, every backend's emission lag is covered.
+            //
+            // Cost: refinement trails the live edge by an extra
+            // ~margin (10s) in steady state, and the unrefined tail
+            // at session stop grows by the same. Both acceptable —
+            // provisional raw text living ~40s instead of ~30s is
+            // invisible next to text that never got refined at all.
+            let marginSize = Int(Self.rawEmissionLagMargin * sampleRate)
+            if bufferSize < windowSize + marginSize {
                 try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
                 continue
             }
 
-            // Phase 7: if the buffer has grown past 2× cadence while we
-            // were busy, count the intermediate window(s) we're about to
-            // skip past. Each `cadenceSize` worth of audio that gets
-            // trimmed without firing inference is a "dropped" window.
-            // We only count drops AFTER the first cadence (which is the
-            // window we're about to refine, not a drop).
-            if bufferSize > windowSize + cadenceSize {
-                let extraCadences = (bufferSize - windowSize) / cadenceSize
-                if extraCadences > 0 {
-                    await MainActor.run {
-                        self.refinementStats.windowsDropped += extraCadences
-                    }
-                    print("[Refinement] Buffer overflow: \(extraCadences) window(s) dropped without refinement (buffer=\(bufferSize / Int(self.sampleRate))s, cadence=\(Int(self.activeRefineCadence))s).")
+            // We have a full window (plus margin). Before firing
+            // inference, silence short-circuit: if the window's audio
+            // is silent AND the raw pass produced no segments in its
+            // range, skip inference entirely and advance.
+            //
+            // **Why this exists (field postmortem).** The raw-pass
+            // silence gate lets raw processing race through a senate
+            // hearing's ~15-minute silent intro in seconds — but the
+            // refined pass was still running FULL inference on every
+            // silent window behind it (20-25s each for a 1.1B model),
+            // producing "0 refined seg(s)" over and over. Net effect:
+            // refinement fell ~10 minutes behind the live edge and
+            // never reached actual speech during the session, while
+            // its inference contended with the live raw pass for
+            // GPU/ANE (raw chunk times spiking from ~1.5s to 20s+
+            // whenever a refined window was in flight). Skipping
+            // silent windows keeps refinement pinned near the live
+            // edge and eliminates the contention.
+            //
+            // **Why "AND no raw segments."** The refined pass is the
+            // safety net for raw-gate false negatives: if the crude
+            // amplitude gate wrongly skipped quiet speech, the raw
+            // transcript has a hole — but the refined pass, running
+            // the same audio through a loudness-robust model, would
+            // recover it. Skipping refinement only when the window is
+            // BOTH amplitude-silent AND raw-empty preserves that net:
+            // any window where raw found words still gets refined,
+            // and any window where raw found nothing but audio is
+            // non-silent still gets transcribed by the refined model.
+            let windowEndTimeForCheck = bufferStart + Double(windowSize) / sampleRate
+            let skipAsSilent: Bool = await MainActor.run {
+                guard let buf = self.refinePcmBuffer, buf.count >= windowSize else { return false }
+                let windowSamples = Array(buf.prefix(windowSize))
+                guard Self.isChunkSilent(windowSamples) else { return false }
+                let hasRawSegments = self.segments.contains {
+                    $0.start < windowEndTimeForCheck && $0.end > bufferStart
                 }
+                return !hasRawSegments
+            }
+            if skipAsSilent {
+                print(String(format: "[Refinement] Window [%.1fs..%.1fs] silent with no raw segments — skipped inference.",
+                             bufferStart, windowEndTimeForCheck))
+                await MainActor.run {
+                    guard var buf = self.refinePcmBuffer else { return }
+                    let drop = min(cadenceSize, buf.count)
+                    buf.removeFirst(drop)
+                    self.refinePcmBuffer = buf
+                    self.refineBufferStartTime += Double(drop) / self.sampleRate
+                }
+                continue
             }
 
             // We have a full window. Fire it.
@@ -3545,10 +3776,30 @@ final class TranscriptionEngine: ObservableObject {
             )
 
             // Advance buffer: drop `cadenceSize` samples off the front. When
-            // cadence == window this is "consume the window," which is the
-            // common case. When cadence > window we'd skip audio — not
-            // currently allowed; we clamp `cadence >= window` above so this
-            // collapses to the consume-window case.
+            // cadence == window this is "consume the window" — the common
+            // case, and nothing is skipped. When the adaptive policy has
+            // raised cadence PAST the window, the gap between window end
+            // and the drain point is audio that gets trimmed WITHOUT ever
+            // being refined — the only genuine "dropped" case, counted
+            // honestly here.
+            //
+            // (Historical note: an earlier version counted "dropped
+            // windows" by recomputing backlog depth before every fire,
+            // which produced a wall of scary "Buffer overflow: N
+            // window(s) dropped" log spam during backlog catch-up even
+            // though every window was being refined sequentially. The
+            // stats it fed were inflated by orders of magnitude.)
+            if cadenceSize > windowSize {
+                let skippedSeconds = Double(cadenceSize - windowSize) / sampleRate
+                let skippedWindows = Int((Double(cadenceSize - windowSize) / Double(windowSize)).rounded(.up))
+                await MainActor.run {
+                    self.refinementStats.windowsDropped += skippedWindows
+                }
+                print(String(format: "[Refinement] Adaptive cadence (%.0fs) exceeds window (%.0fs): skipping %.0fs of audio without refinement.",
+                             Double(cadenceSize) / sampleRate,
+                             Double(windowSize) / sampleRate,
+                             skippedSeconds))
+            }
             await MainActor.run {
                 guard var buf = self.refinePcmBuffer else { return }
                 let drop = min(cadenceSize, buf.count)
@@ -4109,11 +4360,226 @@ final class TranscriptionEngine: ObservableObject {
 
             let displayLabel = newLabel.map { self.displayName(for: $0) ?? $0 } ?? "(no speaker)"
             print("[Reassign] Set \(changedCount) segment(s) to \(displayLabel).")
+
+            // Clear per-segment voiceprint identifications on the
+            // reassigned segments. Those IDs are keyed by segment
+            // UUID and OUTRANK the machine label in displayName
+            // resolution — without this, a segment the voiceprint
+            // pipeline auto-identified keeps resolving (and
+            // rendering, and grouping) as the OLD person after
+            // reassignment, making the reassign invisible in the
+            // transcript while the menu checkmark says it happened.
+            // Reassignment is an explicit user override of whatever
+            // the pipeline believed about this text.
+            for sid in segmentIDs {
+                VoiceprintService.shared.clearSegmentIdentification(segmentId: sid)
+            }
         }
 
         withAnimation(.easeInOut(duration: 0.15)) {
             mutate()
         }
+    }
+
+    /// Sub-segment speaker reassignment: reassign exactly the SELECTED
+    /// portion of each covered segment, splitting segments whose
+    /// selection boundary lands mid-segment. This is what makes
+    /// selection-based reassignment genuinely precise — mid-segment
+    /// diarization errors (one speaker's sentence tail glued onto the
+    /// next speaker's segment) can be carved off at the word where the
+    /// voice actually changed.
+    ///
+    /// **Inputs.** Each slice pairs a segment ID with the selected
+    /// character range within that segment's TRIMMED text — the same
+    /// text the document renderer laid down, so offsets line up by
+    /// construction.
+    ///
+    /// **Word-boundary snapping.** Raw selection edges can land
+    /// mid-word; the snap expands each edge OUTWARD so a partially
+    /// selected word belongs to the selection — predictable, and it
+    /// means sloppy drags still cut at word seams.
+    ///
+    /// **Split timing.** When the segment carries word-level timings
+    /// (WhisperKit with wordTimestamps), boundary times come from the
+    /// actual word clock: the split inherits real acoustics. Without
+    /// word timing, times interpolate linearly by character position —
+    /// crude, but across a 5-15 word segment the error is a fraction
+    /// of a second, and the transcript TEXT is exact either way; only
+    /// clip-export edges and playhead-highlight boundaries feel the
+    /// interpolation at all.
+    ///
+    /// **Identity.** The first non-empty piece inherits the original
+    /// segment ID (pins and other anchors pointing at the segment keep
+    /// resolving); later pieces get fresh IDs. All pieces copy the
+    /// original's finalization/refinement state; the selected piece
+    /// takes `newLabel`, the rest keep the original speaker.
+    @MainActor
+    func reassignSpeaker(
+        splittingSlices slices: [(segmentID: UUID, localRange: NSRange)],
+        to newLabel: String?
+    ) {
+        guard !slices.isEmpty else { return }
+        var sliceByID: [UUID: NSRange] = [:]
+        for s in slices { sliceByID[s.segmentID] = s.localRange }
+
+        var wholeIDs: Set<UUID> = []
+        var didSplit = 0
+
+        let mutate = {
+            var newSegments = self.segments
+            // Descending index order keeps earlier indices valid
+            // through splices.
+            for index in stride(from: newSegments.count - 1, through: 0, by: -1) {
+                let seg = newSegments[index]
+                guard let localRange = sliceByID[seg.id] else { continue }
+
+                let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let chars = Array(text)
+                let length = chars.count
+                guard length > 0 else { continue }
+
+                // Clamp, then snap outward to word boundaries.
+                var lo = max(0, min(localRange.location, length))
+                var hi = max(lo, min(NSMaxRange(localRange), length))
+                while lo > 0 && !chars[lo - 1].isWhitespace { lo -= 1 }
+                while hi < length && !chars[hi].isWhitespace { hi += 1 }
+
+                // Whole-segment coverage after snapping → plain
+                // reassignment, no split.
+                let prefixText = String(chars[0..<lo]).trimmingCharacters(in: .whitespaces)
+                let middleText = String(chars[lo..<hi]).trimmingCharacters(in: .whitespaces)
+                let suffixText = String(chars[hi..<length]).trimmingCharacters(in: .whitespaces)
+                guard !middleText.isEmpty else { continue }
+                if prefixText.isEmpty && suffixText.isEmpty {
+                    wholeIDs.insert(seg.id)
+                    continue
+                }
+
+                // Boundary times: word clock when available, character
+                // interpolation otherwise.
+                let (t1, t2) = Self.splitTimes(
+                    for: seg, text: text, lowChar: lo, highChar: hi
+                )
+
+                var pieces: [TranscriptSegment] = []
+                var originalIDUsed = false
+                func makePiece(text: String, start: TimeInterval, end: TimeInterval, speaker: String?) {
+                    guard !text.isEmpty, end > start else { return }
+                    let pieceID: UUID
+                    if !originalIDUsed {
+                        pieceID = seg.id
+                        originalIDUsed = true
+                    } else {
+                        pieceID = UUID()
+                    }
+                    // Partition word timings (if any) into the piece by
+                    // time. Inferred typing on purpose: the engine has
+                    // a private nested `WordToken` (refinement
+                    // splitter's) that shadows the segment-level
+                    // `WordToken` here, so naming the type would
+                    // resolve to the wrong one — inference off
+                    // `seg.words` sidesteps the collision.
+                    let subset = seg.words?.filter { $0.start >= start && $0.start < end }
+                    pieces.append(TranscriptSegment(
+                        id: pieceID,
+                        text: text,
+                        start: start,
+                        end: end,
+                        speaker: speaker,
+                        isFinalized: seg.isFinalized,
+                        refinementState: seg.refinementState,
+                        words: (subset?.isEmpty == false) ? subset : nil
+                    ))
+                }
+                makePiece(text: prefixText, start: seg.start, end: t1, speaker: seg.speaker)
+                makePiece(text: middleText, start: t1, end: t2, speaker: newLabel)
+                makePiece(text: suffixText, start: t2, end: seg.end, speaker: seg.speaker)
+
+                guard pieces.count >= 2 else {
+                    // Degenerate timing collapsed a piece — fall back
+                    // to whole-segment reassignment rather than losing
+                    // text.
+                    wholeIDs.insert(seg.id)
+                    continue
+                }
+                newSegments.replaceSubrange(index...index, with: pieces)
+                didSplit += 1
+
+                // The first piece inherits the original segment ID —
+                // and with it any per-segment voiceprint
+                // identification, which outranks machine labels in
+                // name resolution. That stale ID describes the WHOLE
+                // pre-split segment; after the split it would pin the
+                // piece (and, via grouping, the visible transcript) to
+                // the old identity regardless of reassignment. Clear
+                // it: the split is an explicit assertion that the
+                // pipeline's read on this text was wrong.
+                VoiceprintService.shared.clearSegmentIdentification(segmentId: seg.id)
+            }
+            self.segments = newSegments
+
+            if didSplit > 0 {
+                let displayLabel = newLabel.map { self.displayName(for: $0) ?? $0 } ?? "(no speaker)"
+                print("[Reassign] Split \(didSplit) segment(s), selected portions → \(displayLabel).")
+            }
+        }
+
+        withAnimation(.easeInOut(duration: 0.15)) {
+            mutate()
+        }
+
+        // Whole-coverage segments route through the plain path — it
+        // handles the pin-speaker mirroring and no-op pre-checks.
+        if !wholeIDs.isEmpty {
+            reassignSpeaker(segmentIDs: wholeIDs, to: newLabel)
+        }
+    }
+
+    /// Boundary times for a split at character offsets [lo, hi) of
+    /// `text`. Prefers the segment's word clock; falls back to linear
+    /// character interpolation. Returned times are clamped strictly
+    /// inside the segment's span and ordered.
+    private static func splitTimes(
+        for seg: TranscriptSegment, text: String, lowChar: Int, highChar: Int
+    ) -> (TimeInterval, TimeInterval) {
+        let length = max(text.count, 1)
+        let dur = max(seg.end - seg.start, 0.001)
+
+        var t1 = seg.start + dur * Double(lowChar) / Double(length)
+        var t2 = seg.start + dur * Double(highChar) / Double(length)
+
+        // Word-clock refinement: rebuild the character walk the same
+        // way the words would join into the text, and take the real
+        // start/end of the boundary words. If the word texts don't
+        // reconstruct the segment text (tokenizer drift), keep the
+        // interpolation.
+        if let words = seg.words, !words.isEmpty {
+            var cursor = 0
+            for (i, word) in words.enumerated() {
+                let w = word.text.trimmingCharacters(in: .whitespaces)
+                guard !w.isEmpty else { continue }
+                let wordStart = cursor
+                let wordEnd = cursor + w.count
+                if lowChar >= wordStart && lowChar <= wordEnd {
+                    t1 = word.start
+                }
+                if highChar > wordStart && highChar <= wordEnd + 1 {
+                    t2 = word.end
+                }
+                cursor = wordEnd + 1  // joining space
+                if i == words.count - 1 && abs(cursor - 1 - text.count) > 3 {
+                    // Reconstruction drifted — distrust the mapping,
+                    // revert to interpolation.
+                    t1 = seg.start + dur * Double(lowChar) / Double(length)
+                    t2 = seg.start + dur * Double(highChar) / Double(length)
+                }
+            }
+        }
+
+        let eps = 0.02
+        t1 = min(max(t1, seg.start + eps), seg.end - eps)
+        t2 = min(max(t2, t1 + eps), seg.end - eps)
+        return (t1, t2)
     }
 
     /// Diagnostic: mark the most recent N segments as `.raw` so the
@@ -5639,7 +6105,7 @@ final class TranscriptionEngine: ObservableObject {
                         probeResult = .failed("Senate.gov resolution failed and yt-dlp probe also failed — check URL or network.")
                     }
                 }
-            } else if source == .criticalMention {
+            } else if source == .criticalMention || source == .granicus {
                 // Critical Mention: resolve the SPA clip page to its
                 // signed HLS URL via our browser extractor, then
                 // ffmpeg-probe the m3u8 for duration. Without this

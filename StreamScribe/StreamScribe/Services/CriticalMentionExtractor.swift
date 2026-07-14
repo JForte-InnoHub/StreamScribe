@@ -22,9 +22,9 @@ enum CriticalMentionExtractor {
         var errorDescription: String? {
             switch self {
             case .invalidURL:
-                return "Not a Critical Mention clip URL."
+                return "Not a supported player-page URL (Critical Mention or Granicus)."
             case .extractionFailed(let reason):
-                return "Critical Mention extraction failed: \(reason)"
+                return "Stream extraction failed: \(reason)"
             }
         }
     }
@@ -42,21 +42,26 @@ enum CriticalMentionExtractor {
         let title: String?
     }
 
-    /// Resolve a `app.criticalmention.com/app/#/clip/public/<uuid>`
-    /// page URL to its HLS stream URL. Throws on structural failure
-    /// (unrecognized URL shape) or timeout.
+    /// Resolve a browser-extracted page URL to its HLS stream URL.
+    /// Accepts Critical Mention clip pages
+    /// (`app.criticalmention.com/app/#/clip/public/<uuid>`) and
+    /// Granicus player pages (`*.granicus.com/player/…`,
+    /// `…/MediaPlayer.php…`) — both are JS players whose real m3u8
+    /// only appears in network traffic, which the shared
+    /// WKWebView sniffer captures. Throws on structural failure
+    /// (unrecognized host) or timeout.
     ///
-    /// **Public clips only for now.** Private clips would require a
-    /// Critical Mention login session that the headless WKWebView
-    /// doesn't have. If the URL contains `/clip/private/` or the
-    /// extractor times out on a public URL, the error message will
-    /// hint at authentication as a likely cause.
+    /// **Public content only for now.** Private CM clips would
+    /// require a login session the headless WKWebView doesn't have.
     static func resolve(url: URL) async throws -> Resolved {
-        // Sanity-check the URL shape before launching WebKit — the
+        // Sanity-check the host before launching WebKit — the
         // WebKit dance costs 3-8 seconds; failing fast on obviously
-        // wrong URLs saves the user time.
+        // wrong URLs saves the user time. Kept in sync with the
+        // hosts `StreamSource.detect` routes to this extractor.
         guard let host = url.host?.lowercased(),
-              host.hasSuffix("criticalmention.com") else {
+              host.hasSuffix("criticalmention.com")
+                || host == "granicus.com"
+                || host.hasSuffix(".granicus.com") else {
             throw ExtractorError.invalidURL
         }
 

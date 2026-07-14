@@ -95,6 +95,60 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
 
     var duration: TimeInterval { end - start }
 
+    /// Media time for a character offset within this segment's
+    /// TRIMMED text — the word-level seek primitive.
+    ///
+    /// With word timings, the offset maps to its word by
+    /// reconstructing the character walk (word texts joined by single
+    /// spaces — the same construction the renderer and the splitter
+    /// use), returning that word's real start time. If the
+    /// reconstruction drifts from the actual text length (tokenizer
+    /// mismatch), the word mapping is distrusted and interpolation is
+    /// used instead. Without word timings, time interpolates linearly
+    /// by character position.
+    ///
+    /// **Early bias, by design.** This is a SEEK primitive, and seek
+    /// errors are asymmetric: landing late clips the word the user
+    /// aimed at (bad), landing early plays a moment of lead-in
+    /// (harmless, often useful). Each path subtracts a lead sized to
+    /// its error profile — a small pad on word-clock times (covers
+    /// player seek granularity clipping the first phoneme), a larger
+    /// one on interpolation (covers the interpolation error itself).
+    /// Clamped to the segment start, so the floor is the old
+    /// segment-start behavior.
+    func time(atCharacterOffset offset: Int) -> TimeInterval {
+        let text = self.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let length = max(text.count, 1)
+        let clamped = max(0, min(offset, length))
+        let interpolated = start + duration * Double(clamped) / Double(length)
+
+        let exactLead: TimeInterval = 0.15
+        let interpolatedLead: TimeInterval = 0.6
+
+        guard let words, !words.isEmpty else {
+            return max(start, interpolated - interpolatedLead)
+        }
+
+        var cursor = 0
+        var wordExact: TimeInterval? = nil
+        for word in words {
+            let w = word.text.trimmingCharacters(in: .whitespaces)
+            guard !w.isEmpty else { continue }
+            let wordEnd = cursor + w.count
+            if clamped >= cursor && clamped <= wordEnd {
+                wordExact = word.start
+            }
+            cursor = wordEnd + 1  // joining space
+        }
+        // Drift check: if the word texts don't reconstruct the
+        // segment text (±3 chars tolerance), the mapping above may
+        // have picked the wrong word — fall back to interpolation.
+        if abs((cursor - 1) - text.count) > 3 || wordExact == nil {
+            return max(start, interpolated - interpolatedLead)
+        }
+        return max(start, (wordExact ?? interpolated) - exactLead)
+    }
+
     var formattedTimeRange: String {
         "\(Self.formatTime(start)) – \(Self.formatTime(end))"
     }
@@ -252,6 +306,7 @@ enum StreamSource: String, CaseIterable {
     case soundcloud = "SoundCloud"
     case senateGov = "U.S. Senate"
     case criticalMention = "Critical Mention"
+    case granicus = "Granicus"
     case hls = "HLS Stream"
     case directAudio = "Direct Audio"
     case localFile = "Local File"
@@ -295,7 +350,7 @@ enum StreamSource: String, CaseIterable {
         switch self {
         case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
             return true
-        case .senateGov, .criticalMention, .hls, .directAudio, .localFile:
+        case .senateGov, .criticalMention, .granicus, .hls, .directAudio, .localFile:
             return false
         }
     }
@@ -401,6 +456,20 @@ enum StreamSource: String, CaseIterable {
         //     via the JS shim on first observation).
         if host == "criticalmention.com" || host.hasSuffix(".criticalmention.com") {
             return .criticalMention
+        }
+        // Granicus: government meeting/stream platform used by many
+        // city and county governments (e.g. dc.granicus.com). Player
+        // pages (`/player/camera/N?publish_id=…`, `/MediaPlayer.php…`)
+        // load a JS player that fetches an HLS playlist from a Wowza
+        // CDN (`cdn*.wowza.com/.../playlist.m3u8`). yt-dlp has no
+        // Granicus extractor and its generic scraper misses the JS-
+        // loaded playlist, so these route through the same WKWebView
+        // network-sniffing extractor as Critical Mention — the
+        // sniffer's generic `.m3u8` match catches the Wowza playlist
+        // with no changes. (A pasted wowza .m3u8 URL directly still
+        // detects as `.hls` below and skips the browser entirely.)
+        if host == "granicus.com" || host.hasSuffix(".granicus.com") {
+            return .granicus
         }
         // Apple Podcasts: host is always podcasts.apple.com. yt-dlp's extractor
         // requires URLs of the shape /<lang>/podcast/<name>/idNNN?i=NNN — i.e.
