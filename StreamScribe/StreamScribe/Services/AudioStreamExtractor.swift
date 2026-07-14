@@ -461,7 +461,27 @@ actor AudioStreamExtractor {
                 "-map", "0:a:0",
             ])
             if wantsVideoInCacheFlag {
-                cacheArgs.append(contentsOf: ["-c:v", "copy"])
+                // Transcode cache video to H.264 via VideoToolbox
+                // (hardware encoder — near-zero CPU on Apple Silicon)
+                // instead of stream-copying whatever codec the source
+                // served. Field bug behind this: when YouTube's
+                // premuxed MP4 (H.264) tier stopped matching, the
+                // format selector's fallback matched a VP9 premuxed
+                // format, and `-c:v copy` shipped VP9 inside the .mp4
+                // cache — which AVPlayer renders as a BLACK video area
+                // with working audio, on every video, with the
+                // transcript unaffected. Hardware-transcoding to
+                // H.264 makes the cache playable regardless of what
+                // codec the source serves, today and after the next
+                // upstream format shuffle. Cost: an extra encode of
+                // ≤480p video on the media engine — imperceptible on
+                // M-series. (H.264 sources get a pointless re-encode;
+                // accepted for the codec-proof guarantee.)
+                cacheArgs.append(contentsOf: [
+                    "-c:v", "h264_videotoolbox",
+                    "-b:v", "1500k",
+                    "-pix_fmt", "yuv420p",
+                ])
             }
             cacheArgs.append(contentsOf: [
                 "-c:a", "aac",
@@ -1184,7 +1204,7 @@ actor AudioStreamExtractor {
         // muxed streams (e.g. YouTube format 18 = 360p H.264+AAC).
         // Falls back to anything muxed when no MP4 is offered.
         let liveFormatSelector = wantsVideoInCacheFlag
-            ? "best[height<=480][ext=mp4]/best[height<=480]/best"
+            ? "best[height<=480][vcodec*=avc]/best[height<=480][ext=mp4]/best[height<=480]/best"
             : "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio/best"
         // HLS / fragmented-stream staging directory. yt-dlp's HLS
         // native downloader writes each fragment to disk before

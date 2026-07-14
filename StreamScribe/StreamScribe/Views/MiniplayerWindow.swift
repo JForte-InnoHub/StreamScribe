@@ -469,6 +469,19 @@ final class MiniplayerController: ObservableObject {
 
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
+        // Diagnostic: a media file with no video track renders as a
+        // black video area with working audio — historically a silent
+        // failure that looked like a player bug (it was actually the
+        // cache mux receiving no/unplayable video from the source
+        // format). Make it loud in the log so the next occurrence is
+        // a one-line diagnosis instead of an investigation.
+        Task {
+            let asset = AVURLAsset(url: url)
+            let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            if videoTracks.isEmpty {
+                print("[Miniplayer] Loaded media has NO video track (audio-only) — video area will be black. URL: \(url.lastPathComponent). If video was expected, check the cache recorder's format selection in the session log.")
+            }
+        }
 
         // Wire up the time observer for transcript highlighting + live
         // lag tracking. 5 Hz (200 ms interval) is smooth enough to look
