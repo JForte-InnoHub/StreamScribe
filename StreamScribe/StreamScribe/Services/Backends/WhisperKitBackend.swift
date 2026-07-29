@@ -7,6 +7,36 @@ import WhisperKit
 actor WhisperKitBackend: TranscriptionBackend {
 
     private var whisperKit: WhisperKit?
+
+    /// STYLE-ANCHOR PROMPT (2026-07-21). Root-cause fix for Whisper's
+    /// ALL-CAPS collapse: the model's training data includes broadcast
+    /// SDH captions (traditionally UPPERCASE), and hot, compressed
+    /// broadcast audio — Fox News clips are the reliable field trigger
+    /// — flips the decoder into that caption style, which then
+    /// self-perpetuates through the window. Whisper's documented
+    /// counter-lever is prompt conditioning: output style follows the
+    /// prompt's style, so a well-cased, punctuated prompt biases every
+    /// window toward mixed case BEFORE decoding starts.
+    ///
+    /// Deliberately STATIC — never previous-transcript text. Feeding
+    /// prior output back as the prompt is the classic caps-perpetuation
+    /// loop (one shouted chunk would seed the next). A fixed anchor has
+    /// no feedback path. Domain-flavored as a free bonus: mildly biases
+    /// toward hearing/finance vocabulary and healthy punctuation.
+    /// The deshout post-pass remains as a rarely-needed backstop.
+    private static let styleAnchorPrompt =
+        "Thank you, Mr. Chairman. The committee will come to order. We welcome today's witnesses and look forward to their testimony on financial regulation."
+
+    /// Opt-in gate for the style-anchor prompt. Defaults false (see
+    /// the regression note at the DecodingOptions wiring).
+    static var styleAnchorPromptEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "whisper.styleAnchorPromptEnabled")
+    }
+
+    /// `styleAnchorPrompt` encoded with the loaded model's tokenizer.
+    /// Computed once per model load in `prepare()`; nil until then
+    /// (DecodingOptions treats nil promptTokens as "no prompt").
+    private var styleAnchorPromptTokens: [Int]?
     private var loadedModelName: String?
     private let modelName: String
     /// nil = auto-detect; ISO 639-1 code (e.g. "en", "es") = force language.
@@ -109,6 +139,20 @@ actor WhisperKitBackend: TranscriptionBackend {
         )
         whisperKit = try await WhisperKit(config)
         loadedModelName = modelName
+
+        // Encode the style-anchor prompt with this model's tokenizer.
+        // Leading space per GPT-2-style BPE convention; filter defends
+        // against any special tokens the encoder might emit (mirrors
+        // WhisperKit's own prompt-handling examples). Whisper's prompt
+        // budget is 224 tokens; this is ~30.
+        if let tokenizer = whisperKit?.tokenizer {
+            let encoded = tokenizer.encode(text: " " + Self.styleAnchorPrompt)
+                .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+            styleAnchorPromptTokens = encoded
+            print("\(role.isEmpty ? "[WhisperKit]" : "[WhisperKit/\(role)]") Style-anchor prompt encoded (\(encoded.count) tokens).")
+        } else {
+            styleAnchorPromptTokens = nil
+        }
 
         // After load: report exactly what happened, where files live, and whether
         // they look healthy. This is the primary diagnostic when transcription
@@ -343,6 +387,20 @@ actor WhisperKitBackend: TranscriptionBackend {
             skipSpecialTokens: true,
             withoutTimestamps: false,
             wordTimestamps: true,
+            // Style-anchor prompt — DEFAULT OFF after a same-week
+            // field regression (2026-07-22): with the prompt active, a
+            // 273s local clip with diarizer-confirmed speech across
+            // 95.6% of its frames transcribed only its first 13
+            // seconds — chunks #2-#10 bailed in ~0.6s each with empty
+            // output. Prompt conditioning shifts the no-speech and
+            // log-prob distributions the decode gates
+            // (noSpeechThreshold/firstTokenLogProbThreshold) were
+            // tuned against, tipping real speech into "silence".
+            // Re-enabling requires a controlled A/B (per-chunk RTF +
+            // emptiness on a known-good clip AND a Fox caps clip),
+            // likely with relaxed gates while the prompt is active:
+            //   defaults write PLUS-PR.StreamScribe whisper.styleAnchorPromptEnabled -bool YES
+            promptTokens: Self.styleAnchorPromptEnabled ? styleAnchorPromptTokens : nil,
             suppressBlank: true,
             compressionRatioThreshold: 2.4,
             logProbThreshold: -1.0,

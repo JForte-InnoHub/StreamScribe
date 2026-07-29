@@ -97,6 +97,13 @@ struct SettingsView: View {
     @AppStorage("transcript.documentRenderer")
     private var useDocumentRenderer: Bool = true
 
+    @AppStorage(TranscriptCleanupService.enabledKey)
+    private var cleanupEnabled: Bool = false
+    @AppStorage(TranscriptCleanupService.modelRepoKey)
+    private var cleanupModelRepo: String = TranscriptCleanupService.defaultModelRepo
+    @AppStorage(TranscriptCleanupService.numeralsKey)
+    private var cleanupNumerals: Bool = false
+
     /// Whether the user has opted in to the Debug menu. Bound to the
     /// "Show Debug menu" toggle in the Advanced section. Same
     /// UserDefaults key the matching @AppStorage in StreamScribeApp
@@ -245,6 +252,24 @@ struct SettingsView: View {
                 Text("Miniplayer")
             } footer: {
                 Text("Video cache: when on, the miniplayer plays the original video alongside audio (useful for visually identifying speakers). When off, only audio is fetched and cached — saves bandwidth and disk space on long videos. Local file transcriptions are unaffected; the miniplayer plays the original file directly. Takes effect on the next transcription Start.\n\nDouble-click to seek: when on, double-clicking a sentence in the transcript jumps miniplayer playback to that spot. Turn off if it conflicts with your text-selection habits.\n\nClip buffer length: how far back the miniplayer's Clip button reaches by default. Clicking Clip saves this many trailing seconds; holding the menu open still offers other lengths for one-off clips.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Clean up transcript on completion", isOn: $cleanupEnabled)
+                Toggle("Convert spelled-out numbers to numerals", isOn: $cleanupNumerals)
+                HStack {
+                    Text("Cleanup model")
+                    Spacer()
+                    TextField("mlx-community/…", text: $cleanupModelRepo)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 320)
+                }
+            } header: {
+                Text("Transcript Cleanup")
+            } footer: {
+                Text("When enabled, runs automatically after each session; the transcript pane also has a Clean Up button for running it manually on demand (recommended for long transcripts — review first, then decide). A local LLM fixes punctuation and capitalization, removes filler words and false starts, and corrects obvious mis-transcriptions (your Custom Dictionary terms are provided as known spellings). It is instructed never to paraphrase, every change is length-validated, and the verbatim text is always preserved — any segment the model mishandles keeps its original text. The model (default Qwen3-4B-Instruct, ~2.3GB) downloads on first use and can be swapped for any mlx-community chat model by editing the repo above. After each pass, a before/after report of every change is written to Application Support → StreamScribe → Reports (path printed in the log) for review. Numeral conversion (e.g. \u{201C}sixty six\u{201D} → 66) is optional and off by default.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

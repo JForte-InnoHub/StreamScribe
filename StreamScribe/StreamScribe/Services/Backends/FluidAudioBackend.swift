@@ -146,11 +146,8 @@ actor FluidAudioBackend: DiarizationBackend {
         // route through R2; FluidAudio's `ModelRegistry.baseURL` is
         // the equivalent knob here. If the mirror key isn't set,
         // FluidAudio falls through to HuggingFace as default.
-        if let mirrorURL = UserDefaults.standard.string(forKey: FluidAudioBackend.mirrorURLKey),
-           !mirrorURL.isEmpty {
-            ModelRegistry.baseURL = mirrorURL
-            print("[FluidAudio] Using R2 mirror: \(mirrorURL)")
-        }
+        ModelRegistry.baseURL = FluidAudioBackend.resolvedMirrorURL
+        print("[FluidAudio] Model registry: \(ModelRegistry.baseURL)")
 
         // Offline pipeline. `prepareModels()` downloads + Core ML-compiles
         // all three model bundles (segmentation, embedding, VAD) into the
@@ -464,6 +461,14 @@ extension FluidAudioBackend {
     /// → Advanced; absence means use HuggingFace as FluidAudio's default
     /// download source.
     static let mirrorURLKey = "fluidAudio.mirrorURL"
+
+    /// Mirror resolution: the settings key when set, else the app's
+    /// canonical R2 base. R2 is the DEFAULT — never HuggingFace —
+    /// because fleet machines can't reach HF at all.
+    static var resolvedMirrorURL: String {
+        let custom = UserDefaults.standard.string(forKey: mirrorURLKey) ?? ""
+        return custom.isEmpty ? ModelDownloadManager.mirrorBaseURL : custom
+    }
 
     /// Best-effort check for whether FluidAudio's models are already
     /// cached on disk. Checks the unified models path

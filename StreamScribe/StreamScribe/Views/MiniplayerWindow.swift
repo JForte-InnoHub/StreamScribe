@@ -77,14 +77,18 @@ struct MiniplayerWindow: View {
     var body: some View {
         VStack(spacing: 0) {
             if let url = engine.playbackMediaURL, playerReady {
+                // NOTE (2026-07-22): URL-change handling deliberately
+                // does NOT live here. This branch unmounts when a
+                // session ends (playbackMediaURL → nil) and REMOUNTS
+                // with the next session's URL as its initial value —
+                // an onChange attached here never fires for that
+                // transition, which is exactly the field bug "the
+                // miniplayer stops loading on subsequent
+                // transcriptions until app restart" (restart worked
+                // because the placeholder's one-shot bootstrap ran on
+                // a fresh window). The handler now sits on the outer
+                // VStack, which stays mounted across sessions.
                 AVPlayerViewRepresentable(player: controller.player)
-                    .onChange(of: url) { _, new in
-                        controller.load(
-                            url: new,
-                            isLive: Self.isLiveURL(new),
-                            sessionStart: engine.sessionStartedAt
-                        )
-                    }
                     .onDisappear { controller.teardown() }
 
                 // Live indicator bar. Only renders during live mode —
@@ -112,6 +116,23 @@ struct MiniplayerWindow: View {
                             playerReady = true
                         }
                     }
+            }
+        }
+        // Session-lifecycle media handling at the ALWAYS-MOUNTED
+        // level (see the note inside the player branch): a new URL
+        // loads it; nil (session boundary / reset) tears the player
+        // down — which also clears the controller's currentURL, so
+        // re-transcribing the SAME file next session reloads instead
+        // of short-circuiting into a stale item.
+        .onChange(of: engine.playbackMediaURL) { _, newURL in
+            if let newURL {
+                controller.load(
+                    url: newURL,
+                    isLive: Self.isLiveURL(newURL),
+                    sessionStart: engine.sessionStartedAt
+                )
+            } else {
+                controller.teardown()
             }
         }
         // Apply floating-window config via onAppear instead of a
@@ -414,6 +435,12 @@ struct AVPlayerViewRepresentable: NSViewRepresentable {
 final class MiniplayerController: ObservableObject {
     let player = AVPlayer()
     private var timeObserver: Any?
+
+    /// Fragmented-asset machinery for the still-being-written session
+    /// cache file — see the load() comment for why a plain
+    /// AVPlayerItem(url:) fails on it (FigFilePlayer err=-12860).
+    private var fragmentedAsset: AVFragmentedAsset?
+    private var fragmentMinder: AVFragmentedAssetMinder?
     private var seekSubscription: AnyCancellable?
     private var currentURL: URL?
 
@@ -450,7 +477,8 @@ final class MiniplayerController: ObservableObject {
         // URL — calling `replaceCurrentItem` resets playback position
         // even with the same URL, which is jarring if the user
         // switches windows.
-        if currentURL == url, player.currentItem != nil {
+        if currentURL == url, let existingItem = player.currentItem,
+           existingItem.status != .failed {
             // The mode might have changed (e.g. session ended and the
             // URL transitioned from m3u8 to mkv — but the mkv was already
             // cached for a previous session, so the URL string matches
@@ -467,7 +495,31 @@ final class MiniplayerController: ObservableObject {
         self.fallbackT0Offset = nil
         self.liveLag = 0
 
-        let item = AVPlayerItem(url: url)
+        // FIELD FAILURE (2026-07-21, FigFilePlayer err=-12860): the
+        // session cache is a fragmented mp4 with an EMPTY moov,
+        // written progressively by ffmpeg. A plain AVPlayerItem(url:)
+        // on the still-growing file parses that empty moov, finds no
+        // indexed tracks, and fails — which is why the miniplayer
+        // "worked half the time": it depended on whether the user
+        // opened it before or after ffmpeg finished writing. For the
+        // cache file, use AVFragmentedAsset + a minder so AVFoundation
+        // tracks fragments as ffmpeg appends them — the API built for
+        // exactly this file shape. Everything else (the split-stream
+        // downloaded video, HLS URLs, local files) loads normally.
+        if let minder = fragmentMinder, let fragged = fragmentedAsset {
+            minder.removeFragmentedAsset(fragged)
+        }
+        fragmentMinder = nil
+        fragmentedAsset = nil
+        let item: AVPlayerItem
+        if url.path == MediaCacheManager.currentFileURL.path {
+            let fragged = AVFragmentedAsset(url: url)
+            fragmentedAsset = fragged
+            fragmentMinder = AVFragmentedAssetMinder(asset: fragged, mindingInterval: 2.0)
+            item = AVPlayerItem(asset: fragged)
+        } else {
+            item = AVPlayerItem(url: url)
+        }
         player.replaceCurrentItem(with: item)
         // Diagnostic: a media file with no video track renders as a
         // black video area with working audio — historically a silent
@@ -475,11 +527,28 @@ final class MiniplayerController: ObservableObject {
         // cache mux receiving no/unplayable video from the source
         // format). Make it loud in the log so the next occurrence is
         // a one-line diagnosis instead of an investigation.
+        // Hang-proofed (2026-07-21): loadTracks on a growing
+        // fragmented file can await indefinitely, which silently
+        // swallowed this diagnostic in the field. Race it against a
+        // 5s timeout so SOMETHING always logs.
         Task {
             let asset = AVURLAsset(url: url)
-            let videoTracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
-            if videoTracks.isEmpty {
-                print("[Miniplayer] Loaded media has NO video track (audio-only) — video area will be black. URL: \(url.lastPathComponent). If video was expected, check the cache recorder's format selection in the session log.")
+            let result: [AVAssetTrack]? = await withTaskGroup(of: [AVAssetTrack]?.self) { group in
+                group.addTask { (try? await asset.loadTracks(withMediaType: .video)) ?? [] }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    return nil
+                }
+                let first = await group.next() ?? nil
+                group.cancelAll()
+                return first
+            }
+            if let tracks = result {
+                if tracks.isEmpty {
+                    print("[Miniplayer] Loaded media has NO video track (audio-only) — video area will be black. URL: \(url.lastPathComponent). If video was expected, check the cache recorder's format selection in the session log.")
+                }
+            } else {
+                print("[Miniplayer] Video-track probe timed out after 5s (media still being written?) — URL: \(url.lastPathComponent)")
             }
         }
 
@@ -611,6 +680,11 @@ final class MiniplayerController: ObservableObject {
     }
 
     func teardown() {
+        if let minder = fragmentMinder, let fragged = fragmentedAsset {
+            minder.removeFragmentedAsset(fragged)
+        }
+        fragmentMinder = nil
+        fragmentedAsset = nil
         if let obs = timeObserver {
             player.removeTimeObserver(obs)
             timeObserver = nil

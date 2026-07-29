@@ -102,34 +102,25 @@ final class PotProviderManager: @unchecked Sendable {
 
     // MARK: - yt-dlp integration
 
-    /// Arguments to append to EVERY yt-dlp invocation (probe, VOD, live, cache
-    /// download). Returns [] until provisioning has completed, so call sites can
-    /// append unconditionally.
+    /// Arguments to append to every yt-dlp invocation, immediately after the
+    /// existing `--js-runtimes deno:<path>` flag (the plugin discovers Deno
+    /// through that same flag, so it must be present). Returns [] until
+    /// provisioning has completed, so call sites can append unconditionally.
+    ///
+    /// Environment: the plugin spawns Deno with the yt-dlp process environment,
+    /// so on Netskope-fleet machines the interception CA must reach the script —
+    /// `ToolManager.ytDlpChildEnvironment()` exports `DENO_CERT` alongside
+    /// `SSL_CERT_FILE` for exactly this.
     ///
     /// Note: `--extractor-args` accumulates per extractor key, so a separate
     /// `--extractor-args youtube:...` (e.g. the upcoming player_client rotation
     /// setting) can coexist with the `youtubepot-bgutilscript:` one below.
-    func ytDlpArguments(denoPath: String) -> [String] {
+    func potArguments() -> [String] {
         guard isProvisioned else { return [] }
         return [
             "--plugin-dirs", pluginDirectory.path,
-            "--js-runtimes", "deno:\(denoPath)",
             "--extractor-args", "youtubepot-bgutilscript:server_home=\(serverDirectory.path)",
         ]
-    }
-
-    /// Environment additions for yt-dlp invocations. The plugin spawns Deno with
-    /// the yt-dlp process environment, so a corporate TLS-interception CA (fleet
-    /// behind Netskope) must be exported here for the script's calls to Google.
-    /// Pass the app's existing extra-CA-cert setting; nil/empty is a no-op.
-    func ytDlpEnvironmentAdditions(extraCACertPath: String?) -> [String: String] {
-        var env: [String: String] = [
-            "DENO_NO_UPDATE_CHECK": "1",
-        ]
-        if let cert = extraCACertPath, !cert.isEmpty {
-            env["DENO_CERT"] = cert
-        }
-        return env
     }
 
     // MARK: - Provisioning

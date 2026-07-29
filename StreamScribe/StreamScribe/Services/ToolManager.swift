@@ -188,6 +188,28 @@ final class ToolManager: ObservableObject {
         }
     }
 
+    /// YouTube player-client override for yt-dlp, emitted as
+    /// `--extractor-args youtube:player_client=<value>`. Empty = yt-dlp's
+    /// own client selection.
+    ///
+    /// Why this exists and why the default is `web_safari`: yt-dlp's
+    /// cookie-authenticated default resolves to tv-family clients
+    /// (log signature: "Downloading tv downgraded player API JSON").
+    /// The bgutil PO-token provider is WebPO-only, so with a tv client
+    /// no token is ever generated and flagged clients get deliberate
+    /// fragment starvation — 0.00B/s with "Read timed out" retry loops
+    /// (field failure 2026-07-17, static VOD, 1392 DASH fragments all
+    /// starved). A web-family client both accepts our PO tokens and is
+    /// the field-tested working choice. When YouTube flags the current
+    /// client, rotate here (e.g. `web`, or a comma-separated list)
+    /// without a rebuild — the original motivation for this setting.
+    @Published var youtubePlayerClient: String = ToolManager.loadInitialYoutubePlayerClient() {
+        didSet {
+            guard oldValue != youtubePlayerClient else { return }
+            UserDefaults.standard.set(youtubePlayerClient, forKey: Self.youtubePlayerClientDefaultsKey)
+        }
+    }
+
     /// User-supplied path to a yt-dlp binary that overrides the bundled
     /// one. The use case is the bundled PyInstaller yt-dlp on
     /// corporate-TLS-interception networks: it ships with `certifi`
@@ -258,6 +280,56 @@ final class ToolManager: ObservableObject {
 
     /// UserDefaults key for the persisted custom SSL cert file path.
     private static let customSSLCertFileDefaultsKey = "toolManager.customSSLCertFile"
+
+    /// UserDefaults key for the persisted YouTube player-client override.
+    /// Internal (not private): the static argument builder below and the
+    /// loader both read it, and keeping it alongside the other tool keys
+    /// documents the naming convention.
+    static let youtubePlayerClientDefaultsKey = "toolManager.youtubePlayerClient"
+
+    /// Default player client. See the @Published property's docstring.
+    /// "web_safari,default" (2026-07-22, CLI-confirmed): pure
+    /// web_safari — the static-proven PO-token combo — gets NO live
+    /// formats on some streams under YouTube's current per-client
+    /// grants ("No video formats found!", verified: forcing
+    /// web_safari on a live URL errored while default clients listed
+    /// formats). The comma list makes yt-dlp query BOTH: web_safari's
+    /// formats (PO-token-covered) merge with the default multi-client
+    /// set, so any client granted live formats keeps the session
+    /// alive. Users who explicitly SET the field (including clearing
+    /// it) keep their value — the default applies only when the key
+    /// was never written.
+    static let youtubePlayerClientDefault = "web_safari,default"
+
+    /// UserDefaults key for the yt-dlp proxy URL. Empty = direct
+    /// connection. The in-app remedy for IP-level bot walls
+    /// (2026-07-21): when YouTube interstitials an address, only a
+    /// different network path gets through — this routes every
+    /// yt-dlp invocation via `--proxy` (http(s)://, socks5://, socks5h://).
+    static let proxyURLDefaultsKey = "toolManager.proxyURL"
+    static let proxyFallbacksDefaultsKey = "toolManager.proxyFallbacks"
+
+    /// Session-scoped egress override set by the extractor's proxy
+    /// rotation (2026-07-23: fleet machines share Netskope egress
+    /// IPs, so the whole building presents to YouTube as one identity
+    /// and IP-scoped enforcement — bot walls, 403 storms — triggers
+    /// at building scale; Jamie's VPN test proved recovery is
+    /// instant on a fresh egress). nil = use the configured primary
+    /// proxy or direct. Cleared by the extractor at session end.
+    /// Static because proxyArguments() is static and consumed at all
+    /// six spawn sites — the override propagates to probe, pipe,
+    /// downloader, and cache alike.
+    static var sessionProxyOverride: String?
+
+    /// Parsed fallback proxy list: one URL per line (commas also
+    /// accepted), blanks dropped.
+    static func proxyFallbackList() -> [String] {
+        let raw = UserDefaults.standard.string(forKey: proxyFallbacksDefaultsKey) ?? ""
+        return raw
+            .split(whereSeparator: { $0 == "\n" || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
 
     /// UserDefaults key for the persisted custom yt-dlp binary path.
     private static let customYTDlpPathDefaultsKey = "toolManager.customYTDlpPath"
@@ -470,6 +542,44 @@ final class ToolManager: ObservableObject {
         Task { @MainActor in
             ToolManager.shared.cookiePrimingIssue = issue
         }
+    }
+
+    /// Load the persisted YouTube player-client override, defaulting to
+    /// `web_safari` when the key has never been set (fresh installs AND
+    /// upgrades — pre-existing users get the working client by default,
+    /// same migration philosophy as `loadInitialDisableTLSCheck`).
+    private static func loadInitialYoutubePlayerClient() -> String {
+        UserDefaults.standard.string(forKey: youtubePlayerClientDefaultsKey)
+            ?? youtubePlayerClientDefault
+    }
+
+    /// Arguments forcing yt-dlp's YouTube player client. Reads UserDefaults
+    /// directly (thread-safe) so non-main-actor call sites — the extractor
+    /// actor, the probe continuation — can call it without hopping actors.
+    /// Returns [] when the user cleared the field (fall back to yt-dlp's
+    /// own selection). The `youtube:` extractor-args key is scoped to the
+    /// YouTube extractor, so this is a no-op for other sources, and it
+    /// coexists with the `youtubepot-bgutilscript:` extractor-args because
+    /// yt-dlp accumulates `--extractor-args` per key.
+    /// `--proxy` arguments from the sidebar setting; [] when unset.
+    /// Thread-safe (reads UserDefaults directly) for the same reasons
+    /// as `youtubePlayerClientArguments`.
+    static func proxyArguments() -> [String] {
+        // Rotation override wins over the configured primary.
+        let value = (sessionProxyOverride
+            ?? UserDefaults.standard.string(forKey: proxyURLDefaultsKey)
+            ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return [] }
+        return ["--proxy", value]
+    }
+
+    static func youtubePlayerClientArguments() -> [String] {
+        let value = (UserDefaults.standard.string(forKey: youtubePlayerClientDefaultsKey)
+            ?? youtubePlayerClientDefault)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return [] }
+        return ["--extractor-args", "youtube:player_client=\(value)"]
     }
 
     /// Load the persisted `disableTLSCheck` flag. **Defaults to true**
@@ -686,6 +796,12 @@ final class ToolManager: ObservableObject {
         }
         var env = ProcessInfo.processInfo.environment
         env["SSL_CERT_FILE"] = certPath
+        // Deno reads its own variable, not SSL_CERT_FILE. The bgutil
+        // PO-token plugin spawns Deno with this same environment, so
+        // without DENO_CERT the token script's HTTPS calls to Google
+        // fail behind Netskope-style TLS interception even though
+        // yt-dlp itself succeeds.
+        env["DENO_CERT"] = certPath
         // Indicate which source the path came from so the log helps
         // diagnose "did my override take effect?" vs "is the
         // auto-detected value being picked up?" — without making the
@@ -930,6 +1046,28 @@ final class ToolManager: ObservableObject {
             await self?.refreshDenoIfNeeded()
         }
 
+        // bgutil PO-token provider provisioning (script-deno mode).
+        // Runs after Deno resolution because the provider's dependency
+        // install and self-test need the runtime. Best-effort and
+        // detached: on failure the app works exactly as before — the
+        // yt-dlp call sites append `potArguments()`, which stays []
+        // until a later successful provision. `ensureDenoAvailable()`
+        // is an existence check + return in the common case, so this
+        // doesn't duplicate the refresh task's download.
+        Task.detached { [weak self] in
+            guard let self else { return }
+            do {
+                let deno = try await self.ensureDenoAvailable()
+                let cert = await MainActor.run { self.effectiveSSLCertFile }
+                try await PotProviderManager.shared.provisionIfNeeded(
+                    denoPath: deno,
+                    extraCACertPath: cert
+                )
+            } catch {
+                print("[ToolManager] PO-token provider provisioning failed: \(error.localizedDescription)")
+            }
+        }
+
         // Delete cookie jars left over from the previous app run —
         // they hold plaintext auth cookies and go stale (see
         // `cleanupSessionCookieJars`). The first yt-dlp invocation of
@@ -987,16 +1125,6 @@ final class ToolManager: ObservableObject {
 
     // MARK: - Session cookie jar
 
-    /// Path of the per-session cookie jar for a given browser argument.
-    /// Browser name is embedded in the filename so switching the cookie
-    /// browser mid-session doesn't reuse another browser's jar.
-    func sessionCookieJarPath(forBrowserArg browserArg: String) -> String {
-        // Sanitize: browser args can be "chrome" or "chrome:Profile 1";
-        // keep filenames filesystem-safe.
-        let safe = browserArg.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
-        return Self.appSupportDir.appendingPathComponent("session-cookies-\(safe).txt").path
-    }
-
     /// Cookie arguments for a yt-dlp invocation, with per-session
     /// extraction caching.
     ///
@@ -1018,41 +1146,36 @@ final class ToolManager: ObservableObject {
     /// jar, so YouTube's session-cookie rotation stays fresh across
     /// the session.
     ///
-    /// **Statelessness = self-healing.** The switch is keyed on jar
-    /// existence, not an in-memory flag. If the first invocation gets
-    /// killed before writing the jar (probe timeout, user cancel),
-    /// the next invocation simply extracts from the browser again.
-    /// No stuck states.
-    ///
-    /// **Staleness.** Jars are deleted at every app launch (see
-    /// `bootstrap`), so a session's jar never outlives the app run.
-    /// Within a session, logins/logouts in the browser won't be
-    /// picked up until relaunch — acceptable for a session-scoped
-    /// cache, and the pre-cache behavior (fresh extraction per
-    /// invocation) had the same practical latency for noticing a
-    /// *logout* anyway since sites revalidate server-side.
+    /// Cookie arguments for yt-dlp: fresh browser extraction, every
+    /// invocation, nothing cached. See the comment inside for the
+    /// history of why there is deliberately NO jar here.
     func sessionCookieArguments(browserArg: String?) -> [String] {
         guard let browserArg, !browserArg.isEmpty else { return [] }
-        let jar = sessionCookieJarPath(forBrowserArg: browserArg)
-        if FileManager.default.fileExists(atPath: jar) {
-            // Jar exists → reuse. Tighten perms opportunistically;
-            // the jar holds live auth cookies in plaintext and
-            // yt-dlp's own umask-derived perms may be looser.
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: jar
-            )
-            return ["--cookies", jar]
-        }
-        // No jar yet → extract from browser AND dump to jar so the
-        // next invocation can skip extraction.
-        return ["--cookies-from-browser", browserArg, "--cookies", jar]
+        // JAR CACHING REMOVED (2026-07-21). The jar was a rotation
+        // trap: YouTube rotates session tokens continuously; yt-dlp
+        // saved its rotated tokens into the jar on exit while the
+        // browser kept rotating its own copies, and every subsequent
+        // invocation (which sent the jar ALONE) fed YouTube a stale,
+        // divergent rotation stream. YouTube treats that as session
+        // theft and answers with a PERSISTENT "Sign in to confirm
+        // you're not a bot" wall that follows the account across IPs
+        // (VPN), browsers (each had its own jar), and sign-out/
+        // sign-in cycles (the running app re-served the old jar and
+        // re-poisoned the fresh session). Field-diagnosed after a day
+        // where every network-side remedy failed identically; the CLI
+        // — which never used a jar — worked throughout.
+        // Fresh per-invocation browser extraction costs ~20ms
+        // (measured); the cache was buying nothing and costing
+        // everything.
+        return ["--cookies-from-browser", browserArg]
     }
 
-    /// Delete session cookie jars from previous app runs. Called from
-    /// `bootstrap()`. Two reasons: (1) jars hold plaintext auth
-    /// cookies and shouldn't persist longer than needed; (2) stale
-    /// jars from yesterday would silently serve outdated cookies
-    /// (missing new logins) for the whole session.
+    /// Delete session cookie jars left behind by builds that had jar
+    /// caching (removed 2026-07-21 — see sessionCookieArguments).
+    /// Called from `bootstrap()`: existing installs carry poisoned
+    /// jars whose stale rotated tokens triggered YouTube's persistent
+    /// bot wall; deleting them at launch is the migration. Also
+    /// hygiene — jars hold plaintext auth cookies.
     func cleanupSessionCookieJars() {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: Self.appSupportDir.path) else { return }

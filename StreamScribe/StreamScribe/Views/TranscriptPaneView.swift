@@ -591,25 +591,16 @@ struct TranscriptPaneView: View {
         // `displayName(forSegment:clusterMajorities:)` to smooth
         // unidentified segments into their cluster's majority — keeps
         // continuous single-speaker stretches from fragmenting into
-        // alternating "Bernie Sanders / Speaker 1 / Bernie Sanders"
-        // groups when short segments fail to extract or match.
-        // Computed once here rather than per-segment to avoid O(N²)
-        // recomputation.
-        let majorities = engine.clusterMajorityIdentifications()
-
         // Resolve each segment's effective name once, then walk
         // through and accumulate runs of identical resolved names.
-        // O(N) over segments; the displayName resolution is O(1)
-        // per call (dict lookups in VoiceprintService + majorities).
+        // O(N) over segments; unified resolution is O(1) per call
+        // (dict lookups in VoiceprintService keyed by cluster).
         var groups: [SpeakerGroup] = []
         var currentSegments: [TranscriptSegment] = []
         var currentName: String? = nil
 
         for seg in segments {
-            let resolvedName = engine.displayName(
-                forSegment: seg,
-                clusterMajorities: majorities
-            ) ?? seg.speaker
+            let resolvedName = engine.displayName(forSegment: seg) ?? seg.speaker
             if resolvedName == currentName {
                 currentSegments.append(seg)
             } else {
@@ -752,27 +743,27 @@ private struct SpeakerGroupView: View {
                     // to identity, not to raw clustering.
                     let firstSeg = group.segments.first
                     let clusterId = firstSeg?.speaker
+                    // Unified model: identity is a cluster property,
+                    // so the badge state comes straight from the
+                    // cluster — no per-segment lookup exists anymore.
                     let isIdentified: Bool = {
-                        if let seg = firstSeg {
-                            return VoiceprintService.shared.displayInfo(
-                                forSegmentId: seg.id,
-                                clusterId: clusterId
-                            ).isIdentified
+                        if let cid = clusterId {
+                            return VoiceprintService.shared.displayInfo(forClusterId: cid).isIdentified
                         }
                         return false
                     }()
                     let isUncertain: Bool = {
-                        if let seg = firstSeg, let cid = clusterId {
+                        if let cid = clusterId {
                             let hasManualRename = engine.speakerNames[cid]?.isEmpty == false
                             if hasManualRename { return false }
-                            return VoiceprintService.shared.displayInfo(
-                                forSegmentId: seg.id,
-                                clusterId: cid
-                            ).isUncertain
+                            return VoiceprintService.shared.displayInfo(forClusterId: cid).isUncertain
                         }
                         return false
                     }()
-                    let colorSeed = isIdentified ? displayedName : (clusterId ?? displayedName)
+                    // Machine label always — identified speakers used to
+                    // switch their seed to the display name, re-rolling
+                    // their color on rename/identify (2026-07-22 fix).
+                    let colorSeed = clusterId ?? displayedName
                     SpeakerBadge(
                         displayName: displayedName,
                         colorSeed: colorSeed,
@@ -1058,33 +1049,22 @@ private struct SpeakerGroupView: View {
             if !VoiceprintService.shared.templates.isEmpty {
                 Menu {
                     let sessionSpeakers = VoiceprintService.shared.sessionSpeakerHistory.sorted()
-                    let groupSegmentIdentifications = group.segments.compactMap {
-                        VoiceprintService.shared.segmentIdentifications[$0.id]
-                    }
 
-                    if !groupSegmentIdentifications.isEmpty {
-                        Button {
-                            for seg in group.segments {
-                                VoiceprintService.shared.clearSegmentIdentification(segmentId: seg.id)
-                            }
-                        } label: {
-                            Label("Clear segment IDs in this group",
-                                  systemImage: "xmark.circle")
-                        }
-                        Divider()
-                    }
-
-                    // Session speakers directly — same treatment as
-                    // the cluster menu above.
+                    // Unified model (2026-07): identifying these
+                    // segments SPLITS them into a freshly minted
+                    // machine speaker and names that cluster — the
+                    // person always appears in the Speakers panel
+                    // with their own Speaker N. (The old per-segment
+                    // identity layer, and its "clear segment IDs"
+                    // escape hatch, are gone; to undo, reassign the
+                    // split speaker like any other.)
                     if !sessionSpeakers.isEmpty {
                         ForEach(sessionSpeakers, id: \.self) { name in
                             Button {
-                                for seg in group.segments {
-                                    VoiceprintService.shared.setManualSegmentIdentification(
-                                        segmentId: seg.id,
-                                        name: name
-                                    )
-                                }
+                                engine.identifySegments(
+                                    Set(group.segments.map { $0.id }),
+                                    as: name
+                                )
                             } label: {
                                 Text(name)
                             }
@@ -1096,8 +1076,7 @@ private struct SpeakerGroupView: View {
                         identifyMode = .segments
                         identifyClusterID = nil
                         identifySegmentIDs = group.segments.map { $0.id }
-                        identifyCurrentName = VoiceprintService.shared
-                            .segmentIdentifications[group.segments.first?.id ?? UUID()]?.name
+                        identifyCurrentName = nil
                         showIdentifySheet = true
                     } label: {
                         Label(sessionSpeakers.isEmpty ? "Choose speaker…" : "Other speaker…",
@@ -1200,12 +1179,9 @@ private struct SpeakerGroupView: View {
                             )
                         }
                     case .segments:
-                        for segId in identifySegmentIDs {
-                            VoiceprintService.shared.setManualSegmentIdentification(
-                                segmentId: segId,
-                                name: chosenName
-                            )
-                        }
+                        // Unified model: split into a new machine
+                        // speaker + name that cluster.
+                        engine.identifySegments(Set(identifySegmentIDs), as: chosenName)
                     }
                     showIdentifySheet = false
                 }

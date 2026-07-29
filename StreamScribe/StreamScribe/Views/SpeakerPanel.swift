@@ -140,6 +140,15 @@ private struct SpeakerRow: View {
                 }
 
                 Spacer()
+
+                // Match this speaker to a STORED identity (2026-07-27):
+                // the fast path for when auto-ID missed or got it wrong.
+                // Picking a name calls setManualIdentification on the
+                // CLUSTER, so every segment of this speaker — past and
+                // future this session — becomes that person. This is
+                // identity-on-the-cluster, never a per-segment split.
+                identityMenu
+
                 Text("\(segmentCount) segment\(segmentCount == 1 ? "" : "s")")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
@@ -154,6 +163,62 @@ private struct SpeakerRow: View {
             TextField(displayName, text: nameBinding)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 13))
+        }
+    }
+
+    /// Stored-identity picker. Session speakers (already seen this
+    /// run) float to the top for quick reuse; the full enrolled
+    /// catalog follows. Selecting any name identifies the whole
+    /// CLUSTER. A checkmark marks the current identity; "Clear
+    /// identity" removes a manual/auto ID and falls back to the
+    /// machine label. When the template bank hasn't loaded and no
+    /// session speakers exist yet, the menu still offers Clear.
+    private var identityMenu: some View {
+        Menu {
+            let sessionNames = voiceprints.sessionSpeakerHistory.sorted {
+                $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+            }
+            let catalog = voiceprints.allTemplateNames
+            let currentInfo = voiceprints.displayInfo(forClusterId: machineLabel)
+
+            if !sessionNames.isEmpty {
+                Section("This session") {
+                    ForEach(sessionNames, id: \.self) { name in
+                        identityButton(name, current: currentInfo.isIdentified && currentInfo.name == name)
+                    }
+                }
+            }
+            if !catalog.isEmpty {
+                Section("Stored identities") {
+                    ForEach(catalog, id: \.self) { name in
+                        identityButton(name, current: currentInfo.isIdentified && currentInfo.name == name)
+                    }
+                }
+            }
+            if currentInfo.isIdentified {
+                Divider()
+                Button("Clear identity", role: .destructive) {
+                    voiceprints.clearIdentification(clusterId: machineLabel)
+                }
+            }
+            if sessionNames.isEmpty && catalog.isEmpty {
+                Text("Identity list still loading…")
+            }
+        } label: {
+            Image(systemName: "person.crop.circle.badge.questionmark")
+                .font(.system(size: 12))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Match this speaker to a stored identity")
+    }
+
+    private func identityButton(_ name: String, current: Bool) -> some View {
+        Button {
+            voiceprints.setManualIdentification(clusterId: machineLabel, name: name)
+        } label: {
+            if current { Label(name, systemImage: "checkmark") } else { Text(name) }
         }
     }
 

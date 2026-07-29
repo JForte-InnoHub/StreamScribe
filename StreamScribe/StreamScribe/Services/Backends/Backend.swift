@@ -36,7 +36,7 @@ enum ComputeUnits: String, Codable, Equatable {
 enum TranscriptionEngineKind: String, CaseIterable, Identifiable, Codable {
     case whisperKit = "WhisperKit"
     case parakeet   = "Parakeet (MLX)"
-    case parakeetEOU = "Parakeet EOU (Streaming)"
+    case canary = "Canary (FluidAudio)"
 
     var id: String { rawValue }
 
@@ -50,7 +50,7 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .whisperKit:  return "Whisper"
         case .parakeet:    return "Parakeet"
-        case .parakeetEOU: return "EOU"
+        case .canary:      return "Canary"
         }
     }
 
@@ -60,8 +60,8 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable, Codable {
             return "OpenAI Whisper via CoreML/ANE. Multilingual, mature, with timestamps."
         case .parakeet:
             return "NVIDIA Parakeet via MLX. English, very fast on Apple Silicon."
-        case .parakeetEOU:
-            return "Parakeet EOU 120M via FluidAudio. True streaming with end-of-utterance detection. English only, no punctuation — best as the raw pass in multi-pass live mode with a heavier refined model."
+        case .canary:
+            return "NVIDIA Canary 1B v2 via FluidAudio CoreML (ANE, int4). Attention encoder-decoder — the accuracy pick (~2.1% WER). Multilingual, punctuated. Works on both raw and refined slots; ~7x realtime."
         }
     }
 }

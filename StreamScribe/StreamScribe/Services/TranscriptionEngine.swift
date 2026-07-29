@@ -105,13 +105,37 @@ final class TranscriptionEngine: ObservableObject {
     /// When multi-pass refinement is on AND `useSplitRefinedEngine` is true,
     /// the refined pass uses `refinedTranscriptionEngine` instead. Otherwise
     /// both passes use this property (the Phase 3 "option β" default).
-    /// **Default: Parakeet.** TDT-CTC 1.1B produces native PnC with strong
-    /// throughput on Apple Silicon — a better baseline than WhisperKit for
-    /// most StreamScribe use cases (hearings, podcasts, conference audio).
-    /// WhisperKit remains available via the picker for users who want it
-    /// (e.g. multilingual content where Parakeet's English-only training
-    /// hurts) or as the refined-pass engine when split refinement is on.
+    /// **Default: PER-MODE (2026-07-22).** Until the user explicitly
+    /// picks an engine this launch, each Start auto-selects by session
+    /// mode: WhisperKit for STATIC (accuracy priority; wall-clock
+    /// matters less offline), Parakeet for LIVE (its ~4x throughput
+    /// advantage keeps the live edge). The picker reflects the auto
+    /// choice so what's running is always visible, and an explicit
+    /// pick pins the choice for the rest of the launch. The stored
+    /// default here (.parakeet) is just the pre-first-Start value.
     @Published var transcriptionEngine: TranscriptionEngineKind = .parakeet
+
+    /// True once the user explicitly picks a transcription engine this
+    /// launch — per-mode auto-selection then stops adjusting.
+    private(set) var userPinnedTranscriptionEngine = false
+
+    /// Set when the engine changes `transcriptionEngine`
+    /// programmatically (per-mode auto-selection), so the sidebar's
+    /// onChange can tell an auto change from a user pick. Consumed on
+    /// read.
+    private var engineAutoChangedTranscription = false
+
+    /// Called by the sidebar picker's onChange. Returns true when the
+    /// change it observed was the engine's own per-mode auto-selection
+    /// (→ neither pin the choice nor fire pick-coupled behaviors like
+    /// the Sortformer autopair); false means a real user pick, which
+    /// pins the engine for this launch.
+    func consumeAutoEngineChangeFlag() -> Bool {
+        let wasAuto = engineAutoChangedTranscription
+        engineAutoChangedTranscription = false
+        if !wasAuto { userPinnedTranscriptionEngine = true }
+        return wasAuto
+    }
 
     /// **Default: FluidAudio.** Offline pyannote-community-1 pipeline (static)
     /// + LS-EEND streaming (live) — superior speaker accuracy to SpeakerKit
@@ -516,6 +540,10 @@ final class TranscriptionEngine: ObservableObject {
     /// hitting Start on a new source (which clears them like any other session state).
     @Published private(set) var pinnedQuotes: [PinnedQuote] = []
 
+    /// True while a manual cleanup pass runs (drives the document
+    /// pane's button state).
+    @Published private(set) var isCleanupRunning: Bool = false
+
     // MARK: - Speaker spotter
 
     /// Speakers (by name, matching a voiceprint template) the user
@@ -643,10 +671,12 @@ final class TranscriptionEngine: ObservableObject {
             } catch {
                 print("[LivePreview] \(source.rawValue) extractor failed: \(error.localizedDescription) — no live preview this session.")
             }
-        case .hls, .directAudio:
+        case .hls, .directAudio, .directVideo:
             // Input URL is already directly playable by AVPlayer. .hls
-            // is an m3u8; .directAudio is typically an mp3/aac stream.
-            // Both work as-is via AVURLAsset.
+            // is an m3u8; .directAudio is typically an mp3/aac stream;
+            // .directVideo is a plain mp4/mov file (2026-07-27) — the
+            // most natively playable of the three. All work as-is via
+            // AVURLAsset.
             guard self.state.isActive else { return }
             self.playbackMediaURL = url
             print("[LivePreview] Direct stream URL set: \(url.absoluteString)")
@@ -854,6 +884,24 @@ final class TranscriptionEngine: ObservableObject {
         return ordered
     }
 
+    /// A machine label no current segment carries — the reassignment
+    /// target for "New Speaker" (the recovery path when the diarizer
+    /// merged two people into one cluster and there's no existing
+    /// label to move the text to). Parses the numeric suffix of
+    /// existing "Speaker N" labels and returns max+1; labels that
+    /// don't fit the pattern are ignored for numbering but can't
+    /// collide with the result anyway.
+    var nextUnusedMachineLabel: String {
+        var maxN = 0
+        for label in distinctMachineSpeakers {
+            if label.hasPrefix("Speaker "),
+               let n = Int(label.dropFirst("Speaker ".count)) {
+                maxN = max(maxN, n)
+            }
+        }
+        return "Speaker \(maxN + 1)"
+    }
+
     /// Resolve a machine label to its display name, in priority order:
     ///   1. User's explicit per-session rename via `speakerNames` (the
     ///      existing "Rename Speaker" UI) — always wins
@@ -882,119 +930,21 @@ final class TranscriptionEngine: ObservableObject {
         return label
     }
 
-    /// Resolve a segment's display name, considering per-segment
-    /// identifications in addition to cluster-level ones. Use this
-    /// when you have a segment UUID — produces correct names through
-    /// diarizer-merge scenarios where multiple speakers share a
-    /// cluster ID but have been individually identified.
-    ///
-    /// **Precedence:**
-    ///   1. `speakerNames[clusterId]` — engine's manual cluster rename
-    ///   2. Per-segment + cluster identifications via
-    ///      `VoiceprintService.displayInfo(forSegmentId:clusterId:)`
-    ///      (which has its own internal precedence: segment-manual >
-    ///      cluster-manual > segment-auto > cluster ID)
-    ///   3. **Cluster majority smoothing** (when `clusterMajorities`
-    ///      is provided): if this segment is unidentified but its
-    ///      cluster has a clear majority identification across its
-    ///      OTHER segments, propagate that name. Catches cases where
-    ///      short segments fall below the extraction duration gate
-    ///      or fail to match cleanly while the surrounding cluster
-    ///      mates DO match — preventing fragmented "Bernie Sanders /
-    ///      Speaker 1 / Bernie Sanders" alternation on continuous
-    ///      single-speaker audio.
-    ///   4. The cluster ID itself — final fallback
-    ///
-    /// **About `clusterMajorities`.** Callers that resolve many
-    /// segments in one pass (visible group computation, export
-    /// rendering) should compute this once via
-    /// `clusterMajorityIdentifications()` and pass it in to avoid
-    /// O(N²) majority recomputation per segment. One-off callers
-    /// (notifications, pin labels) can omit it and accept no
-    /// smoothing — they typically resolve a single segment, not a
-    /// batch.
-    func displayName(forSegment segment: TranscriptSegment,
-                     clusterMajorities: [String: String]? = nil) -> String? {
-        // Manual rename via the existing "Reassign Speaker" UI
-        // always wins. This is the path users have known for years
-        // and we shouldn't surprise them by letting auto-matching
-        // override it.
-        if let cluster = segment.speaker,
-           let custom = speakerNames[cluster]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !custom.isEmpty {
-            return custom
-        }
-        let info = VoiceprintService.shared.displayInfo(
-            forSegmentId: segment.id,
-            clusterId: segment.speaker
-        )
-        if info.isIdentified {
-            return info.name
-        }
-
-        // Cluster majority smoothing: inherit the cluster's
-        // majority-identified name when available. Only fires when
-        // VoiceprintService says this segment is unidentified —
-        // explicit per-segment IDs win.
-        if let cluster = segment.speaker,
-           let majority = clusterMajorities?[cluster] {
-            return majority
-        }
-
-        return info.name  // falls back to cluster ID per displayInfo's contract
+    /// Resolve a segment's display name. UNIFIED CHAIN (2026-07): a
+    /// segment's name is exactly its cluster's name — rename →
+    /// cluster voiceprint identification → machine label. There is no
+    /// per-segment identity anymore: identifying part of a cluster
+    /// SPLITS those segments into a new machine speaker and names
+    /// that cluster (see `identifySegments`/`identifySelection`), so
+    /// the Speakers panel, transcript, exports, and notifications all
+    /// resolve through the same state and can never disagree. The old
+    /// per-segment layer + cluster-majority smoothing existed to
+    /// paper over segment-level identity fragmentation; with identity
+    /// grounded on clusters both are gone.
+    func displayName(forSegment segment: TranscriptSegment) -> String? {
+        displayName(for: segment.speaker)
     }
 
-    /// Compute the majority-identified name per cluster, used for
-    /// smoothing unidentified segments to match the consensus of
-    /// their cluster-mates. Returns only the clusters where:
-    ///   - At least 3 segments have been identified, AND
-    ///   - At least 75% of identified segments agree on one name
-    ///
-    /// **Why both thresholds.** The 3-segment minimum guards against
-    /// false confidence from tiny samples ("100% of 1 segment" is
-    /// not evidence). The 75% majority threshold preserves cluster-
-    /// merge detection: a cluster containing two different speakers
-    /// produces ~50/50 identification splits, which fails the
-    /// majority test and leaves unidentified segments correctly
-    /// labeled as the cluster ID. Without this guard, merged
-    /// clusters would get the dominant speaker's name applied to
-    /// the OTHER speaker's segments.
-    ///
-    /// **Cost.** O(N) over segments, single pass. Caller is expected
-    /// to call once per render and reuse the result across all
-    /// segments — avoiding the O(N²) trap of calling per-segment.
-    func clusterMajorityIdentifications() -> [String: String] {
-        // Gather identified names per cluster.
-        var namesByCluster: [String: [String]] = [:]
-        for seg in segments {
-            guard let cluster = seg.speaker else { continue }
-            let info = VoiceprintService.shared.displayInfo(
-                forSegmentId: seg.id,
-                clusterId: cluster
-            )
-            guard info.isIdentified else { continue }
-            namesByCluster[cluster, default: []].append(info.name)
-        }
-
-        // Apply thresholds and return the majority name per qualifying
-        // cluster.
-        var result: [String: String] = [:]
-        for (cluster, names) in namesByCluster {
-            guard names.count >= 3 else { continue }
-
-            var counts: [String: Int] = [:]
-            for name in names {
-                counts[name, default: 0] += 1
-            }
-
-            guard let topEntry = counts.max(by: { $0.value < $1.value }) else { continue }
-            let fraction = Double(topEntry.value) / Double(names.count)
-            if fraction >= 0.75 {
-                result[cluster] = topEntry.key
-            }
-        }
-        return result
-    }
 
     /// Total duration of the source audio in seconds, when known up-front. nil for
     /// live streams (where there is no end). Used to drive a progress bar.
@@ -1331,7 +1281,7 @@ final class TranscriptionEngine: ObservableObject {
         //   1) Standard URL with scheme: https://…, file://…
         //   2) Absolute filesystem path: /Users/foo/video.mp4
         //   3) Tilde-expanded path: ~/Movies/video.mp4
-        let url: URL
+        var url: URL
         if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") {
             let expanded = (trimmed as NSString).expandingTildeInPath
             url = URL(fileURLWithPath: expanded)
@@ -1348,6 +1298,40 @@ final class TranscriptionEngine: ObservableObject {
            !FileManager.default.fileExists(atPath: url.path) {
             state = .error("File not found: \(url.path)")
             return
+        }
+
+        // CIVICCLERK PORTALS (2026-07-22): resolve portal event URLs
+        // to their direct media BEFORE anything downstream sees the
+        // URL — the probe, yt-dlp's generic extractor, the downloader,
+        // and the miniplayer cache all handle a plain remote mp4/m3u8
+        // natively; only the SPA wrapper defeats them.
+        if let civic = await Self.resolveCivicClerkMedia(url: url) {
+            url = civic.mediaURL
+            if let portalTitle = civic.title, !portalTitle.isEmpty, detectedTitle == nil {
+                detectedTitle = portalTitle
+            }
+        }
+
+        // STATE LEGISLATURE HEARINGS (2026-07-28). Two tiers, most
+        // specific first:
+        //   1. Per-state resolvers (currently Texas) — precise, know
+        //      the exact page→media mapping for one system.
+        //   2. Generic HLS page-sniffer — fetches an HTML player page
+        //      and pulls the first .m3u8 it references. Catches the
+        //      many state/municipal players that simply embed an
+        //      m3u8 in page JS, without a bespoke resolver each.
+        // Both run only for http(s) non-file URLs that aren't already
+        // a recognized yt-dlp site or direct media, and both fail open
+        // (nil → original URL proceeds). The generic sniffer is LAST so
+        // a precise resolver always wins.
+        if !url.isFileURL {
+            if let resolved = await Self.resolveStatehousePlayer(url: url) {
+                url = resolved.mediaURL
+                if let t = resolved.title, !t.isEmpty, detectedTitle == nil { detectedTitle = t }
+            } else if let sniffed = await Self.sniffEmbeddedHLS(url: url) {
+                url = sniffed.mediaURL
+                if let t = sniffed.title, !t.isEmpty, detectedTitle == nil { detectedTitle = t }
+            }
         }
 
         let source = StreamSource.detect(from: url)
@@ -1814,6 +1798,8 @@ final class TranscriptionEngine: ObservableObject {
         let graceful = needsGracefulFinalization && pipelineTask != nil && state.isActive
         userInitiatedStop = graceful
 
+        // Split-stream: a video cache download may be in flight.
+        VideoCacheDownloader.shared.cancel()
         Task { await extractor.stop() }
 
         if graceful {
@@ -1918,6 +1904,21 @@ final class TranscriptionEngine: ObservableObject {
 
     @MainActor
     private func rebuildBackends() {
+        // PER-MODE ENGINE DEFAULTS (2026-07-22, user decision): resolve
+        // the raw engine by session mode at every Start unless the user
+        // explicitly picked one this launch. resolvedSessionMode is set
+        // by the pre-Start probe (URLs) or at file selection (local);
+        // an unknown mode conservatively resolves .live → Parakeet.
+        if !userPinnedTranscriptionEngine {
+            let auto: TranscriptionEngineKind =
+                (resolvedSessionMode == .static) ? .whisperKit : .parakeet
+            if transcriptionEngine != auto {
+                engineAutoChangedTranscription = true
+                transcriptionEngine = auto
+                print("[Engine] Auto-selected \(auto.rawValue) for \(resolvedSessionMode) session (no explicit engine pick this launch).")
+            }
+        }
+
         // Raw pair: the always-on primary. For single-pass live mode and
         // static mode this is the only pair, and the chunked pipeline drives
         // through it just like before multi-pass existed. Per the design
@@ -2005,16 +2006,12 @@ final class TranscriptionEngine: ObservableObject {
                 modelRepo: modelRepo,
                 chunkDuration: chunkSeconds
             )
-        case .parakeetEOU:
-            // Single-model streaming backend — no per-slot model name
-            // to route; the 120M EOU model is the only variant. Note
-            // it maintains streaming state across chunks, so using it
-            // on the REFINED slot would be architecturally wrong
-            // (refinement re-transcribes windows out of stream order);
-            // the sidebar picker copy steers users toward raw-slot
-            // use, but nothing hard-blocks it — a refined-slot EOU
-            // would produce garbled window text, visible immediately.
-            return EouBackend()
+        case .canary:
+            // Single-model backend (Canary 1B v2 int4 is the only
+            // variant). Batch-capable: valid on BOTH slots, and the
+            // refined slot is arguably its best seat — accuracy is
+            // the refined pass's whole job.
+            return CanaryBackend()
         }
     }
 
@@ -2057,12 +2054,12 @@ final class TranscriptionEngine: ObservableObject {
         case .parakeet:
             let repo = useRefinedModel ? refinedParakeetModelName : parakeetModelName
             return .parakeet(modelRepo: repo)
-        case .parakeetEOU:
-            // Downloaded and cached by FluidAudio's own ModelHub (like
-            // the diarizer models), not by ModelDownloadManager — no
-            // key to report. The sidebar shows no status row for this
-            // engine; first prepare() blocks on the ~100MB fetch with
-            // the standard loading state instead.
+        case .canary:
+            // Downloaded and cached by FluidAudio's own download
+            // machinery (like the diarizer models), not by
+            // ModelDownloadManager — no key to report. First
+            // prepare() blocks on the ~573MB fetch with the standard
+            // loading state.
             return nil
         }
     }
@@ -2406,6 +2403,34 @@ final class TranscriptionEngine: ObservableObject {
             )
             print("[Pipeline] Audio stream open. Beginning to read frames. (cache video: \(wantsVideo))")
 
+            // SPLIT-STREAM: static sessions get miniplayer video from a
+            // separate complete-file download (the pipe is audio-only
+            // for them — see AudioStreamExtractor's selector). Fire and
+            // consume: on success, republish playbackMediaURL so the
+            // miniplayer's onChange swaps from the (audio-only) cache
+            // to the real video file, mid-session or after. Failure is
+            // non-fatal — the session simply behaves like pre-split.
+            if useFastDownload && wantsVideo && source != .localFile {
+                Task { [weak self] in
+                    let ok = await VideoCacheDownloader.shared.run(url: url)
+                    guard ok, let self else { return }
+                    await MainActor.run {
+                        // Guard on the FILE, not engine state: sessions
+                        // end back at .idle (there's no .finished case),
+                        // so state can't distinguish "this session ended
+                        // normally" from "a new session took over" — but
+                        // a new session's prepareForRecording() wipes the
+                        // cache directory, so if our file still exists,
+                        // it's still this session's video. (A manual Stop
+                        // cancels the download before it succeeds, so
+                        // that path never reaches here.)
+                        guard FileManager.default.fileExists(atPath: MediaCacheManager.videoDownloadFileURL.path) else { return }
+                        self.playbackMediaURL = MediaCacheManager.videoDownloadFileURL
+                        print("[Pipeline] Miniplayer switched to downloaded video cache.")
+                    }
+                }
+            }
+
             await setState(.streaming)
 
             // 4. Consume audio frames, chunk, transcribe + diarize.
@@ -2538,6 +2563,15 @@ final class TranscriptionEngine: ObservableObject {
                         self.playbackMediaURL = cacheURL
                     }
                 }
+            }
+
+            // Optional LLM cleanup pass (Settings → Transcript
+            // Cleanup). Runs after everything else has finalized —
+            // refinement, rediarize, cache publish — so it edits the
+            // best available text. Failures never fail the session;
+            // affected segments simply keep verbatim text.
+            if UserDefaults.standard.bool(forKey: TranscriptCleanupService.enabledKey) {
+                await runTranscriptCleanupPass()
             }
 
             await setState(.idle)
@@ -3163,6 +3197,7 @@ final class TranscriptionEngine: ObservableObject {
                 minSeconds: max(overlapSeconds + 1.0, 3.0)
             )
             if !prevContext.isEmpty {
+                let beforeTrim = seg.text
                 if let trimmed = Self.trimmedAfterOverlap(
                     prevTail: prevContext,
                     newText: seg.text,
@@ -3175,6 +3210,12 @@ final class TranscriptionEngine: ObservableObject {
                     maxOverlapWords: maxOverlapWords
                 ) {
                     seg.text = trimmed
+                }
+                // Diagnosability (2026-07-22): trims used to be silent,
+                // which turned every dedup question into log-less
+                // forensics. One line per actual trim; no-ops stay quiet.
+                if seg.text != beforeTrim {
+                    print("[Dedup] Trimmed \(beforeTrim.count - seg.text.count) chars at chunk boundary: \"\(beforeTrim.prefix(60))\" → \"\(seg.text.prefix(40))\"")
                 }
             }
             // Skip if the entire new segment was an exact duplicate of the previous one.
@@ -3298,13 +3339,13 @@ final class TranscriptionEngine: ObservableObject {
         //   3. **No double work.** Without this skip, raw identifies
         //      a segment, then refinement replaces it (new UUID) and
         //      identifies again — the old identification becomes an
-        //      orphan in `segmentIdentifications` and we pay for two
+        //      duplicate cluster evidence and we pay for two
         //      WeSpeaker calls per segment.
         //
         // **Trade-off:** segments that never get refined (refinement
         // failure, or the session ends before the window covers them)
         // stay unidentified. Acceptable — refinement failures are
-        // rare, and `clusterMajorityIdentifications()` typically fills
+        // rare, and cluster-level identification typically fills
         // the visual gap from neighbors anyway.
         guard !useMultiPassLive else { return }
 
@@ -3316,13 +3357,12 @@ final class TranscriptionEngine: ObservableObject {
             // Gate 1 — minimum duration.
             guard (seg.end - seg.start) >= minDurationSeconds else { continue }
 
-            // Gate 2 — already identified (manual or auto).
-            if VoiceprintService.shared.segmentIdentifications[seg.id] != nil {
-                continue
-            }
-
-            // Gate 3 — cluster-level manual reassignment skips
-            // per-segment matching to save compute.
+            // Gate 2 — cluster-level manual reassignment skips
+            // matching (user truth). Note: the old per-segment
+            // "already identified" gate is gone with the unification —
+            // every qualifying segment's embedding is recorded as
+            // cluster evidence now, because identity lives ONLY on
+            // clusters and more evidence sharpens the cluster average.
             if let clusterId = seg.speaker,
                let clusterIdent = VoiceprintService.shared.identifications[clusterId],
                clusterIdent.isManual {
@@ -3355,26 +3395,28 @@ final class TranscriptionEngine: ObservableObject {
         guard audio.count >= 16_000 else { return }
 
         do {
+            // Spotter fires on cluster identity TRANSITIONS: capture
+            // the cluster's name before recording this evidence, and
+            // notify only when the addition newly identifies (or
+            // re-identifies) the cluster. Under the unification the
+            // segment has no identity of its own — the interesting
+            // event is "this speaker's cluster just became a known
+            // person," which is exactly the walked-away-from-a-long-
+            // hearing case the spotter exists for.
+            let clusterNameBefore = segment.speaker.flatMap {
+                VoiceprintService.shared.identifications[$0]?.name
+            }
             let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
-            VoiceprintService.shared.identifySegment(
+            VoiceprintService.shared.recordEmbedding(
                 segmentId: segment.id,
                 embedding: embedding,
                 clusterId: segment.speaker
             )
-
-            // Only log successful identifications (matches above
-            // threshold). Misses are uninteresting and noisy.
-            if let id = VoiceprintService.shared.segmentIdentifications[segment.id] {
-                let shortID = String(segment.id.uuidString.prefix(8))
-                print("[Voiceprint] Seg \(shortID) (\(segment.speaker ?? "?")) → \(id.name) (conf \(String(format: "%.3f", id.confidence)))")
-
-                // Spotter check — runs only on automatic per-segment
-                // matching, not manual identifications. The user
-                // setting a manual ID via context menu IS the
-                // notification (they're at the screen interacting
-                // with the app); the spotter exists for the
-                // "walked away from a long hearing" case where the
-                // automatic matcher catches a target speaker.
+            if let cluster = segment.speaker,
+               let id = VoiceprintService.shared.identifications[cluster],
+               !id.isManual,
+               id.name != clusterNameBefore {
+                print("[Voiceprint] Cluster \(cluster) newly → \(id.name) via seg \(String(segment.id.uuidString.prefix(8)))")
                 checkSpeakerSpotter(identifiedName: id.name, segment: segment)
             }
         } catch {
@@ -3428,15 +3470,9 @@ final class TranscriptionEngine: ObservableObject {
             // Gate 1 — minimum duration.
             guard (seg.end - seg.start) >= minDurationSeconds else { continue }
 
-            // Gate 2 — already identified. Refined-pass replacement
-            // produces NEW segment UUIDs, so this gate normally just
-            // means "manual override touched this segment after
-            // replacement" — a rare corner case but cheap to check.
-            if VoiceprintService.shared.segmentIdentifications[seg.id] != nil {
-                continue
-            }
-
-            // Gate 3 — cluster-level manual ID skips per-segment work.
+            // Gate 2 — cluster-level manual ID skips matching
+            // (user truth). Per-segment gate removed with the
+            // unification; see the raw-pass loop for rationale.
             if let clusterId = seg.speaker,
                let clusterIdent = VoiceprintService.shared.identifications[clusterId],
                clusterIdent.isManual {
@@ -3459,7 +3495,7 @@ final class TranscriptionEngine: ObservableObject {
 
             do {
                 let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
-                VoiceprintService.shared.identifySegment(
+                VoiceprintService.shared.recordEmbedding(
                     segmentId: seg.id,
                     embedding: embedding,
                     clusterId: seg.speaker
@@ -3556,6 +3592,21 @@ final class TranscriptionEngine: ObservableObject {
             return
         }
 
+        // F3 / unification stage 2: the labels on `allSegments` are
+        // now FINAL (whole-file or post-finish diarization has run).
+        // Re-ground every retained embedding from the live/raw pass
+        // on these labels — before this existed, evidence gathered
+        // while segments had provisional (or nil) speakers was simply
+        // orphaned by the relabel, which is why static sessions
+        // under-identified.
+        await MainActor.run {
+            var assignments: [UUID: String] = [:]
+            for seg in allSegments {
+                if let sp = seg.speaker { assignments[seg.id] = sp }
+            }
+            VoiceprintService.shared.reaggregate(assignments: assignments)
+        }
+
         let sampleRate: Double = 16_000
         let minDurationSeconds: Double = 1.5
         var identifiedCount = 0
@@ -3563,7 +3614,13 @@ final class TranscriptionEngine: ObservableObject {
 
         for seg in allSegments {
             guard (seg.end - seg.start) >= minDurationSeconds else { continue }
-            if VoiceprintService.shared.segmentIdentifications[seg.id] != nil { continue }
+            // Already have this segment's embedding from the live/raw
+            // pass — the re-aggregation above just credited it to the
+            // segment's final cluster. Skip the second WeSpeaker
+            // extraction; only segments the live pass never reached
+            // (too short then, session-start races, refinement
+            // replacements) are extracted here.
+            if VoiceprintService.shared.hasRetainedEmbedding(segmentId: seg.id) { continue }
             if let clusterId = seg.speaker,
                let clusterIdent = VoiceprintService.shared.identifications[clusterId],
                clusterIdent.isManual {
@@ -3584,18 +3641,13 @@ final class TranscriptionEngine: ObservableObject {
             attemptedCount += 1
             do {
                 let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
-                VoiceprintService.shared.identifySegment(
+                VoiceprintService.shared.recordEmbedding(
                     segmentId: seg.id,
                     embedding: embedding,
                     clusterId: seg.speaker
                 )
-                // Count as identified if the CLUSTER has an identification
-                // (cluster-level matching is the new primary path) OR a
-                // per-segment manual override is set (backward compat).
                 if let cluster = seg.speaker,
                    VoiceprintService.shared.identifications[cluster] != nil {
-                    identifiedCount += 1
-                } else if VoiceprintService.shared.segmentIdentifications[seg.id] != nil {
                     identifiedCount += 1
                 }
             } catch {
@@ -3611,6 +3663,138 @@ final class TranscriptionEngine: ObservableObject {
         // one final match on everything to make sure short clusters
         // get their chance.
         VoiceprintService.shared.forceMatchAllPendingClusters()
+
+        // Consolidation: merge over-split clusters using identity
+        // agreement and (optionally) the expected-speaker-count
+        // constraint. Runs LAST — it needs the force-matched
+        // identifications above as its evidence.
+        await consolidateClusters()
+    }
+
+    /// Cluster consolidation (unification stage 2). Two merge phases
+    /// over the final diarization labels, both constraint-checked:
+    ///
+    ///   Phase 1 — identity agreement: two clusters whose voiceprint
+    ///   matches BOTH clear the high-confidence bar with the SAME
+    ///   name are the same person the diarizer split; merge them.
+    ///
+    ///   Phase 2 — expected count: while more clusters exist than the
+    ///   user's expected-speaker-count setting (0 = skip), merge the
+    ///   most centroid-similar mergeable pair, refusing to merge
+    ///   below a similarity floor — a wrong merge is worse than an
+    ///   over-split, even with a count telling us to keep going.
+    ///
+    /// Cannot-merge constraints (both phases): differing manual
+    /// renames, differing manual identifications, or differing
+    /// confident auto-identities. User truth and strong evidence are
+    /// never averaged away.
+    ///
+    /// Merging = relabel the absorbed cluster's segments and pins to
+    /// the survivor, migrate a manual rename if only the absorbed
+    /// side had one, and fold voiceprint evidence via
+    /// `VoiceprintService.consolidate(from:into:)`. Survivor = more
+    /// segments (ties: lexicographically smaller label, for
+    /// determinism).
+    @MainActor
+    private func consolidateClusters() {
+        var counts: [String: Int] = [:]
+        for seg in segments {
+            if let sp = seg.speaker { counts[sp, default: 0] += 1 }
+        }
+        guard counts.count > 1 else { return }
+        let vp = VoiceprintService.shared
+
+        func cannotMerge(_ a: String, _ b: String) -> Bool {
+            let renameA = speakerNames[a]?.trimmingCharacters(in: .whitespaces)
+            let renameB = speakerNames[b]?.trimmingCharacters(in: .whitespaces)
+            if let ra = renameA, !ra.isEmpty, let rb = renameB, !rb.isEmpty, ra != rb { return true }
+            if let ma = vp.manualName(forCluster: a), let mb = vp.manualName(forCluster: b), ma != mb { return true }
+            if let ca = vp.confidentAutoName(forCluster: a), let cb = vp.confidentAutoName(forCluster: b), ca != cb { return true }
+            // Manual identity vs a DIFFERENT confident auto identity
+            // is also a conflict in either direction.
+            if let ma = vp.manualName(forCluster: a), let cb = vp.confidentAutoName(forCluster: b), ma != cb { return true }
+            if let mb = vp.manualName(forCluster: b), let ca = vp.confidentAutoName(forCluster: a), ca != mb { return true }
+            return false
+        }
+
+        func merge(_ absorbed: String, into survivor: String, reason: String) {
+            segments = segments.map { seg in
+                var copy = seg
+                if copy.speaker == absorbed { copy.speaker = survivor }
+                return copy
+            }
+            pinnedQuotes = pinnedQuotes.map { quote in
+                var copy = quote
+                if copy.speaker == absorbed { copy.speaker = survivor }
+                return copy
+            }
+            // Migrate a manual rename the survivor lacks.
+            let survivorRename = speakerNames[survivor]?.trimmingCharacters(in: .whitespaces) ?? ""
+            let absorbedRename = speakerNames[absorbed]?.trimmingCharacters(in: .whitespaces) ?? ""
+            if survivorRename.isEmpty && !absorbedRename.isEmpty {
+                speakerNames[survivor] = speakerNames[absorbed]
+            }
+            speakerNames.removeValue(forKey: absorbed)
+            vp.consolidate(from: absorbed, into: survivor)
+            counts[survivor, default: 0] += counts[absorbed] ?? 0
+            counts.removeValue(forKey: absorbed)
+            print("[Consolidate] \(absorbed) → \(survivor) (\(reason))")
+        }
+
+        func survivorOf(_ a: String, _ b: String) -> (survivor: String, absorbed: String) {
+            let ca = counts[a] ?? 0, cb = counts[b] ?? 0
+            if ca != cb { return ca > cb ? (a, b) : (b, a) }
+            return a < b ? (a, b) : (b, a)
+        }
+
+        // Phase 1 — identity agreement.
+        var changed = true
+        while changed {
+            changed = false
+            var byName: [String: [String]] = [:]
+            for label in counts.keys {
+                if let name = vp.confidentAutoName(forCluster: label) {
+                    byName[name, default: []].append(label)
+                }
+            }
+            for (name, labels) in byName where labels.count > 1 {
+                let sorted = labels.sorted { (counts[$0] ?? 0) > (counts[$1] ?? 0) }
+                let survivor = sorted[0]
+                for absorbed in sorted.dropFirst() where !cannotMerge(survivor, absorbed) {
+                    merge(absorbed, into: survivor, reason: "both matched \(name)")
+                    changed = true
+                }
+            }
+        }
+
+        // Phase 2 — expected-count constrained centroid merging.
+        let expected = Self.expectedSpeakerCount
+        if expected > 0 {
+            let similarityFloor: Float = 0.60
+            while counts.count > expected {
+                var best: (a: String, b: String, sim: Float)? = nil
+                let labels = Array(counts.keys)
+                for i in 0..<labels.count {
+                    for j in (i + 1)..<labels.count {
+                        let a = labels[i], b = labels[j]
+                        guard !cannotMerge(a, b),
+                              let ca = vp.clusterCentroid(clusterId: a),
+                              let cb = vp.clusterCentroid(clusterId: b),
+                              ca.count == cb.count else { continue }
+                        var dot: Float = 0
+                        for k in 0..<ca.count { dot += ca[k] * cb[k] }
+                        if best == nil || dot > best!.sim { best = (a, b, dot) }
+                    }
+                }
+                guard let pair = best, pair.sim >= similarityFloor else {
+                    print("[Consolidate] Expected \(expected) speakers, have \(counts.count) — no mergeable pair above similarity floor; stopping (right call: a wrong merge is worse).")
+                    break
+                }
+                let (survivor, absorbed) = survivorOf(pair.a, pair.b)
+                merge(absorbed, into: survivor,
+                      reason: "count constraint \(counts.count) > \(expected), centroid sim \(String(format: "%.3f", pair.sim))")
+            }
+        }
     }
 
     // MARK: - Refinement scheduler (Phase 4, multi-pass live)
@@ -4237,7 +4421,16 @@ final class TranscriptionEngine: ObservableObject {
         let overlapping: (TranscriptSegment) -> Bool = { seg in
             seg.start < hi && seg.end > lo
         }
-        let removedIDs = Set(segments.filter(overlapping).map(\.id))
+        // USER-EDITED PRESERVATION (2026-07-21): hand-edited segments
+        // are never replaced by the time-window swap — the user's text
+        // is final. Refined pieces whose midpoint lands inside a kept
+        // edited segment's span are dropped (they would duplicate the
+        // audio the user already curated); pieces merely brushing an
+        // edited segment's edges survive.
+        let removedIDs = Set(segments.filter { overlapping($0) && $0.userEdited != true }.map(\.id))
+        let keptEditedSpans: [(TimeInterval, TimeInterval)] = segments
+            .filter { overlapping($0) && $0.userEdited == true }
+            .map { ($0.start, $0.end) }
         let insertionIndex = segments.firstIndex(where: overlapping)
             ?? segments.firstIndex(where: { $0.start >= lo })
             ?? segments.endIndex
@@ -4245,8 +4438,23 @@ final class TranscriptionEngine: ObservableObject {
         segments.removeAll(where: { removedIDs.contains($0.id) })
 
         // 2. Insert refined segments (sorted by start) at the insertion point.
-        let sortedRefined = refined.sorted { $0.start < $1.start }
+        let sortedRefined = refined
+            .filter { piece in
+                guard !keptEditedSpans.isEmpty else { return true }
+                let mid = (piece.start + piece.end) / 2
+                return !keptEditedSpans.contains { mid >= $0.0 && mid <= $0.1 }
+            }
+            .sorted { $0.start < $1.start }
         segments.insert(contentsOf: sortedRefined, at: insertionIndex)
+        // Kept edited segments can sit inside the swapped window, which
+        // breaks the insert-at-one-index assumption — restore the
+        // array's load-bearing time order. Only needed (and only run)
+        // when edited segments were actually preserved.
+        if !keptEditedSpans.isEmpty {
+            segments.sort { a, b in
+                a.start != b.start ? a.start < b.start : a.end < b.end
+            }
+        }
 
         // 3. Re-anchor pins via time-range mapping (option 6.A). Pins that
         //    didn't overlap the replacement range are completely untouched.
@@ -4321,6 +4529,170 @@ final class TranscriptionEngine: ObservableObject {
     /// No-ops cleanly when `segmentIDs` is empty or every targeted segment
     /// already has the requested label.
     @MainActor
+    /// Defaults key for the expected-speaker-count constraint.
+    /// 0 (or unset) = unconstrained. A congressional hearing has a
+    /// known roster; telling the pipeline how many distinct voices
+    /// to expect lets the consolidation pass merge the diarizer's
+    /// over-splits down to reality — the single biggest accuracy
+    /// lever available on top of clustering.
+    static let expectedSpeakerCountDefaultsKey = "engine.expectedSpeakerCount"
+
+    /// Read the expected-speaker-count setting (0 = off). Reads
+    /// UserDefaults directly so the consolidation pass doesn't need
+    /// published state; the sidebar binds the same key via AppStorage.
+    static var expectedSpeakerCount: Int {
+        max(0, UserDefaults.standard.integer(forKey: expectedSpeakerCountDefaultsKey))
+    }
+
+    // MARK: - User transcript edits (2026-07-21)
+
+    /// Replace a segment's text with user-authored text. The verbatim
+    /// ASR text is preserved in `rawText` the first time (same
+    /// press-quote guarantee as the LLM cleanup), the word clock is
+    /// dropped (it no longer matches the text — seek falls back to
+    /// interpolation, the documented degraded mode), and the segment
+    /// is marked `userEdited` so the refinement and cleanup passes
+    /// treat the text as final. Saving an empty text deletes the
+    /// segment.
+    func updateSegmentText(id: UUID, newText: String) {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let idx = segments.firstIndex(where: { $0.id == id }) else { return }
+        if trimmed.isEmpty {
+            deleteSegments(ids: [id])
+            return
+        }
+        var seg = segments[idx]
+        if seg.rawText == nil { seg.rawText = seg.text }
+        seg.text = trimmed
+        seg.words = nil
+        seg.userEdited = true
+        segments[idx] = seg
+        print("[Edit] Segment \(seg.id.uuidString.prefix(8)) user-edited (\(trimmed.count) chars); verbatim preserved in rawText.")
+    }
+
+    /// Delete exactly the SELECTED text (2026-07-22, UX feedback:
+    /// segment boundaries are invisible in the rendered document, so
+    /// partial deletion is the common case and the default — whole-
+    /// segment removal is the explicit secondary action). Range
+    /// conventions mirror `reassignSpeaker(splittingSlices:)`: the
+    /// localRange applies to the segment's trimmed text as a character
+    /// array, snapped OUTWARD to word boundaries.
+    ///
+    /// Per-segment outcomes:
+    ///   - selection covers the whole segment (after snapping) →
+    ///     segment removed;
+    ///   - selection at an edge → text trimmed AND the segment's time
+    ///     span tightened to the kept side via the same word-clock/
+    ///     interpolation boundary math the splitter uses, so seek and
+    ///     miniplayer sync stay honest;
+    ///   - selection in the middle → prefix + suffix joined; the span
+    ///     is kept (the text no longer maps 1:1 to audio — word clock
+    ///     is dropped, interpolation takes over, same as Edit Text).
+    /// Every surviving touched segment is marked userEdited (protected
+    /// from refinement/cleanup overwrites) with verbatim ASR preserved
+    /// in rawText.
+    func deleteSelectedText(_ slices: [(segmentID: UUID, localRange: NSRange)]) {
+        guard !slices.isEmpty else { return }
+        var sliceByID: [UUID: NSRange] = [:]
+        for s in slices { sliceByID[s.segmentID] = s.localRange }
+
+        var trimmedCount = 0
+        var idsToRemove: Set<UUID> = []
+        var newSegments = segments
+        for index in newSegments.indices {
+            let seg = newSegments[index]
+            guard let localRange = sliceByID[seg.id] else { continue }
+
+            let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let chars = Array(text)
+            let length = chars.count
+            guard length > 0 else { idsToRemove.insert(seg.id); continue }
+
+            // Clamp, then snap outward to word boundaries — same
+            // convention as the reassign splitter.
+            var lo = max(0, min(localRange.location, length))
+            var hi = max(lo, min(NSMaxRange(localRange), length))
+            while lo > 0 && !chars[lo - 1].isWhitespace { lo -= 1 }
+            while hi < length && !chars[hi].isWhitespace { hi += 1 }
+
+            let prefixText = String(chars[0..<lo]).trimmingCharacters(in: .whitespaces)
+            let suffixText = String(chars[hi..<length]).trimmingCharacters(in: .whitespaces)
+
+            if prefixText.isEmpty && suffixText.isEmpty {
+                idsToRemove.insert(seg.id)
+                continue
+            }
+
+            var updated = seg
+            if updated.rawText == nil { updated.rawText = seg.text }
+            if prefixText.isEmpty || suffixText.isEmpty {
+                let (t1, t2) = Self.splitTimes(for: seg, text: text, lowChar: lo, highChar: hi)
+                if prefixText.isEmpty {
+                    updated.text = suffixText
+                    updated.start = min(t2, updated.end)
+                } else {
+                    updated.text = prefixText
+                    updated.end = max(t1, updated.start)
+                }
+            } else {
+                updated.text = prefixText + " " + suffixText
+            }
+            updated.words = nil
+            updated.userEdited = true
+            newSegments[index] = updated
+            trimmedCount += 1
+        }
+        newSegments.removeAll { idsToRemove.contains($0.id) }
+        segments = newSegments
+        print("[Edit] Deleted selection: \(trimmedCount) segment(s) trimmed, \(idsToRemove.count) removed entirely.")
+    }
+
+    /// Remove segments outright. Pins referencing them keep their own
+    /// text and fall back to time-based jumping (existing behavior for
+    /// vanished source segments).
+    func deleteSegments(ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        let before = segments.count
+        segments.removeAll { ids.contains($0.id) }
+        print("[Edit] Deleted \(before - segments.count) segment(s) by user request.")
+    }
+
+    /// UNIFIED IDENTIFY (2026-07): identify an entire diarizer
+    /// speaker (cluster) as a named person. Thin wrapper over
+    /// VoiceprintService so views route through one place.
+    func identifyCluster(_ clusterId: String, as name: String) {
+        VoiceprintService.shared.setManualIdentification(clusterId: clusterId, name: name)
+    }
+
+    /// UNIFIED IDENTIFY: identify a subset of segments as a named
+    /// person. Under the cluster-grounded identity model this is a
+    /// SPLIT + NAME: the segments are reassigned to a freshly minted
+    /// machine speaker, and THAT cluster gets the identity. The named
+    /// person therefore always appears in the Speakers panel with a
+    /// Speaker N of their own — identity can never float on segments
+    /// detached from the diarizer's speaker list, which was the root
+    /// of the "voice ID'd but no speaker assignment" fracture.
+    func identifySegments(_ segmentIDs: Set<UUID>, as name: String) {
+        guard !segmentIDs.isEmpty else { return }
+        let label = nextUnusedMachineLabel
+        reassignSpeaker(segmentIDs: segmentIDs, to: label)
+        VoiceprintService.shared.setManualIdentification(clusterId: label, name: name)
+        print("[Identify] \(segmentIDs.count) segment(s) split into \(label) → \(name)")
+    }
+
+    /// UNIFIED IDENTIFY: selection-precise variant — identifies
+    /// exactly the selected character ranges, splitting partially
+    /// covered segments (same slice semantics as
+    /// `reassignSpeaker(splittingSlices:to:)`).
+    func identifySelection(splittingSlices slices: [(segmentID: UUID, localRange: NSRange)],
+                           as name: String) {
+        guard !slices.isEmpty else { return }
+        let label = nextUnusedMachineLabel
+        reassignSpeaker(splittingSlices: slices, to: label)
+        VoiceprintService.shared.setManualIdentification(clusterId: label, name: name)
+        print("[Identify] Selection (\(slices.count) slice(s)) split into \(label) → \(name)")
+    }
+
     func reassignSpeaker(segmentIDs: Set<UUID>, to newLabel: String?) {
         guard !segmentIDs.isEmpty else { return }
 
@@ -4361,19 +4733,11 @@ final class TranscriptionEngine: ObservableObject {
             let displayLabel = newLabel.map { self.displayName(for: $0) ?? $0 } ?? "(no speaker)"
             print("[Reassign] Set \(changedCount) segment(s) to \(displayLabel).")
 
-            // Clear per-segment voiceprint identifications on the
-            // reassigned segments. Those IDs are keyed by segment
-            // UUID and OUTRANK the machine label in displayName
-            // resolution — without this, a segment the voiceprint
-            // pipeline auto-identified keeps resolving (and
-            // rendering, and grouping) as the OLD person after
-            // reassignment, making the reassign invisible in the
-            // transcript while the menu checkmark says it happened.
-            // Reassignment is an explicit user override of whatever
-            // the pipeline believed about this text.
-            for sid in segmentIDs {
-                VoiceprintService.shared.clearSegmentIdentification(segmentId: sid)
-            }
+            // (Per-segment voiceprint IDs used to be cleared here — the
+            // "invisible reassign" fix. With identity unified onto
+            // clusters there is no per-segment state left to clear:
+            // reassigned segments resolve through their NEW cluster
+            // immediately.)
         }
 
         withAnimation(.easeInOut(duration: 0.15)) {
@@ -4505,16 +4869,10 @@ final class TranscriptionEngine: ObservableObject {
                 newSegments.replaceSubrange(index...index, with: pieces)
                 didSplit += 1
 
-                // The first piece inherits the original segment ID —
-                // and with it any per-segment voiceprint
-                // identification, which outranks machine labels in
-                // name resolution. That stale ID describes the WHOLE
-                // pre-split segment; after the split it would pin the
-                // piece (and, via grouping, the visible transcript) to
-                // the old identity regardless of reassignment. Clear
-                // it: the split is an explicit assertion that the
-                // pipeline's read on this text was wrong.
-                VoiceprintService.shared.clearSegmentIdentification(segmentId: seg.id)
+                // (First piece inherits the original segment ID; with
+                // per-segment identity abolished there is nothing
+                // stale to clear — the piece resolves through
+                // whichever cluster it now belongs to.)
             }
             self.segments = newSegments
 
@@ -4533,6 +4891,110 @@ final class TranscriptionEngine: ObservableObject {
         if !wholeIDs.isEmpty {
             reassignSpeaker(segmentIDs: wholeIDs, to: newLabel)
         }
+    }
+
+    /// LLM transcript cleanup orchestration: snapshot segments, run
+    /// the cleanup service (progress surfaced through the state
+    /// machine), apply validated results. Model memory is released
+    /// when done.
+    /// Manual cleanup entry point — the document pane's "Clean Up"
+    /// button. Runs the same pass as the on-completion toggle, but at
+    /// the user's chosen moment: review the transcript first, decide
+    /// whether it needs it, and accept the multi-minute cost
+    /// knowingly (on long transcripts the pass is expensive, and
+    /// forcing it on every session end was the wrong default for
+    /// that reason). Guarded against running during an active
+    /// session or concurrently with itself.
+    @MainActor
+    func startManualTranscriptCleanup() {
+        guard !state.isActive, !segments.isEmpty, !isCleanupRunning else { return }
+        isCleanupRunning = true
+        Task {
+            await runTranscriptCleanupPass()
+            await MainActor.run { self.isCleanupRunning = false }
+            await self.setState(.idle)
+        }
+    }
+
+    private func runTranscriptCleanupPass() async {
+        let snapshot = await MainActor.run { self.segments }
+        guard !snapshot.isEmpty else { return }
+        await setState(.preparing("Loading cleanup model…"))
+        do {
+            // Session-known names: manual renames + voiceprint
+            // identifications made this session — the hearing's
+            // actual participants, fed to the model as canonical
+            // spellings.
+            let knownNames = await MainActor.run {
+                Array(Set(self.speakerNames.values)
+                    .union(VoiceprintService.shared.sessionSpeakerHistory))
+            }
+            let cleaned = try await TranscriptCleanupService.shared.cleanTranscript(
+                segments: snapshot,
+                knownNames: knownNames,
+                progress: { done, total in
+                    Task { await self.setState(.preparing("Cleaning up transcript (\(done)/\(total))…")) }
+                }
+            )
+            await MainActor.run { self.applyCleanedTexts(cleaned) }
+
+            // Cleanup report: every change as before → after with
+            // time + speaker, written to a reviewable file. This is
+            // THE assessment tool — open the report after a session
+            // to see exactly what the model did (and judge whether
+            // it's catching the error classes you care about) instead
+            // of hunting for diffs by eye in the transcript.
+            if !cleaned.isEmpty {
+                var lines: [String] = ["StreamScribe Cleanup Report — \(Date())", ""]
+                for seg in snapshot {
+                    guard let after = cleaned[seg.id] else { continue }
+                    let who = displayName(forSegment: seg) ?? seg.speaker ?? "Speaker"
+                    lines.append("[\(TranscriptSegment.formatTime(seg.start))] \(who)")
+                    lines.append("  BEFORE: \(seg.text.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    lines.append("  AFTER:  \(after)")
+                    lines.append("")
+                }
+                let reportDir = FileManager.default
+                    .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("StreamScribe/Reports", isDirectory: true)
+                try? FileManager.default.createDirectory(at: reportDir, withIntermediateDirectories: true)
+                let stamp = ISO8601DateFormatter().string(from: Date())
+                    .replacingOccurrences(of: ":", with: "-")
+                let reportURL = reportDir.appendingPathComponent("cleanup-\(stamp).txt")
+                try? lines.joined(separator: "\n").write(to: reportURL, atomically: true, encoding: .utf8)
+                print("[Cleanup] Report (\(cleaned.count) change(s)) written to: \(reportURL.path)")
+            }
+        } catch {
+            print("[Cleanup] Pass failed: \(error.localizedDescription). Transcript keeps verbatim text.")
+        }
+        await MainActor.run { TranscriptCleanupService.shared.unload() }
+    }
+
+    /// Apply cleaned text by segment ID, preserving verbatim text in
+    /// `rawText`. Word timings are dropped on cleaned segments — the
+    /// original character↔word mapping no longer holds after edits,
+    /// and a wrong mapping is worse than interpolation (which the
+    /// seek/split paths fall back to automatically).
+    @MainActor
+    func applyCleanedTexts(_ cleaned: [UUID: String]) {
+        guard !cleaned.isEmpty else {
+            print("[Cleanup] No segments changed.")
+            return
+        }
+        var updated = 0
+        var newSegments = segments
+        for i in newSegments.indices {
+            guard let newText = cleaned[newSegments[i].id] else { continue }
+            // User-edited text is final — the cleanup model doesn't
+            // get to overrule the human (2026-07-21).
+            if newSegments[i].userEdited == true { continue }
+            newSegments[i].rawText = newSegments[i].rawText ?? newSegments[i].text
+            newSegments[i].text = newText
+            newSegments[i].words = nil
+            updated += 1
+        }
+        segments = newSegments
+        print("[Cleanup] Applied cleaned text to \(updated) segment(s); verbatim preserved in rawText.")
     }
 
     /// Boundary times for a split at character offsets [lo, hi) of
@@ -4695,41 +5157,78 @@ final class TranscriptionEngine: ObservableObject {
         guard !prevWords.isEmpty, !newWords.isEmpty else { return nil }
 
         let minMatchWords = 4
-        let maxK = min(maxOverlapWords, newWords.count, prevWords.count)
-        guard maxK >= minMatchWords else { return nil }
-
         // Pre-normalize prevTail words for fast comparison.
         let prevNormalized = prevWords.map { $0.normalized }
 
-        // Walk K from longest plausible match down to the floor. Return
-        // on the first K that matches — longer is better because it
-        // removes more duplicated text. (Walking up from the floor would
-        // find a short match first and miss the longer overlap.)
-        for k in stride(from: maxK, through: minMatchWords, by: -1) {
-            let prefix = newWords.prefix(k).map { $0.normalized }
-            // Slide the K-word window across prevNormalized looking for a match.
-            // i ranges so that the K-word window fits: i + k - 1 < prevNormalized.count.
-            if prevNormalized.count < k { continue }
-            for i in 0...(prevNormalized.count - k) {
-                var matched = true
-                for j in 0..<k {
-                    if prevNormalized[i + j] != prefix[j] {
-                        matched = false
-                        break
+        // LEADING-JUNK SKIP (2026-07-21). Field failure: a chunk cut
+        // mid-word leaves 1-2 debris tokens at newText's start ("You're"
+        // from "…today. You're" sliced at the boundary), and both dedup
+        // matchers anchored at token 0 — one debris token defeated the
+        // whole cascade. Canonical example:
+        //   prev: "General Teichert, thanks for your time today."
+        //   new:  "You're Thanks for your time today. You're awesome…"
+        // Skipping the debris token lets the matcher find the 5-word
+        // duplication and the trim also discards the debris (it is
+        // overlap-region noise, not content).
+        //
+        // Guardrails against eating REAL words (python-validated
+        // against false-positive traps before porting):
+        //   - skip=0 keeps the original ≥4-word floor;
+        //   - skip=1 requires a ≥4-word match; skip=2 requires ≥6 —
+        //     more discarded words demand stronger evidence;
+        //   - every skipped token must be ≤8 chars normalized:
+        //     mid-word debris is short; a real clause opener like
+        //     "Fundamentally" is not, and is never discarded.
+        let maxSkip = 2
+        for skip in 0...maxSkip {
+            let requiredFloor = skip <= 1 ? minMatchWords : 6
+            if skip > 0 {
+                guard newWords.count > skip else { break }
+                let skippedAreDebrisShaped = newWords.prefix(skip)
+                    .allSatisfy { $0.normalized.count <= 8 }
+                guard skippedAreDebrisShaped else { break }
+            }
+            let maxK = min(maxOverlapWords, newWords.count - skip, prevNormalized.count)
+            guard maxK >= requiredFloor else { continue }
+
+            // Walk K from longest plausible match down to the floor —
+            // longer is better because it removes more duplicated text.
+            for k in stride(from: maxK, through: requiredFloor, by: -1) {
+                let prefix = (skip..<(skip + k)).map { newWords[$0].normalized }
+                guard prevNormalized.count >= k else { continue }
+                for i in 0...(prevNormalized.count - k) {
+                    var matched = true
+                    for j in 0..<k {
+                        if prevNormalized[i + j] != prefix[j] {
+                            matched = false
+                            break
+                        }
                     }
-                }
-                if matched {
-                    // Found a K-word occurrence of newText's prefix
-                    // somewhere in prevTail. Drop the first K tokens
-                    // from newText, preserving the remainder verbatim.
-                    let dropToCharIndex = newWords[k - 1].rangeInOriginal.upperBound
-                    var remainder = String(newText[dropToCharIndex...])
-                    remainder = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
-                    while let first = remainder.first, ".,;:!?".contains(first) {
-                        remainder.removeFirst()
-                        remainder = remainder.trimmingCharacters(in: .whitespaces)
+                    if matched {
+                        // Drop the skipped debris AND the K matched
+                        // tokens; keep the remainder verbatim (original
+                        // casing/punctuation).
+                        let dropToCharIndex = newWords[skip + k - 1].rangeInOriginal.upperBound
+                        var remainder = String(newText[dropToCharIndex...])
+                        remainder = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+                        while let first = remainder.first, ".,;:!?".contains(first) {
+                            remainder.removeFirst()
+                            remainder = remainder.trimmingCharacters(in: .whitespaces)
+                        }
+                        // Return "" (NOT nil) when the match consumed the
+                        // whole text: nil means "no duplication found" and
+                        // the caller keeps the segment VERBATIM — which is
+                        // how a fully-duplicated segment survived in the
+                        // field (2026-07-22, final flush chunk emitted
+                        // "You're Thanks for your time today." as its own
+                        // segment: junk + dup + nothing else → empty
+                        // remainder → nil → kept whole). The caller's
+                        // empty-text check drops "" segments, exactly the
+                        // right outcome, and the suffix matcher already
+                        // followed this convention — this was the one
+                        // asymmetric return in the cascade.
+                        return remainder
                     }
-                    return remainder.isEmpty ? nil : remainder
                 }
             }
         }
@@ -5928,6 +6427,68 @@ final class TranscriptionEngine: ObservableObject {
     /// Read total audio duration from a local file using AVFoundation. Returns nil if
     /// the file can't be parsed (which would also mean ffmpeg won't be able to read it,
     /// so the error will surface again later in a clearer way).
+    private struct CivicClerkResolution {
+        let mediaURL: URL
+        let title: String?
+    }
+
+    /// CivicClerk (CivicPlus municipal meeting portal) event URLs —
+    /// https://{tenant}.portal.civicclerk.com/event/{id}[/media] —
+    /// hide their media behind a JavaScript SPA, so yt-dlp (which has
+    /// no civicclerk extractor as of 2026-07, verified against its
+    /// full extractor list) sees only the app shell. The tenant API
+    /// at {tenant}.api.civicclerk.com serves the event as JSON with
+    /// the media URL inside (cpmedia.azureedge.net/{tenant}/{hash}.mp4
+    /// in the wild). SCHEMA-AGNOSTIC by design: rather than trusting
+    /// exact field names across tenant/API versions, scan the JSON
+    /// text for media URLs (.mp4 preferred over .m3u8), and try both
+    /// OData path syntaxes. Returns nil for non-CivicClerk URLs or on
+    /// any failure — the caller proceeds with the original URL and
+    /// the normal pipeline error surfaces.
+    private static func resolveCivicClerkMedia(url: URL) async -> CivicClerkResolution? {
+        guard let host = url.host?.lowercased(),
+              host.hasSuffix(".portal.civicclerk.com") else { return nil }
+        let tenant = String(host.dropLast(".portal.civicclerk.com".count))
+        guard !tenant.isEmpty, !tenant.contains(".") else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard let eventIdx = parts.firstIndex(of: "event"),
+              parts.count > eventIdx + 1,
+              let eventID = Int(parts[eventIdx + 1]) else { return nil }
+
+        print("[CivicClerk] Portal URL detected (tenant \(tenant), event \(eventID)) — resolving media via the tenant API…")
+        for endpoint in ["v1/Events(\(eventID))", "v1/Events/\(eventID)"] {
+            guard let apiURL = URL(string: "https://\(tenant).api.civicclerk.com/\(endpoint)") else { continue }
+            var request = URLRequest(url: apiURL)
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.timeoutInterval = 15
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode),
+                  let text = String(data: data, encoding: .utf8) else { continue }
+
+            // JSON-escaped slashes tolerated; query strings allowed.
+            let unescaped = text.replacingOccurrences(of: "\\/", with: "/")
+            let pattern = #"https://[^"\s\\]+?\.(?:mp4|m3u8)(?:\?[^"\s\\]*)?"#
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+            let nsRange = NSRange(unescaped.startIndex..., in: unescaped)
+            let matches = regex.matches(in: unescaped, range: nsRange).compactMap {
+                Range($0.range, in: unescaped).map { String(unescaped[$0]) }
+            }
+            guard !matches.isEmpty else { continue }
+            let chosen = matches.first(where: { $0.contains(".mp4") }) ?? matches[0]
+            guard let mediaURL = URL(string: chosen) else { continue }
+
+            var title: String?
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                title = (obj["eventName"] as? String) ?? (obj["name"] as? String)
+            }
+            print("[CivicClerk] Resolved event \(eventID) → \(mediaURL.absoluteString)")
+            return CivicClerkResolution(mediaURL: mediaURL, title: title)
+        }
+        print("[CivicClerk] Could not resolve media from the tenant API — proceeding with the portal URL. (The event may have no published media yet, or this tenant's API differs; the pipeline's normal error will follow.)")
+        return nil
+    }
+
     static func probeDuration(of url: URL) -> TimeInterval? {
         let asset = AVURLAsset(url: url)
         let duration = asset.duration
@@ -5949,6 +6510,251 @@ final class TranscriptionEngine: ObservableObject {
     ///   - cost the user network bandwidth on URLs they may immediately
     ///     discard
     ///
+    private struct ResolvedMedia {
+        let mediaURL: URL
+        let title: String?
+    }
+
+    /// Shared HTML fetch for the resolvers below: desktop UA, short
+    /// timeout, returns decoded text or nil. Kept small and dependency
+    /// -free — these run on the main-session path.
+    private static func fetchHTML(_ url: URL, timeout: TimeInterval = 15) async -> String? {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = timeout
+        req.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Extract an HTML <title> for display, trimmed. nil if absent.
+    private static func htmlTitle(from html: String) -> String? {
+        guard let open = html.range(of: "<title", options: .caseInsensitive),
+              let gt = html.range(of: ">", range: open.upperBound..<html.endIndex),
+              let close = html.range(of: "</title>", options: .caseInsensitive, range: gt.upperBound..<html.endIndex)
+        else { return nil }
+        let raw = String(html[gt.upperBound..<close.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? nil : raw
+    }
+
+    /// Find m3u8 URLs in arbitrary page text (JSON-escaped slashes
+    /// tolerated). Absolute URLs only — relative manifest paths need
+    /// per-site base resolution, which belongs in a precise resolver,
+    /// not the generic sniffer. Ordered by appearance; master/index
+    /// manifests tend to appear before variant playlists.
+    private static func m3u8URLs(in text: String) -> [URL] {
+        let unescaped = text.replacingOccurrences(of: "\\/", with: "/")
+        let pattern = #"https?://[^"'\s\\]+?\.m3u8(?:\?[^"'\s\\]*)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(unescaped.startIndex..., in: unescaped)
+        var seen = Set<String>()
+        var out: [URL] = []
+        for m in regex.matches(in: unescaped, range: range) {
+            guard let r = Range(m.range, in: unescaped) else { continue }
+            let str = String(unescaped[r])
+            if seen.insert(str).inserted, let u = URL(string: str) { out.append(u) }
+        }
+        return out
+    }
+
+    /// TIER 2 — generic HLS page-sniffer. For an HTML player page that
+    /// simply embeds an .m3u8 in its markup or JS, fetch and pull the
+    /// first absolute manifest. Deliberately conservative: only runs
+    /// for URLs the classifier would otherwise send to yt-dlp's
+    /// generic extractor (.unknown) — never overrides a recognized
+    /// site or a direct-media URL — and only accepts a page that is
+    /// actually HTML. nil on anything else, so the pipeline's normal
+    /// path (yt-dlp generic) still runs as the true fallback.
+    private static func sniffEmbeddedHLS(url: URL) async -> ResolvedMedia? {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
+        guard StreamSource.detect(from: url) == .unknown else { return nil }
+        // A path that already looks like media isn't a player page.
+        let lowerPath = url.path.lowercased()
+        guard !lowerPath.hasSuffix(".m3u8"), !lowerPath.hasSuffix(".mp4"), !lowerPath.hasSuffix(".mp3") else { return nil }
+
+        guard let html = await fetchHTML(url) else { return nil }
+        let manifests = m3u8URLs(in: html)
+        guard let first = manifests.first else { return nil }
+        print("[Statehouse] Generic sniffer found an embedded HLS manifest on \(url.host ?? "page"): \(first.absoluteString)")
+        return ResolvedMedia(mediaURL: first, title: htmlTitle(from: html))
+    }
+
+    /// TIER 1 — per-state resolvers. Dispatches by host to a precise
+    /// handler that knows one system's page→media mapping. Add states
+    /// here as their systems are confirmed against a real page.
+    private static func resolveStatehousePlayer(url: URL) async -> ResolvedMedia? {
+        guard let host = url.host?.lowercased() else { return nil }
+        // Host-specific resolvers first (know one system precisely).
+        switch host {
+        case "senate.texas.gov", "house.texas.gov":
+            if let tx = await resolveTexasLegislature(url: url) { return tx }
+        default:
+            break
+        }
+        // Platform resolvers, keyed on page CONTENT not host — one
+        // resolver covers every site embedding that platform. Invintus
+        // is used by KTOO/360 North (Alaska) and numerous state
+        // legislatures, so this is high-leverage.
+        if let inv = await resolveInvintusPlayer(url: url) { return inv }
+        return nil
+    }
+
+    /// Invintus Media player (2026-07-29). Pages embed:
+    ///   <div class="invintus-player" data-eventid="NNNN" ...>
+    ///   var invintusConfig = {"clientId":"NNNN","playerPrefID":"NNN"};
+    /// The player JS then POSTs clientID+eventID to the Invintus API
+    /// and reads the HLS manifest from data.streamingURIs.main. The API
+    /// contract (endpoint, the embedder api-key that Invintus hardcodes
+    /// in its own public app.js, headers, response shape) is documented
+    /// in Streamlink's open-source invintus plugin — we replicate it
+    /// rather than guess. Keyed on the embed markup, so it resolves ANY
+    /// Invintus-hosted page (KTOO, 360 North, state legislatures), not
+    /// just one host. The eventID may also be in the page URL's query
+    /// (?eventID=), used as a fallback if the markup lacks it.
+    private static func resolveInvintusPlayer(url: URL) async -> ResolvedMedia? {
+        guard let html = await fetchHTML(url) else { return nil }
+        guard html.contains("invintus-player") || html.contains("invintusConfig") else { return nil }
+
+        func firstMatch(_ pattern: String, _ text: String) -> String? {
+            guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: text) else { return nil }
+            return String(text[r])
+        }
+
+        // clientID from invintusConfig; eventID from the player div,
+        // falling back to the page URL's ?eventID= query.
+        let clientID = firstMatch(#""clientId"\s*:\s*"?(\d+)"?"#, html)
+        var eventID = firstMatch(#"data-eventid\s*=\s*"(\d+)""#, html)
+        if eventID == nil {
+            eventID = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name.lowercased() == "eventid" })?.value
+        }
+        guard let clientID, let eventID else {
+            print("[Statehouse] Invintus embed found but clientID/eventID missing — falling through.")
+            return nil
+        }
+
+        // POST to the documented Invintus API. The wsc-api-key is the
+        // public "embedder" key Invintus ships in app.js.
+        guard let api = URL(string: "https://api.v3.invintusmedia.com/v2/Event/getDetailed") else { return nil }
+        var req = URLRequest(url: api)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("7WhiEBzijpritypp8bqcU7pfU9uicDR", forHTTPHeaderField: "wsc-api-key")
+        req.setValue("embedder", forHTTPHeaderField: "Authorization")
+        let body: [String: Any] = [
+            "clientID": clientID,
+            "eventID": eventID,
+            "showStreams": true,
+            "showMediaAssets": true,
+            "showEncoder": true,
+            "includePrivate": false,
+            "advancedDetails": true,
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            print("[Statehouse] Invintus API request failed (client=\(clientID) event=\(eventID)) — falling through.")
+            return nil
+        }
+
+        // Pull data.streamingURIs.main; scheme-fix protocol-relative
+        // URLs (//host/…) as the Streamlink plugin does.
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataObj = root["data"] as? [String: Any],
+              let uris = dataObj["streamingURIs"] as? [String: Any],
+              var main = uris["main"] as? String, !main.isEmpty else {
+            print("[Statehouse] Invintus API returned no streamingURIs.main (event=\(eventID)) — falling through.")
+            return nil
+        }
+        if main.hasPrefix("//") { main = "https:" + main }
+        guard let manifest = URL(string: main) else { return nil }
+
+        let title = (dataObj["title"] as? String) ?? htmlTitle(from: html)
+        print("[Statehouse] Invintus event=\(eventID) → \(manifest.absoluteString)")
+        return ResolvedMedia(mediaURL: manifest, title: title)
+    }
+
+    /// Texas Legislature (senate.texas.gov / house.texas.gov)
+    /// videoplayer.php?vid=NNNNN. The player page resolves the vid to
+    /// a CloudFront HLS manifest of the shape
+    /// https://{dist}.cloudfront.net/{vid}/{assetId}/index.m3u8 — the
+    /// {assetId} is an internal number NOT derivable from the vid, so
+    /// (unlike the deterministic Senate.gov ISVP extractor) this must
+    /// fetch the player page and read the real manifest from it.
+    ///
+    /// Implemented via the generic manifest scan (the page embeds the
+    /// absolute CloudFront .m3u8), which keeps this robust to the
+    /// exact JS structure. If Texas ever moves to a relative manifest
+    /// path or an XHR-loaded config, this returns nil and the session
+    /// falls through to yt-dlp's generic extractor — worth revisiting
+    /// with a real page capture if that happens.
+    private static func resolveTexasLegislature(url: URL) async -> ResolvedMedia? {
+        guard url.path.lowercased().contains("videoplayer") else { return nil }
+        let vid = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "vid" })?.value
+        guard let html = await fetchHTML(url) else {
+            print("[Statehouse] Texas player page fetch failed — falling through.")
+            return nil
+        }
+
+        // The manifest URL is embedded in the page but BASE64-ENCODED
+        // (confirmed 2026-07-28 from real page source), which is why a
+        // plaintext .m3u8 scan misses it and the asset ID never appears
+        // as text. The page does:
+        //   const bsfEus="aHR0cHM6...(base64)...";   // random var name
+        //   sources:[{src:atob(bsfEus), type:"application/x-mpegurl"}]
+        // Decoding it yields e.g.
+        //   https://dattbya41tgue.cloudfront.net/22654/44707/index.m3u8
+        // The variable name is randomized per page, so rather than
+        // parse the JS, decode EVERY base64-looking blob on the page and
+        // take the first that decodes to a media manifest URL. This also
+        // needs no hardcoded CloudFront host — the decoded URL carries
+        // its own, surviving a future distribution change.
+        if let manifest = decodedMediaURL(inBase64Blobs: html) {
+            print("[Statehouse] Texas vid=\(vid ?? "?") → \(manifest.absoluteString) (decoded from page)")
+            return ResolvedMedia(mediaURL: manifest, title: htmlTitle(from: html))
+        }
+        // Fallback: a plainly-embedded manifest (if TX ever stops
+        // encoding it).
+        if let manifest = m3u8URLs(in: html).first {
+            print("[Statehouse] Texas vid=\(vid ?? "?") → \(manifest.absoluteString) (plain from page)")
+            return ResolvedMedia(mediaURL: manifest, title: htmlTitle(from: html))
+        }
+        print("[Statehouse] Texas vid=\(vid ?? "?"): no manifest found in page (encoded or plain) — falling through.")
+        return nil
+    }
+
+    /// Decode every base64-looking token in `html` and return the first
+    /// that decodes to an http(s) media manifest/file URL. Used by the
+    /// Texas resolver (its manifest is base64-embedded) and available to
+    /// any future site that does the same. Conservative token match
+    /// (length ≥ 24, base64 alphabet, optional padding) keeps this cheap
+    /// on a full page; only tokens that base64-decode to a media URL
+    /// survive, so false positives are effectively impossible.
+    private static func decodedMediaURL(inBase64Blobs html: String) -> URL? {
+        guard let regex = try? NSRegularExpression(pattern: "[A-Za-z0-9+/]{24,}={0,2}") else { return nil }
+        let range = NSRange(html.startIndex..., in: html)
+        for m in regex.matches(in: html, range: range) {
+            guard let r = Range(m.range, in: html) else { continue }
+            let token = String(html[r])
+            guard let data = Data(base64Encoded: token),
+                  let decoded = String(data: data, encoding: .utf8) else { continue }
+            let lower = decoded.lowercased()
+            guard lower.hasPrefix("http"),
+                  lower.contains(".m3u8") || lower.contains(".mp4") || lower.contains(".m3u8?") else { continue }
+            if let u = URL(string: decoded.trimmingCharacters(in: .whitespacesAndNewlines)) { return u }
+        }
+        return nil
+    }
+
     /// They probe at `start()` instead, paying the cost once per session. The
     /// sidebar will show "Auto (Live)" for those URLs until Start, which is
     /// a minor inconsistency we accept in exchange for not surprising users.
@@ -6019,6 +6825,41 @@ final class TranscriptionEngine: ObservableObject {
         // remains nil and the UI just shows the source kind.
         probeStatus = .probing
         probeTask = Task { [weak self] in
+            // PORTAL/PLAYER RESOLUTION AT PROBE TIME (2026-07-29): the
+            // same resolvers start() runs (CivicClerk, statehouse
+            // players like Texas, generic HLS sniffer) must also run
+            // HERE — otherwise the eager probe throws the portal page
+            // (e.g. senate.texas.gov/videoplayer.php?vid=…) straight at
+            // yt-dlp, which errors "Unsupported URL", the probe fails,
+            // and the session is unstartable even though start() would
+            // have resolved it. When a resolver hits, we probe the
+            // RESOLVED media URL (ffmpeg, sub-second) instead — mirroring
+            // the senate.gov special-case just below. detectedTitle is
+            // populated here so the header shows the hearing name during
+            // preview. Non-portal URLs resolve to nil and fall through
+            // to the normal probe paths unchanged.
+            var url = url
+            var source = source
+            if !url.isFileURL {
+                var resolvedMedia: ResolvedMedia?
+                if let civic = await Self.resolveCivicClerkMedia(url: url) {
+                    resolvedMedia = ResolvedMedia(mediaURL: civic.mediaURL, title: civic.title)
+                } else if let sh = await Self.resolveStatehousePlayer(url: url) {
+                    resolvedMedia = sh
+                } else if let sniffed = await Self.sniffEmbeddedHLS(url: url) {
+                    resolvedMedia = sniffed
+                }
+                if let resolvedMedia {
+                    url = resolvedMedia.mediaURL
+                    source = StreamSource.detect(from: url)
+                    if let t = resolvedMedia.title, !t.isEmpty {
+                        await MainActor.run { [weak self] in
+                            if self?.detectedTitle == nil { self?.detectedTitle = t }
+                        }
+                    }
+                }
+            }
+
             // Run the appropriate probe off the MainActor. The chosen
             // strategy is captured by `source` — it's stable for the task's
             // lifetime since urlString changes cancel the task before
@@ -6622,6 +7463,21 @@ final class TranscriptionEngine: ObservableObject {
         // Likewise read the SSL_CERT_FILE override into a local
         // before entering the sync continuation.
         let childEnv = await MainActor.run { ToolManager.shared.ytDlpChildEnvironment() }
+        // Deno + bgutil PO-token provider flags, resolved out here for
+        // the same reason. The probe historically omitted --js-runtimes
+        // (metadata-only, no format resolution needed), but a
+        // PO-token-flagged client can fail extraction before the
+        // --print fields are emitted — and script-mode tokens are
+        // cached on disk (6h TTL, shared across processes), so letting
+        // the probe generate them pre-warms the cache for the
+        // stream/download invocation that follows. Existence check
+        // only — never trigger a Deno download from the probe path.
+        let potProbeArgs: [String] = {
+            let deno = ToolManager.shared.denoPath
+            guard FileManager.default.isExecutableFile(atPath: deno) else { return [] }
+            return ["--js-runtimes", "deno:\(deno)"]
+                + PotProviderManager.shared.potArguments()
+        }()
 
         return await withCheckedContinuation { (cont: CheckedContinuation<YTDlpProbeResult?, Never>) in
             let process = Process()
@@ -6649,6 +7505,13 @@ final class TranscriptionEngine: ObservableObject {
             if probeSource.benefitsFromImpersonation {
                 probeArgs.append(contentsOf: ["--impersonate", "chrome"])
             }
+            probeArgs.append(contentsOf: potProbeArgs)
+            // Player-client override — the probe must see YouTube through
+            // the SAME client as the download that follows, or live/VOD
+            // detection and format availability can disagree between the
+            // two invocations.
+            probeArgs.append(contentsOf: ToolManager.youtubePlayerClientArguments())
+            probeArgs.append(contentsOf: ToolManager.proxyArguments())
             probeArgs.append(contentsOf: [
                 // Warm-up speedup flags. See class-level explanation
                 // at `ytDlpWarmupFlags` rationale.

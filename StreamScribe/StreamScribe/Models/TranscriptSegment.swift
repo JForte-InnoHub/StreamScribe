@@ -73,6 +73,22 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
     /// internal channel between WhisperKit and the splitter.
     var words: [WordToken]?
 
+    /// Pre-cleanup verbatim text, set when the LLM cleanup pass
+    /// modifies `text`. Never destroyed — cleaned transcripts must
+    /// always be able to produce the exact words as transcribed
+    /// (these transcripts feed press quotes). Optional and nil for
+    /// segments the cleanup never touched; old saved sessions decode
+    /// it as nil.
+    var rawText: String?
+
+    /// True when the user hand-edited this segment's text in-app
+    /// (2026-07-21 transcript-editing feature). User text is FINAL:
+    /// the refinement pass preserves these segments instead of
+    /// replacing them by time-window, and the LLM cleanup pass skips
+    /// them. Optional so sessions saved before this field decode as
+    /// nil (= false), same pattern as `rawText`.
+    var userEdited: Bool?
+
     init(
         id: UUID = UUID(),
         text: String,
@@ -81,7 +97,9 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
         speaker: String? = nil,
         isFinalized: Bool = false,
         refinementState: SegmentRefinementState = .refined,
-        words: [WordToken]? = nil
+        words: [WordToken]? = nil,
+        rawText: String? = nil,
+        userEdited: Bool? = nil
     ) {
         self.id = id
         self.text = text
@@ -91,6 +109,8 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
         self.isFinalized = isFinalized
         self.refinementState = refinementState
         self.words = words
+        self.rawText = rawText
+        self.userEdited = userEdited
     }
 
     var duration: TimeInterval { end - start }
@@ -309,6 +329,7 @@ enum StreamSource: String, CaseIterable {
     case granicus = "Granicus"
     case hls = "HLS Stream"
     case directAudio = "Direct Audio"
+    case directVideo = "Direct Video"
     case localFile = "Local File"
     case unknown = "Unknown"
 
@@ -350,7 +371,7 @@ enum StreamSource: String, CaseIterable {
         switch self {
         case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
             return true
-        case .senateGov, .criticalMention, .granicus, .hls, .directAudio, .localFile:
+        case .senateGov, .criticalMention, .granicus, .hls, .directAudio, .directVideo, .localFile:
             return false
         }
     }
@@ -535,6 +556,19 @@ enum StreamSource: String, CaseIterable {
         }
         if audioExtensions.contains(where: { path.hasSuffix(".\($0)") }) {
             return .directAudio
+        }
+        // Direct video files (2026-07-27): a plain https link ending
+        // in .mp4/.mov/etc. is just a file ffmpeg can demux — it needs
+        // no yt-dlp extractor. Previously these fell through to
+        // .unknown and got routed through yt-dlp's generic extractor,
+        // which usually worked but was slower and added a yt-dlp
+        // failure surface for what is a direct download (this also
+        // covers the CivicClerk resolver's .mp4 output and direct
+        // government-portal media links). url.path already excludes
+        // the query string, so signed-CDN URLs (…mp4?Expires=…&Sig=…)
+        // match correctly.
+        if videoExtensions.contains(where: { path.hasSuffix(".\($0)") }) {
+            return .directVideo
         }
         return .unknown
     }

@@ -310,7 +310,17 @@ final class TranscriptDocumentModel {
         // stroke). Name text is color-matched and semibold 10pt with
         // slight tracking — the same recipe as the SwiftUI
         // SpeakerBadge, so the two renderers read identically.
-        let headerColor = speakerColor(for: group.speaker ?? displayName)
+        // Color keys on the MACHINE LABEL — the diarizer's stable
+        // identity — never the display name (2026-07-22 fix: renaming
+        // a speaker changed their color, because group.speaker carries
+        // the RESOLVED name from makeGroups; hashing it re-rolled the
+        // palette on every rename). The name is decoration; the color
+        // is identity. Keying on the first segment's raw speaker also
+        // re-aligns the transcript with SpeakerPanel/PinPanel, which
+        // already hash the machine label with this same palette.
+        let headerColor = speakerColor(
+            for: group.segments.first?.speaker ?? group.speaker ?? displayName
+        )
         let header = NSMutableAttributedString()
         let badge = NSMutableAttributedString()
         badge.append(NSAttributedString(string: "● ", attributes: [

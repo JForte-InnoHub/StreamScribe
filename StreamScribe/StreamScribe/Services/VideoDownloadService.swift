@@ -78,13 +78,13 @@ final class VideoDownloadService: ObservableObject {
         currentTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.performDownload(
+                let savedURL = try await self.performDownload(
                     from: sourceURL,
                     to: destinationURL
                 )
                 await MainActor.run {
                     self.progress = 1.0
-                    self.statusText = "Saved to \(destinationURL.lastPathComponent)"
+                    self.statusText = "Saved to \(savedURL.lastPathComponent)"
                 }
             } catch is CancellationError {
                 await MainActor.run {
@@ -144,7 +144,13 @@ final class VideoDownloadService: ObservableObject {
     /// path via `--print after_move:filepath`, and then move that
     /// file to the user's chosen destination. Same idiom as the
     /// audio path.
-    nonisolated private func performDownload(from sourceURL: URL, to destinationURL: URL) async throws {
+    /// Returns the URL the file was ACTUALLY saved to — which can
+    /// differ from `destinationURL` by extension: audio-only sources
+    /// are delivered as .mp3 (2026-07-22 user request; podcast-class
+    /// content saved as an audio-only .mp4 confused every downstream
+    /// tool).
+    @discardableResult
+    nonisolated private func performDownload(from sourceURL: URL, to destinationURL: URL) async throws -> URL {
         // Route by source type. yt-dlp is the workhorse for most
         // platforms (YouTube, Twitter, Instagram, Threads, etc.)
         // because it handles their platform-specific format
@@ -185,6 +191,19 @@ final class VideoDownloadService: ObservableObject {
                 tempDir: tempDir,
                 ffmpegPath: ffmpegPath
             )
+        } else if source == .hls {
+            // Bare HLS URL (2026-07-29 user request): the URL IS the
+            // m3u8 — no page resolution needed. Same ffmpeg segment-
+            // concatenate-and-remux path the Critical Mention/Granicus
+            // flows use. The download button only appears for HLS once
+            // the probe has confirmed the playlist is finite (VOD), so
+            // a live stream that never terminates won't reach here.
+            await MainActor.run { self.statusText = "Downloading HLS stream…" }
+            downloadedPath = try await runFFmpegHLSDownload(
+                streamURL: sourceURL,
+                tempDir: tempDir,
+                ffmpegPath: ffmpegPath
+            )
         } else {
             // yt-dlp flow for all other sources.
             let tools = try await AudioStreamExtractor.resolveYTDlpTools()
@@ -198,26 +217,102 @@ final class VideoDownloadService: ObservableObject {
             )
         }
 
-        let downloadedURL = URL(fileURLWithPath: downloadedPath)
+        var downloadedURL = URL(fileURLWithPath: downloadedPath)
+
+        // AUDIO-ONLY → MP3 (2026-07-22 user request): podcast-class
+        // sources have no real video, and delivering them as an
+        // audio-only .mp4 confuses downstream tools. Detection uses
+        // the same attached-picture-aware capital-V selector as the
+        // broken-pipe fix (cover art must not count as video). On any
+        // failure the original container is delivered — this stage
+        // must never turn a successful download into an error.
+        var effectiveDestination = destinationURL
+        if let mp3URL = Self.convertToMP3IfAudioOnly(downloadedURL: downloadedURL, ffmpegPath: ffmpegPath) {
+            downloadedURL = mp3URL
+            effectiveDestination = destinationURL
+                .deletingPathExtension()
+                .appendingPathExtension("mp3")
+        }
 
         // Move (or copy across volumes) to user destination. If a
         // file already exists at the destination, NSSavePanel has
         // confirmed overwrite — remove the existing file first
         // since FileManager.moveItem errors on existing target.
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
+        // (For an mp3 delivery the extension changed AFTER the save
+        // panel, so an existing file at the .mp3 path gets the same
+        // overwrite treatment.)
+        if FileManager.default.fileExists(atPath: effectiveDestination.path) {
+            try FileManager.default.removeItem(at: effectiveDestination)
         }
         do {
-            try FileManager.default.moveItem(at: downloadedURL, to: destinationURL)
+            try FileManager.default.moveItem(at: downloadedURL, to: effectiveDestination)
         } catch {
             // Cross-volume move (temp on /private/tmp, destination on
             // user's external drive) fails with EXDEV; fall back to
             // copy + remove. The `removeItem` is best-effort — leaving
             // a stray temp file is preferable to surfacing the copy
             // success as a failure to the user.
-            try FileManager.default.copyItem(at: downloadedURL, to: destinationURL)
+            try FileManager.default.copyItem(at: downloadedURL, to: effectiveDestination)
             try? FileManager.default.removeItem(at: downloadedURL)
         }
+        return effectiveDestination
+    }
+
+    /// If `downloadedURL` has no REAL video stream (attached-picture
+    /// cover art excluded via the `0:V` selector), return an .mp3 to
+    /// deliver instead: the file itself when it's already MP3, or a
+    /// libmp3lame V2 conversion (transparent for speech). Returns nil
+    /// when the file has video OR when anything fails — the caller
+    /// then delivers the original container unchanged.
+    nonisolated private static func convertToMP3IfAudioOnly(downloadedURL: URL, ffmpegPath: String) -> URL? {
+        func runFFmpeg(_ arguments: [String]) -> Int32 {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: ffmpegPath)
+            proc.arguments = arguments
+            proc.standardOutput = Pipe(); proc.standardError = Pipe()
+            do { try proc.run() } catch { return -1 }
+            proc.waitUntilExit()
+            return proc.terminationStatus
+        }
+
+        // Real-video probe: decode at most one frame from the first
+        // NON-attached-picture video stream. Audio-only files fail the
+        // map instantly; real video succeeds in milliseconds.
+        let probeStatus = runFFmpeg([
+            "-v", "error",
+            "-i", downloadedURL.path,
+            "-map", "0:V:0",
+            "-frames:v", "1",
+            "-f", "null", "-",
+        ])
+        guard probeStatus != 0 else { return nil }  // has real video
+
+        if downloadedURL.pathExtension.lowercased() == "mp3" {
+            // Podcast feeds commonly serve native MP3 — yt-dlp already
+            // saved it with the right extension; nothing to convert.
+            return downloadedURL
+        }
+
+        let mp3URL = downloadedURL.deletingPathExtension().appendingPathExtension("mp3")
+        if mp3URL != downloadedURL {
+            try? FileManager.default.removeItem(at: mp3URL)
+        }
+        let convertStatus = runFFmpeg([
+            "-v", "error",
+            "-i", downloadedURL.path,
+            "-vn",
+            "-c:a", "libmp3lame",
+            "-q:a", "2",
+            mp3URL.path,
+        ])
+        guard convertStatus == 0, FileManager.default.fileExists(atPath: mp3URL.path) else {
+            print("[Download] Audio-only source detected but MP3 conversion failed — delivering the original container.")
+            try? FileManager.default.removeItem(at: mp3URL)
+            return nil
+        }
+        try? FileManager.default.removeItem(at: downloadedURL)
+        print("[Download] Audio-only source — delivered as MP3.")
+        return mp3URL
     }
 
     /// Download an HLS stream via ffmpeg. Used for Critical Mention
@@ -414,7 +509,17 @@ final class VideoDownloadService: ObservableObject {
             // path — same tools tuple, same flag, same behavior.
             if let denoPath = tools.denoPath {
                 args.append(contentsOf: ["--js-runtimes", "deno:\(denoPath)"])
+                // bgutil PO-token provider (script-deno). Discovers Deno
+                // via the --js-runtimes flag above. Empty until
+                // PotProviderManager finishes provisioning, so appending
+                // unconditionally is safe.
+                args.append(contentsOf: PotProviderManager.shared.potArguments())
             }
+            // YouTube player-client override (Settings). See
+            // ToolManager.youtubePlayerClientArguments — web-family
+            // client so the PO-token provider (WebPO-only) applies.
+            args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
+            args.append(contentsOf: ToolManager.proxyArguments())
 
             // Cookies for sites that require login. Session-cached —
             // browser extraction on first invocation, cheap jar reads
@@ -461,7 +566,12 @@ final class VideoDownloadService: ObservableObject {
             // interfere with progress display.
             args.append(contentsOf: [
                 "--ffmpeg-location", ffmpegPath,
-                "-f", "best/bv*+ba/bv*/wv*/w",
+                // [vcodec!*=unknown] on the muxed tier: keeps the
+                // SABR-era unknown-codec formats (e.g. 387) from
+                // outranking a real bv*+ba merge — same field failure
+                // as the pipe path, see AudioStreamExtractor's
+                // liveFormatSelector comment (2026-07-17).
+                "-f", "best[vcodec!*=unknown]/bv*+ba/bv*/wv*/w",
                 "-o", outputTemplate,
                 "--print", "after_move:filepath",
                 "--newline",   // progress lines on their own lines, easier to parse

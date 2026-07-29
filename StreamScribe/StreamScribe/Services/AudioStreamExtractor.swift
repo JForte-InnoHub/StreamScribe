@@ -17,6 +17,30 @@ private final class MutableByteBuffer {
 /// Tracks total bytes received from ffmpeg over the whole process lifetime,
 /// plus the snapshot at the last log emission so we can compute a rolling
 /// "bytes/sec since last log" without keeping a sliding window.
+/// Lock-guarded flag shared between the actor and ffmpeg's nonisolated
+/// termination handler. During a live escalation respawn, the OLD
+/// ffmpeg's exit must NOT finish the AsyncStream continuation — the
+/// new yt-dlp/ffmpeg pair keeps feeding the same stream. One-shot:
+/// consumed (reset) by the first termination it suppresses.
+private final class EscalationFlag {
+    let lock = NSLock()
+    var suppressFinishOnce = false
+}
+
+/// Per-spawn counter for googlevideo fragment 403s. A 403 STORM
+/// (2026-07-22 field log: format 94 — an HLS format from the merged
+/// client list's non-web clients, which the WebPO-only token provider
+/// cannot authorize — 403'd every fragment forever) is starvation
+/// with a different face: delivery is zero, but the watchdog's
+/// 30s window is the wrong detector shape for an error that
+/// announces itself six times in ten seconds. One counter per spawn;
+/// handlers of dead spawns keep their own dead counter so residual
+/// stderr can never trip the new pipe's threshold.
+private final class Error403Counter {
+    let lock = NSLock()
+    var count = 0
+}
+
 private final class AudioRateStats {
     let lock = NSLock()
     var totalBytes: Int = 0
@@ -101,6 +125,34 @@ actor AudioStreamExtractor {
     /// get tangled (a stale download-tracker pointer would never matter
     /// here, but separation makes the code easier to reason about).
     private var ytDlpStreamProcess: Process?
+
+    // MARK: Live starvation watchdog (2026-07-21)
+    //
+    // FIELD FAILURE this exists for: YouTube's PO-token era starves
+    // flagged clients per-fragment ("Read timed out.. Retrying
+    // (1/inf)" forever) — the stream stays CONNECTED but delivers a
+    // trickle, so the early-failure retry never fires and the session
+    // sits text-less. The proven manual remedy is rotating the player
+    // client (and dropping account cookies, since flags follow the
+    // account across clients); this watchdog automates it: sustained
+    // under-delivery → kill the yt-dlp/ffmpeg pair → respawn at the
+    // live edge with the next escalation step, SAME continuation.
+    private var watchdogTask: Task<Void, Never>?
+    /// One-shot: set when yt-dlp reports YouTube's bot-check
+    /// interstitial. Stops the watchdog and blocks further
+    /// escalations — every additional automated attempt against a
+    /// bot-walled IP EXTENDS the wall (field lesson 2026-07-21:
+    /// probes + pipes + escalations + parallel downloads from one IP
+    /// promoted a throttle into a hard interstitial).
+    private var botWallDetected = false
+    private var escalationAttempt = 0
+    private let escalationFlag = EscalationFlag()
+    private var current403Counter: Error403Counter?
+    /// Index of the NEXT fallback proxy to try (0 = none tried yet;
+    /// the session starts on the configured primary proxy or direct).
+    private var proxyRotationIndex = 0
+    private var currentRateStats: AudioRateStats?
+    private var liveEscalationContext: (url: URL, source: StreamSource, sourceLabel: String, ffmpegPath: String, cacheOutputPath: String?)?
 
     /// Accumulated stderr output from the live-pipe yt-dlp process. Used
     /// by the retry logic in `streamViaYTDlpPipe` to detect the known
@@ -196,7 +248,9 @@ actor AudioStreamExtractor {
                 // mapping if a real-world hearing surfaces a gap.
                 print("[Extractor] U.S. Senate direct extractor failed (\(error.localizedDescription)) — falling back to yt-dlp.")
                 print("[Extractor] Streaming pipe via yt-dlp (parallel fragments)…")
-                let pipe = try await streamViaYTDlpPipe(url, source: .unknown, ffmpegPath: ffmpeg)
+                // isStaticSession false: the Senate fallback serves live or
+                // unknown-duration streams; keep the live hardening.
+                let pipe = try await streamViaYTDlpPipe(url, source: .unknown, ffmpegPath: ffmpeg, isStaticSession: false)
                 ytDlpStdinPipe = pipe
                 inputURL = "-"
                 inputIsLocalFile = false
@@ -253,10 +307,26 @@ actor AudioStreamExtractor {
             // they don't need yt-dlp at all and were never affected
             // by the download-vs-stream choice.
             print("[Extractor] Streaming pipe via yt-dlp (parallel fragments)…")
-            let pipe = try await streamViaYTDlpPipe(url, source: source, ffmpegPath: ffmpeg)
+            // `useFastDownload` is set by the engine as
+            // `source.requiresYTDlp && resolvedSessionMode == .static`
+            // (TranscriptionEngine.start), so inside this requiresYTDlp
+            // branch it is exactly the static-session signal. Sessions
+            // whose probe couldn't determine a duration resolve to
+            // .live and conservatively keep the hardening.
+            let pipe = try await streamViaYTDlpPipe(url, source: source, ffmpegPath: ffmpeg, isStaticSession: useFastDownload)
             ytDlpStdinPipe = pipe
             inputURL = "-"
             inputIsLocalFile = false
+            // Live sessions get the starvation watchdog; static
+            // sessions don't (finite retries fail fast there, and a
+            // static download legitimately idles between chunk
+            // bursts, which would false-trip a rate watchdog).
+            if !useFastDownload {
+                liveEscalationContext = (url, source, "\(source)", ffmpeg, cacheOutputPath)
+                escalationAttempt = 0
+            } else {
+                liveEscalationContext = nil
+            }
         } else if source == .localFile {
             inputURL = url.path
             inputIsLocalFile = true
@@ -297,6 +367,9 @@ actor AudioStreamExtractor {
                     continuation: continuation
                 )
                 print("[Extractor] ffmpeg process spawned.")
+                if ytDlpStdinPipe != nil, self.liveEscalationContext != nil {
+                    self.startLiveWatchdog()
+                }
             } catch {
                 print("[Extractor] Failed to spawn ffmpeg: \(error)")
                 continuation.finish()
@@ -307,6 +380,14 @@ actor AudioStreamExtractor {
     }
 
     func stop() {
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        liveEscalationContext = nil
+        escalationAttempt = 0
+        botWallDetected = false
+        current403Counter = nil
+        proxyRotationIndex = 0
+        ToolManager.sessionProxyOverride = nil
         if let p = ffmpegProcess, p.isRunning {
             p.terminate()
         }
@@ -344,6 +425,227 @@ actor AudioStreamExtractor {
     }
 
     // MARK: - FFmpeg wiring
+
+    // MARK: - Live starvation watchdog
+
+    private func currentDeliveredBytes() -> Int {
+        guard let stats = currentRateStats else { return 0 }
+        stats.lock.lock(); defer { stats.lock.unlock() }
+        return stats.totalBytes
+    }
+
+    /// Arm the watchdog for a live pipe session. Grace period covers
+    /// slow live-edge joins; after that, delivery below 0.3x realtime
+    /// over a 30s window means the client is being starved (healthy
+    /// live delivery is 0.9-1.1x; live-edge jitter is stall-then-burst
+    /// which still averages fine over 30s) and triggers escalation.
+    private func startLiveWatchdog() {
+        watchdogTask?.cancel()
+        print("[Watchdog] Armed: grace 30s, then fast-trip check (<0.6x delivered → immediate escalation), then 30s windows at 0.6x threshold.")
+        watchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            if Task.isCancelled { return }
+            // Fast-trip: a session that has delivered essentially
+            // nothing by the end of the grace period is starved from
+            // birth — don't make the user wait out a full measurement
+            // window on top (field feedback 2026-07-21: worst-case
+            // first rescue was ~80s of dead air; now ~31s).
+            if let self {
+                let bytes = await self.currentDeliveredBytes()
+                let audioSeconds = Double(bytes) / Double(Self.bytesPerSecondRealtime)
+                // Same 0.6x criterion as the rolling windows. Field
+                // lesson (2026-07-21): a steady mechanical throttle
+                // delivered a rock-solid 0.32x — above the old 0.3
+                // threshold, below anything usable. Healthy live is
+                // 0.9-1.1x; sustained sub-0.6 is always broken.
+                if audioSeconds < 18.0 {
+                    print(String(format: "[Watchdog] Fast-trip: only %.1fs audio delivered in the first 30s.", audioSeconds))
+                    await self.escalateLivePipe(measuredRatio: audioSeconds / 30.0)
+                }
+            }
+            guard var lastBytes = await self?.currentDeliveredBytes() else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                let now = await self.currentDeliveredBytes()
+                let delta = now - lastBytes
+                lastBytes = now
+                let audioSeconds = Double(delta) / Double(Self.bytesPerSecondRealtime)
+                let ratio = audioSeconds / 30.0
+                if ratio < 0.6 {
+                    await self.escalateLivePipe(measuredRatio: ratio)
+                    // Baseline resets with the fresh rateStats of the
+                    // respawned ffmpeg.
+                    lastBytes = await self.currentDeliveredBytes()
+                }
+            }
+        }
+    }
+
+    /// YouTube's bot-check interstitial appeared. Every further
+    /// automated attempt from this IP makes the wall last longer, so:
+    /// stop the watchdog, block the ladder, kill the processes, end
+    /// the session. The remedies are outside the app and time-bound —
+    /// say so loudly instead of churning.
+    /// Egress rotation (2026-07-23): when IP-scoped enforcement hits
+    /// — the bot wall, or a 403 storm surviving the whole client
+    /// ladder — advance to the next configured fallback proxy and
+    /// restart the pipe through it, with a FRESH client-escalation
+    /// ladder (a new IP deserves rung 1 again). Sticky by design: a
+    /// proxy that works keeps the rest of the session; rotation only
+    /// advances on the next enforcement hit. Returns false when the
+    /// list is exhausted (or empty) — callers then fall through to
+    /// their loud terminal banners. Field basis: fleet shares
+    /// Netskope egress IPs (whole building = one identity to
+    /// YouTube); VPN test showed instant recovery on a fresh egress.
+    private func rotateEgress(reason: String) async -> Bool {
+        let fallbacks = ToolManager.proxyFallbackList()
+        guard proxyRotationIndex < fallbacks.count else { return false }
+        let next = fallbacks[proxyRotationIndex]
+        proxyRotationIndex += 1
+        ToolManager.sessionProxyOverride = next
+        print("[Egress] \(reason) — rotating to fallback proxy \(proxyRotationIndex)/\(fallbacks.count): \(Self.redactProxyCredentials(next))")
+        botWallDetected = false
+        escalationAttempt = 0
+        await escalateLivePipe(measuredRatio: 0)
+        return true
+    }
+
+    /// Credentials never go in logs: http://user:pass@host → http://•••@host
+    private static func redactProxyCredentials(_ url: String) -> String {
+        guard let atIdx = url.lastIndex(of: "@"),
+              let schemeRange = url.range(of: "://") else { return url }
+        return String(url[..<schemeRange.upperBound]) + "•••" + String(url[atIdx...])
+    }
+
+    private func handleBotWall() async {
+        guard !botWallDetected else { return }
+        botWallDetected = true
+        escalationAttempt = Int.max  // silence termination-handler escalation during teardown
+        if let p = ytDlpStreamProcess, p.isRunning { p.terminate() }
+        if let p = ffmpegProcess, p.isRunning { p.terminate() }
+        // Fresh egress beats waiting out the wall — rotation resets
+        // the ladder and respawns; the banner is the no-proxies-left
+        // path only.
+        if await rotateEgress(reason: "Bot wall on current egress IP") { return }
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        print("""
+        [BotWall] ==========================================================
+        [BotWall] YouTube is serving its "Sign in to confirm you're not a
+        [BotWall] bot" interstitial for this IP address. Cookies, player
+        [BotWall] clients, and PO tokens do not bypass this tier — it is an
+        [BotWall] IP-level block, typically triggered by many rapid
+        [BotWall] automated requests, and it is TIME-BOUND (usually clears
+        [BotWall] within an hour if the requests stop). StreamScribe has
+        [BotWall] stopped retrying so as not to extend it.
+        [BotWall] Remedies: wait it out; or use a different network path
+        [BotWall] (hotspot, VPN, or the proxy setting in the sidebar).
+        [BotWall] ==========================================================
+        """)
+    }
+
+    /// Six fragment 403s from the CURRENT pipe: this config's media
+    /// URLs are unauthorized for us (typically a merged-client-list
+    /// format whose client the WebPO provider can't cover). Respond
+    /// like starvation, immediately: next ladder rung = fresh
+    /// extraction = fresh format choice under new conditions. When
+    /// the ladder is already exhausted, stop the session LOUDLY —
+    /// an infinite 403 retry loop delivers nothing, burns requests,
+    /// and reads as a hang.
+    private func handle403Storm(from counter: Error403Counter) async {
+        guard counter === current403Counter else { return }  // stale spawn's stderr
+        guard !botWallDetected else { return }
+        if escalationAttempt >= 3 || watchdogTask == nil {
+            if await rotateEgress(reason: "403 storm with client ladder exhausted") { return }
+            print("""
+            [403Storm] ================================================
+            [403Storm] YouTube is rejecting this stream's media URLs
+            [403Storm] (HTTP 403) for every client configuration the
+            [403Storm] escalation ladder tried. The stream may be
+            [403Storm] region- or membership-restricted, or its media
+            [403Storm] is enforcement-locked for non-browser clients
+            [403Storm] right now. Stopping instead of looping.
+            [403Storm] Remedies: the proxy setting (different egress),
+            [403Storm] retrying in a while, or capturing via a
+            [403Storm] different source for this event.
+            [403Storm] ================================================
+            """)
+            watchdogTask?.cancel()
+            watchdogTask = nil
+            if let p = ytDlpStreamProcess, p.isRunning { p.terminate() }
+            if let p = ffmpegProcess, p.isRunning { p.terminate() }
+            return
+        }
+        print("[403Storm] Fragment 403 storm on the current pipe — escalating immediately instead of waiting out the starvation window.")
+        await escalateLivePipe(measuredRatio: 0)
+    }
+
+    /// The escalation ladder. Step 1 keeps the configured client but
+    /// drops cookies (account-level flags survive client rotation, so
+    /// shedding the account is the cheapest first move). Steps 2-3
+    /// rotate to clients this session hasn't burned. Rejoin is at the
+    /// live edge (no --live-from-start): the starved gap is already
+    /// lost either way, and the transcript timeline simply continues —
+    /// the discontinuity is logged for the record.
+    private func escalateLivePipe(measuredRatio: Double) async {
+        guard !botWallDetected else { return }
+        guard let ctx = liveEscalationContext, let continuation = continuation else { return }
+        let ladder: [(client: String?, label: String)] = [
+            (nil, "configured client, cookies dropped"),
+            ("web_embedded", "web_embedded, cookies dropped"),
+            ("default", "yt-dlp default clients, cookies dropped"),
+        ]
+        escalationAttempt += 1
+        guard escalationAttempt <= ladder.count else {
+            print("[Watchdog] Starvation persists after full escalation ladder — leaving the current pipe to ride yt-dlp's retries. Manual remedies: rotate the player-client setting, wait out the cooldown, or change networks.")
+            watchdogTask?.cancel()
+            watchdogTask = nil
+            return
+        }
+        let step = ladder[escalationAttempt - 1]
+        print(String(format: "[Watchdog] Live delivery %.2fx realtime over 30s — starvation. Escalation %d/%d: %@.",
+                     measuredRatio, escalationAttempt, ladder.count, step.label))
+
+        // Deliberate teardown of the current pair. Suppress the
+        // continuation-finish that ffmpeg's termination handler would
+        // otherwise perform.
+        escalationFlag.lock.lock()
+        escalationFlag.suppressFinishOnce = true
+        escalationFlag.lock.unlock()
+        if let p = ytDlpStreamProcess, p.isRunning { p.terminate() }
+        if let p = ffmpegProcess, p.isRunning { p.terminate() }
+        // Let termination handlers run before respawning over the
+        // same properties.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        do {
+            let tools = try await Self.resolveYTDlpTools()
+            let newPipe = try spawnYTDlpPipeProcess(
+                url: ctx.url,
+                source: ctx.source,
+                sourceLabel: ctx.sourceLabel,
+                ffmpegPath: ctx.ffmpegPath,
+                tools: tools,
+                isStaticSession: false,
+                useLiveFromStart: false,
+                useCookies: false,
+                playerClientOverride: step.client
+            )
+            try spawnFFmpeg(
+                ffmpegPath: ctx.ffmpegPath,
+                inputURL: "-",
+                isNetworkInput: false,
+                stdinPipe: newPipe,
+                cacheOutputPath: ctx.cacheOutputPath,
+                continuation: continuation
+            )
+            print("[Watchdog] Respawned pipe at live edge (\(step.label)). Transcript timeline continues; the starved gap is not recoverable. Miniplayer cache restarts.")
+        } catch {
+            print("[Watchdog] Escalation respawn failed: \(error.localizedDescription) — will re-evaluate on the next window.")
+        }
+    }
 
     private func spawnFFmpeg(
         ffmpegPath: String,
@@ -413,6 +715,18 @@ actor AudioStreamExtractor {
         } else {
             args.append("-vn")  // drop video for audio-only ffmpeg invocations
         }
+        // Opt-in loudness taming (2026-07-21, default OFF — sidebar
+        // toggle). Hot, heavily compressed broadcast masters (Fox) are
+        // the reliable trigger for Whisper's ALL-CAPS caption-style
+        // collapse; dynaudnorm is streaming-safe and pulls input level
+        // toward the training distribution. Off by default because
+        // this PCM also feeds diarization + voiceprint embeddings —
+        // WeSpeaker normalizes internally so impact should be nil, but
+        // that's an empirical question the toggle exists to answer,
+        // not an assumption to bake in silently.
+        if UserDefaults.standard.bool(forKey: "extractor.audioNormalizationEnabled") {
+            args.append(contentsOf: ["-af", "dynaudnorm=f=250:g=15"])
+        }
         args.append(contentsOf: [
             "-ac", "1",                               // mono
             "-ar", String(Int(Self.sampleRate)),      // 16 kHz
@@ -455,7 +769,19 @@ actor AudioStreamExtractor {
         if let cachePath = cacheOutputPath {
             var cacheArgs: [String] = []
             if wantsVideoInCacheFlag {
-                cacheArgs.append(contentsOf: ["-map", "0:v?"])
+                // Capital V, deliberately (2026-07-22): `0:v?` also
+                // matches ATTACHED-PICTURE streams — podcast files
+                // carry cover art that ffmpeg surfaces as a video
+                // stream. Stream-copying artwork into the fMP4 cache
+                // fails at the muxer ("Could not find tag for codec"),
+                // which aborts the WHOLE ffmpeg process, slams the
+                // stdin pipe shut (yt-dlp: "Broken pipe"), and kills
+                // the session ~0.5s in — field failure on an Apple
+                // Podcasts episode. `0:V?` matches real video only,
+                // excluding attached pictures; audio-only sources with
+                // artwork degrade to an audio-only cache exactly as
+                // sources with no video stream always have.
+                cacheArgs.append(contentsOf: ["-map", "0:V?"])
             }
             cacheArgs.append(contentsOf: [
                 "-map", "0:a:0",
@@ -487,7 +813,13 @@ actor AudioStreamExtractor {
                 "-c:a", "aac",
                 "-b:a", "128k",
                 "-f", "mp4",
-                "-movflags", "+faststart+frag_keyframe+empty_moov",
+                // +faststart REMOVED (2026-07): for a fragmented mp4
+                // it adds nothing during the session, and its
+                // on-exit file rewrite yanks the bytes out from
+                // under any AVFragmentedAsset reader the miniplayer
+                // has open at that moment. The fragmented file plays
+                // fine as-is once complete.
+                "-movflags", "+frag_keyframe+empty_moov",
                 "-y",
                 cachePath,
             ])
@@ -531,6 +863,11 @@ actor AudioStreamExtractor {
         // counters keeps the logging cheap.
         let rateStats = AudioRateStats()
         rateStats.lastLogAt = Date()
+        // Watchdog visibility: each ffmpeg spawn gets fresh stats; the
+        // watchdog always reads the CURRENT one, so an escalation
+        // respawn also resets its measurement baseline.
+        self.currentRateStats = rateStats
+        let escFlag = self.escalationFlag
 
         outPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -615,7 +952,18 @@ actor AudioStreamExtractor {
             // Any final 1–3 trailing bytes are dropped — they can't form a sample.
 
             errPipe.fileHandleForReading.readabilityHandler = nil
-            continuation.finish()
+            // Escalation respawn in progress? Then this exit is
+            // deliberate — keep the continuation open for the new
+            // ffmpeg. One-shot flag; see EscalationFlag.
+            escFlag.lock.lock()
+            let suppressFinish = escFlag.suppressFinishOnce
+            escFlag.suppressFinishOnce = false
+            escFlag.lock.unlock()
+            if suppressFinish {
+                print("[Extractor] ffmpeg exited for escalation respawn — stream continuation kept open.")
+            } else {
+                continuation.finish()
+            }
         }
 
         try process.run()
@@ -753,7 +1101,17 @@ actor AudioStreamExtractor {
             }
             if let denoPath = tools.denoPath {
                 args.append(contentsOf: ["--js-runtimes", "deno:\(denoPath)"])
+                // bgutil PO-token provider (script-deno). Discovers Deno
+                // via the --js-runtimes flag above. Empty until
+                // PotProviderManager finishes provisioning, so appending
+                // unconditionally is safe.
+                args.append(contentsOf: PotProviderManager.shared.potArguments())
             }
+            // YouTube player-client override (Settings). See
+            // ToolManager.youtubePlayerClientArguments — web-family
+            // client so the PO-token provider (WebPO-only) applies.
+            args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
+            args.append(contentsOf: ToolManager.proxyArguments())
             // Format selector chosen by the user's miniplayer-cache
             // preference. The selectors below are stacked in priority
             // order; yt-dlp tries each and picks the first that
@@ -1079,7 +1437,7 @@ actor AudioStreamExtractor {
     /// success and never trigger the retry. 20s is the budget — if yt-dlp
     /// is still running at 20s it's actively streaming HLS fragments and
     /// is genuinely working.
-    private func streamViaYTDlpPipe(_ url: URL, source: StreamSource, ffmpegPath: String) async throws -> Pipe {
+    private func streamViaYTDlpPipe(_ url: URL, source: StreamSource, ffmpegPath: String, isStaticSession: Bool) async throws -> Pipe {
         let sourceLabel = source.rawValue
         let tools = try await Self.resolveYTDlpTools()
         let hasCookies = tools.cookieBrowser.ytDlpArgument != nil
@@ -1093,6 +1451,7 @@ actor AudioStreamExtractor {
             sourceLabel: sourceLabel,
             ffmpegPath: ffmpegPath,
             tools: tools,
+            isStaticSession: isStaticSession,
             useLiveFromStart: true,
             useCookies: true
         )
@@ -1101,13 +1460,52 @@ actor AudioStreamExtractor {
         // timeout has to exceed cookie-extraction-prompt + webpage-fetch
         // + player-API-fetch time (~10-12s in practice for the failing
         // path), otherwise the slow-failing case gets treated as success.
+        // Two extractor-specific phrasings of the same disease — a
+        // live stream whose formats can't be fetched under the current
+        // flags (--live-from-start chief among them):
+        //   - YouTube:  "No video formats found!"
+        //   - Twitter:  "--live-from-start is passed, but there are no
+        //     formats that can be downloaded from the start" (2026-07-22
+        //     field failure on a White House broadcast on X — yt-dlp's
+        //     own error names the fix this retry already implements,
+        //     but the pattern match only knew YouTube's wording, so
+        //     the retry never fired).
+        // The retry's YouTube-specific extras are harmless elsewhere:
+        // player_client args are youtube-namespaced (other extractors
+        // ignore them), and cookie-dropping is fine for public
+        // broadcasts.
         let failedWithKnownBug = await waitForEarlyFailure(
             timeout: 20.0,
-            errorPattern: "No video formats found"
+            errorPatterns: [
+                "No video formats found",
+                "no formats that can be downloaded from the start",
+            ]
         )
 
         if failedWithKnownBug {
-            print("[Extractor] yt-dlp --live-from-start failed with known formats bug. Retrying without --live-from-start\(hasCookies ? " and without cookies" : "")…")
+            // Which extractor's phrasing matched decides the retry's
+            // shape (2026-07-22, White House broadcast on X): the
+            // cookie-drop and default-client override are remedies for
+            // YOUTUBE-specific failure modes. Applying them to a
+            // twitter:broadcast retry is actively harmful — X is a
+            // logged-in platform and its playlist fetches often
+            // REQUIRE the browser cookies' auth, so the cookie-less
+            // retry produced an empty pipe (ffmpeg: "Invalid data
+            // found when processing input") after the flag fix let
+            // the retry fire at all. Twitter-style failure keeps
+            // cookies and the configured client args (which twitter
+            // ignores anyway); only --live-from-start is dropped —
+            // the one thing its error message actually asked for.
+            let failureStderr = ytDlpStreamStderr.flatMap {
+                String(data: $0.bytes, encoding: .utf8)
+            } ?? ""
+            let twitterStyleFailure = failureStderr.contains("no formats that can be downloaded from the start")
+
+            if twitterStyleFailure {
+                print("[Extractor] Live-from-start unsupported by this broadcast. Retrying from the live edge (cookies kept — this platform's playlists may require auth)…")
+            } else {
+                print("[Extractor] yt-dlp reported no formats. Retrying without --live-from-start\(hasCookies ? ", without cookies" : ""), and with yt-dlp's DEFAULT client selection…")
+            }
 
             // Clean up the failed process (terminationHandler already
             // cleared ytDlpStreamProcess, but belt-and-suspenders).
@@ -1115,16 +1513,27 @@ actor AudioStreamExtractor {
             ytDlpStreamProcess = nil
             ytDlpStreamStderr = nil
 
-            // Second attempt: no --live-from-start, no cookies. Follows
-            // the live edge — we lose DVR history but transcription works.
+            // Second attempt: no --live-from-start, no cookies, and —
+            // critically (2026-07-22 field failure) — DEFAULT clients.
+            // The player-client setting forces web_safari on every
+            // invocation, and when YouTube grants that client no live
+            // formats at all ("No video formats found!"), a retry that
+            // re-forces the same client is a no-op — which is exactly
+            // what this retry silently became the day the setting
+            // shipped. yt-dlp's default multi-client selection means
+            // ANY client currently granted live formats saves the
+            // session; the PO-token provider still covers whichever
+            // web-family clients appear in that set.
             let retryPipe = try spawnYTDlpPipeProcess(
                 url: url,
                 source: source,
                 sourceLabel: sourceLabel,
                 ffmpegPath: ffmpegPath,
                 tools: tools,
+                isStaticSession: isStaticSession,
                 useLiveFromStart: false,
-                useCookies: false
+                useCookies: twitterStyleFailure,
+                playerClientOverride: twitterStyleFailure ? nil : "default"
             )
             return retryPipe
         }
@@ -1148,8 +1557,10 @@ actor AudioStreamExtractor {
             disableTLSCheck: Bool,
             childEnvironment: [String: String]?
         ),
+        isStaticSession: Bool,
         useLiveFromStart: Bool,
-        useCookies: Bool
+        useCookies: Bool,
+        playerClientOverride: String? = nil
     ) throws -> Pipe {
         let process = Process()
         let stdoutPipe = Pipe()
@@ -1186,7 +1597,24 @@ actor AudioStreamExtractor {
         }
         if let denoPath = tools.denoPath {
             args.append(contentsOf: ["--js-runtimes", "deno:\(denoPath)"])
+            // bgutil PO-token provider (script-deno). Discovers Deno
+            // via the --js-runtimes flag above. Empty until
+            // PotProviderManager finishes provisioning, so appending
+            // unconditionally is safe.
+            args.append(contentsOf: PotProviderManager.shared.potArguments())
         }
+        // YouTube player-client override. Normally the Settings value
+        // (see ToolManager.youtubePlayerClientArguments); during a
+        // starvation escalation the watchdog passes an explicit
+        // override to rotate away from the flagged client.
+        if let override = playerClientOverride {
+            args.append(contentsOf: ["--extractor-args", "youtube:player_client=\(override)"])
+        } else {
+            args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
+        }
+        // User-configured proxy (sidebar). The in-app answer to
+        // IP-level walls; empty = direct.
+        args.append(contentsOf: ToolManager.proxyArguments())
         // Format selector: with video, a single muxed format yt-dlp
         // can stream on stdout (it can't merge separate streams when
         // piping). Without video, plain bestaudio — audio-only.
@@ -1203,9 +1631,50 @@ actor AudioStreamExtractor {
         // when it's available — that biases yt-dlp toward H.264
         // muxed streams (e.g. YouTube format 18 = 360p H.264+AAC).
         // Falls back to anything muxed when no MP4 is offered.
-        let liveFormatSelector = wantsVideoInCacheFlag
-            ? "best[height<=480][vcodec*=avc]/best[height<=480][ext=mp4]/best[height<=480]/best"
-            : "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio/best"
+        // SABR-era hardening (field failure 2026-07-17, video fijdz8IDEDc):
+        // web clients can now offer NO classic premuxed format at all —
+        // the only "muxed" entries are server-side (SSAP/SABR) formats
+        // with unknown codecs (e.g. format 387, log signature "WARNING:
+        // Unknown codec unknown" ×2). Those starve over plain HTTPS
+        // fragment GETs even with a valid gvs PO token, and the bytes
+        // that do arrive aren't a parseable container (ffmpeg: "error
+        // reading header"). The bare `best[height<=480]` alternative
+        // ranked 387 above everything, so:
+        //   - every generic alternative now excludes unknown codecs
+        //     ([vcodec!*=unknown] also drops codec-less entries — a
+        //     missing field fails the filter without the `?` suffix);
+        //   - when no usable muxed format exists, degrade to AUDIO-ONLY
+        //     rather than failing the session: transcription is the
+        //     mission, and the ffmpeg cache output's `-map 0:v?`
+        //     (optional map) writes a valid audio-only mp4 for the
+        //     miniplayer. The real fix for video-with-no-premuxed is
+        //     the split-stream design (separate audio pipe + video
+        //     download) — queued, not built.
+        // `/best` stays as the absolute last resort for non-YouTube
+        // sources routed through this pipe (Senate fallback etc.) whose
+        // format lists don't play by YouTube's rules.
+        // SPLIT-STREAM (2026-07): static sessions NEVER ask the pipe
+        // for video. Transcription needs audio; demanding a muxed
+        // format for stdout was what kept steering selection into
+        // SABR fake-muxed junk (the format-387 class). Miniplayer
+        // video for static sessions comes from VideoCacheDownloader's
+        // separate bv*+ba file download instead — the shape that
+        // works on every source. The `/best` tail still matters:
+        // progressive-only sources (Fox/CNBC single mp4) have no
+        // separate audio format, and a video-bearing pipe is harmless
+        // — ffmpeg maps the audio; the extra bytes are the cost.
+        // Live sessions keep the muxed-preference chain: livestream
+        // HLS muxed formats remain broadly available, and a live
+        // session can't wait for a file download to finish.
+        let audioFirstSelector = "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/best[vcodec!*=unknown]/best"
+        let liveFormatSelector: String
+        if isStaticSession {
+            liveFormatSelector = audioFirstSelector
+        } else {
+            liveFormatSelector = wantsVideoInCacheFlag
+                ? "best[height<=480][vcodec*=avc]/best[height<=480][ext=mp4]/best[height<=480][vcodec!*=unknown]/bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/best"
+                : audioFirstSelector
+        }
         // HLS / fragmented-stream staging directory. yt-dlp's HLS
         // native downloader writes each fragment to disk before
         // merging and emitting the muxed result to stdout. With
@@ -1229,7 +1698,6 @@ actor AudioStreamExtractor {
         try? FileManager.default.createDirectory(atPath: fragmentScratchDir, withIntermediateDirectories: true)
         args.append(contentsOf: [
             "-f", liveFormatSelector,
-            "-N", "8",
             "--http-chunk-size", "10M",
             "--no-part",
             "--no-warnings",
@@ -1237,6 +1705,63 @@ actor AudioStreamExtractor {
             "--hls-use-mpegts",
             "--paths", "temp:\(fragmentScratchDir)",
         ])
+        if isStaticSession {
+            // Static/VOD over the pipe path. REGRESSION GUARD: the
+            // live-edge hardening below must NOT apply here. When it
+            // did (previous session applied it unconditionally to this
+            // shared function), VOD downloads inherited a 10s stall
+            // tolerance + infinite retries: throttled googlevideo VOD
+            // reads routinely stall past 10s, so downloads collapsed
+            // into an endless "Read timed out. Retrying (1/inf)"
+            // livelock — field failure 2026-07, broke static mode
+            // app-wide. This branch restores the pre-hardening pipe
+            // args verbatim: -N 8 parallel fragments, yt-dlp default
+            // socket timeout (~20s) and finite default retries (10).
+            args.append(contentsOf: [
+                "-N", "8",
+            ])
+        } else {
+            args.append(contentsOf: [
+                // -N 1 for live: 8 concurrent fragment connections gain
+                // little at the live edge (fragments arrive in real time
+                // anyway) and corporate proxies choke on the connection
+                // fan-out — a contributor to per-fragment stalls.
+                "-N", "1",
+                // Live-edge CDN hardening. googlevideo fragment servers
+                // stall routinely on live streams (field failure: "Read
+                // timed out. Retrying (1/10)…" starving the pipe with no
+                // output). Three levers:
+                //   --socket-timeout 30 (RETUNED 2026-07-21): the
+                //     original 10s was designed to fail over to a
+                //     different CDN node quickly — but field evidence
+                //     (log 15:28, rock-steady 0.32x) showed retries hit
+                //     the SAME node, and per-segment the cycle became
+                //     mechanical: ~5s live segments served after a
+                //     ~10-15s hold, our 10s timeout aborting each first
+                //     request, +5s retry-sleep = 15s per 5s segment =
+                //     the observed 0.33x. The timeout was MANUFACTURING
+                //     the throttle. 30s lets a held-but-alive request
+                //     complete; a truly dead node costs 30s once, then
+                //     the 1s sleep recycles fast.
+                //   infinite retries: a live session should ride out
+                //     CDN turbulence indefinitely rather than dying at
+                //     attempt 10.
+                //   --retry-sleep 1 (was 5): with the long socket
+                //     timeout doing the waiting, the sleep's only job
+                //     is to avoid hammering; 1s suffices and stops
+                //     adding dead time to every recovery.
+                //   --force-ipv4: the classic fix for chronically
+                //     stalling rr*---sn-* googlevideo nodes, which are
+                //     disproportionately flaky over IPv6 routes.
+                // LIVE-ONLY: see the static branch above for why these
+                // must never leak into VOD sessions.
+                "--socket-timeout", "30",
+                "--retries", "infinite",
+                "--fragment-retries", "infinite",
+                "--retry-sleep", "1",
+                "--force-ipv4",
+            ])
+        }
         if useLiveFromStart {
             args.append("--live-from-start")
         }
@@ -1281,6 +1806,7 @@ actor AudioStreamExtractor {
         // it for the known error pattern after the process exits. Also
         // log each line for debug visibility.
         let stderrBuffer = MutableByteBuffer()
+        let counter403 = Error403Counter()
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
@@ -1290,9 +1816,29 @@ actor AudioStreamExtractor {
                 if !trimmed.isEmpty {
                     print("[yt-dlp stderr] \(trimmed)")
                 }
+                // Bot-wall circuit breaker. Match loosely — the
+                // apostrophe in "you're" arrives as a Unicode
+                // right-quote from yt-dlp.
+                if text.contains("Sign in to confirm") {
+                    Task { [weak self] in await self?.handleBotWall() }
+                }
+                // 403-storm fast escalation: fragment URLs this
+                // config cannot authorize announce themselves
+                // immediately and repeatedly — don't wait out a
+                // starvation window on them.
+                if text.contains("HTTP error 403") {
+                    counter403.lock.lock()
+                    counter403.count += 1
+                    let hit = counter403.count == 6  // fire exactly once
+                    counter403.lock.unlock()
+                    if hit {
+                        Task { [weak self] in await self?.handle403Storm(from: counter403) }
+                    }
+                }
             }
         }
         self.ytDlpStreamStderr = stderrBuffer
+        self.current403Counter = counter403
 
         process.terminationHandler = { [weak self] proc in
             // Disable the readability handler FIRST — Foundation owns the
@@ -1337,12 +1883,12 @@ actor AudioStreamExtractor {
 
     /// Wait up to `timeout` seconds for the current `ytDlpStreamProcess`
     /// to exit. Returns true if the process exited with a non-zero code
-    /// AND its stderr contains `errorPattern`. Returns false if the
+    /// AND its stderr contains any of `errorPatterns`. Returns false if the
     /// process is still running after the timeout (success — it's
     /// streaming audio) or if it exited for a different reason.
     /// Wait up to `timeout` seconds for the current `ytDlpStreamProcess`
     /// to either:
-    ///   - exit with a non-zero code AND stderr matches `errorPattern` → returns true (failure, retry)
+    ///   - exit with a non-zero code AND stderr matches any of `errorPatterns` → returns true (failure, retry)
     ///   - exit with a non-zero code but stderr does NOT match → returns false (other failure, don't retry)
     ///   - emit one of `successPatterns` on stderr → returns false (success, exit wait early)
     ///   - timeout while still running → returns false (assumed success)
@@ -1353,7 +1899,10 @@ actor AudioStreamExtractor {
     /// we see yt-dlp's HLS downloader engage ("[hlsnative]") or fragment
     /// download activity, we know it's working and can return immediately
     /// so ffmpeg starts consuming the pipe.
-    private func waitForEarlyFailure(timeout: TimeInterval, errorPattern: String) async -> Bool {
+    private func waitForEarlyFailure(timeout: TimeInterval, errorPatterns: [String]) async -> Bool {
+        func matchesAny(_ stderr: String) -> Bool {
+            errorPatterns.contains { stderr.contains($0) }
+        }
         let successPatterns = ["[hlsnative]", "[download] Destination:", "Downloading m3u8"]
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -1372,14 +1921,14 @@ actor AudioStreamExtractor {
             // Process exited.
             if let proc = ytDlpStreamProcess, !proc.isRunning {
                 print("[Extractor] yt-dlp exited early (code \(proc.terminationStatus)), stderr length: \(stderr.count) bytes")
-                if proc.terminationStatus != 0 && stderr.contains(errorPattern) {
+                if proc.terminationStatus != 0 && matchesAny(stderr) {
                     return true
                 }
                 return false
             }
             if ytDlpStreamProcess == nil {
                 print("[Extractor] yt-dlp process pointer cleared, stderr length: \(stderr.count) bytes")
-                return stderr.contains(errorPattern)
+                return matchesAny(stderr)
             }
 
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
@@ -1458,7 +2007,17 @@ actor AudioStreamExtractor {
             // paths.
             if let denoPath = tools.denoPath {
                 args.append(contentsOf: ["--js-runtimes", "deno:\(denoPath)"])
+                // bgutil PO-token provider (script-deno). Discovers Deno
+                // via the --js-runtimes flag above. Empty until
+                // PotProviderManager finishes provisioning, so appending
+                // unconditionally is safe.
+                args.append(contentsOf: PotProviderManager.shared.potArguments())
             }
+            // YouTube player-client override (Settings). See
+            // ToolManager.youtubePlayerClientArguments — web-family
+            // client so the PO-token provider (WebPO-only) applies.
+            args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
+            args.append(contentsOf: ToolManager.proxyArguments())
             // Mirrors the live-pipe format selector — single muxed
             // container at ≤480p with audio-only fallback when video
             // is wanted, plain bestaudio when not. -g returns the

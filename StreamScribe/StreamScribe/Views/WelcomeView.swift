@@ -66,6 +66,78 @@ struct WelcomeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Everything above the action row scrolls. FIELD FAILURE
+            // (2026-07): the sheet was a fixed 480x960 frame — taller
+            // than the usable height of smaller displays (13" MacBook
+            // ≈ 870pt visible). macOS sheets clip rather than scroll,
+            // so the Continue/Skip row was pushed off-screen with no
+            // way to reach it — the welcome flow was undismissable on
+            // those machines (Esc technically worked via the
+            // presentation binding, but nothing communicated that).
+            // Fix: the informational content scrolls, the action row
+            // is pinned OUTSIDE the scroll area so it is always
+            // visible, and the sheet height caps to the current
+            // screen (see `sheetHeight`).
+            ScrollView {
+                scrollableContent
+            }
+
+            Divider()
+
+            // Action row. Continue is the default action (Return key);
+            // Skip lets users opt out of the cookies prompt entirely.
+            // Both flip hasCompletedFirstTimeSetup so the sheet doesn't
+            // re-show next launch. Pinned below the ScrollView — never
+            // clipped regardless of display size.
+            HStack {
+                Button("Skip for Now") {
+                    completeSetup(
+                        applyingBrowser: false,
+                        applyingDownloads: false,
+                        applyingNotifications: false
+                    )
+                }
+                .controlSize(.large)
+
+                Spacer()
+
+                Button("Continue") {
+                    completeSetup(
+                        applyingBrowser: true,
+                        applyingDownloads: downloadModelsOnContinue,
+                        applyingNotifications: enableNotificationsOnContinue
+                    )
+                }
+                .controlSize(.large)
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(20)
+        }
+        .frame(width: 480, height: Self.sheetHeight)
+    }
+
+    /// Sheet height adapted to the screen the app is on. 960pt is the
+    /// design-ideal height (all cards visible without scrolling); on
+    /// displays whose visible frame can't fit that, the sheet shrinks
+    /// to fit (minus 120pt of margin for the host window's title bar
+    /// and breathing room) and the content scrolls instead. Floored at
+    /// 420pt so a pathological screen value can't collapse the sheet
+    /// below the header + one card + action row. `NSScreen.main` is
+    /// the screen with keyboard focus — correct for a first-launch
+    /// sheet attached to the key window.
+    private static var sheetHeight: CGFloat {
+        let ideal: CGFloat = 960
+        let minimum: CGFloat = 420
+        guard let visible = NSScreen.main?.visibleFrame.height else { return ideal }
+        return max(minimum, min(ideal, visible - 120))
+    }
+
+    /// The informational content of the welcome flow — everything
+    /// except the pinned Skip/Continue action row. Lives in a
+    /// ScrollView in `body`, so it may be any height.
+    private var scrollableContent: some View {
+        VStack(spacing: 0) {
             // Header — branding + welcome line.
             VStack(spacing: 14) {
                 Image(systemName: "waveform.badge.mic")
@@ -228,41 +300,12 @@ struct WelcomeView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 24)
-
-            Spacer(minLength: 16)
-
-            Divider()
-
-            // Action row. Continue is the default action (Return key);
-            // Skip lets users opt out of the cookies prompt entirely.
-            // Both flip hasCompletedFirstTimeSetup so the sheet doesn't
-            // re-show next launch.
-            HStack {
-                Button("Skip for Now") {
-                    completeSetup(
-                        applyingBrowser: false,
-                        applyingDownloads: false,
-                        applyingNotifications: false
-                    )
-                }
-                .controlSize(.large)
-
-                Spacer()
-
-                Button("Continue") {
-                    completeSetup(
-                        applyingBrowser: true,
-                        applyingDownloads: downloadModelsOnContinue,
-                        applyingNotifications: enableNotificationsOnContinue
-                    )
-                }
-                .controlSize(.large)
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-            }
-            .padding(20)
+                // Replaces the Spacer(minLength: 16) that sat here when
+                // this content lived directly in `body` — Spacers are
+                // inert inside a ScrollView (unbounded height), so plain
+                // bottom padding provides the gap instead.
+                .padding(.bottom, 20)
         }
-        .frame(width: 480, height: 960)
     }
 
     /// Mark setup as complete, optionally apply the picked browser,

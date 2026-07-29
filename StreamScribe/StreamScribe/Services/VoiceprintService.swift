@@ -125,6 +125,16 @@ final class VoiceprintService: ObservableObject {
     private var clusterEmbeddingSums: [String: [Float]] = [:]
     private var clusterEmbeddingCounts: [String: Int] = [:]
 
+    /// Every extracted embedding, keyed by segment UUID — the raw
+    /// evidence, independent of which cluster it was credited to at
+    /// extraction time. This is what makes identity SURVIVE
+    /// re-diarization: when a whole-file/post-finish pass relabels
+    /// segments, `reaggregate` rebuilds cluster evidence from these
+    /// against the NEW labels instead of orphaning it against the
+    /// old ones (unification stage 2 / F3, 2026-07). ~1 KB per
+    /// segment (256-dim Float); a 3-hour hearing is a few MB.
+    private var retainedEmbeddings: [UUID: [Float]] = [:]
+
     /// Count of embeddings contributed to each cluster's running
     /// total since the cluster was last identified. Used to decide
     /// when to re-run identification — see `identifyCluster` gates.
@@ -142,7 +152,6 @@ final class VoiceprintService: ObservableObject {
     /// so a merged cluster produces segments with different identified
     /// names — which the transcript view then groups by effective
     /// name, visually splitting the merge.
-    @Published private(set) var segmentIdentifications: [UUID: Identification] = [:]
 
     /// State of the R2 refresh — drives the Settings UI to show
     /// loading spinners, error messages, etc.
@@ -433,8 +442,18 @@ final class VoiceprintService: ObservableObject {
     /// in the signature for API compatibility with the older per-
     /// segment path. Also lets us support per-segment manual
     /// identifications as before if needed.
-    func identifySegment(segmentId: UUID, embedding: [Float], clusterId: String?) {
+    /// Record one segment's embedding as evidence for its cluster and
+    /// re-run cluster identification when due. This is the ONLY entry
+    /// point for automatic identification, and it operates purely at
+    /// cluster level — identity always lands on a diarizer speaker
+    /// ("Speaker N"), never on a floating segment. (Unification,
+    /// 2026-07: per-segment identity state was abolished; identifying
+    /// a sub-cluster selection now SPLITS it into a new machine
+    /// speaker instead — see TranscriptionEngine.identifySegments.)
+    ///
+    func recordEmbedding(segmentId: UUID, embedding: [Float], clusterId: String?) {
         guard isEnabled else { return }
+        retainedEmbeddings[segmentId] = embedding
 
         // Add to cluster running total — always, regardless of
         // manual override state. Keeps the average correct if the
@@ -443,11 +462,7 @@ final class VoiceprintService: ObservableObject {
             addEmbeddingToCluster(clusterId: clusterId, embedding: embedding)
         }
 
-        // Skip auto-identification if this cluster or segment is
-        // manually assigned. Per-segment manual takes precedence
-        // over per-cluster manual — the user explicitly told us
-        // "this one is different."
-        if let existing = segmentIdentifications[segmentId], existing.isManual { return }
+        // Manual cluster assignment is user truth — don't re-match.
         if let clusterId,
            let clusterIdent = identifications[clusterId], clusterIdent.isManual {
             return
@@ -552,26 +567,102 @@ final class VoiceprintService: ObservableObject {
         }
     }
 
-    /// Manually identify a single segment. Used by the per-segment
-    /// "Identify These Segments" context menu — applies to all
-    /// segments in a visible group, which may be a subset of a
-    /// merged cluster.
-    func setManualSegmentIdentification(segmentId: UUID, name: String) {
-        segmentIdentifications[segmentId] = Identification(
-            name: name,
-            confidence: 1.0,
-            isManual: true
-        )
-        // Keep the name accessible in the context menu for the rest of
-        // this session — see sessionSpeakerHistory docstring.
-        sessionSpeakerHistory.insert(name)
+    /// Whether we already hold an embedding for this segment — lets
+    /// the static identification pass skip a second WeSpeaker
+    /// extraction for audio the live pass already processed.
+    func hasRetainedEmbedding(segmentId: UUID) -> Bool {
+        retainedEmbeddings[segmentId] != nil
     }
 
-    /// Remove a per-segment identification, reverting that segment
-    /// to its cluster-level identification (manual cluster reassign,
-    /// or generic cluster ID).
-    func clearSegmentIdentification(segmentId: UUID) {
-        segmentIdentifications.removeValue(forKey: segmentId)
+    /// Re-ground ALL retained evidence on a fresh segment→cluster
+    /// assignment map (the FINAL labels after a whole-file or
+    /// post-finish diarization pass). Wipes per-cluster evidence and
+    /// non-manual identifications, rebuilds sums from retained
+    /// embeddings, then force-matches everything. Manual
+    /// identifications survive untouched — user truth outranks any
+    /// relabeling.
+    func reaggregate(assignments: [UUID: String]) {
+        clusterEmbeddingSums.removeAll()
+        clusterEmbeddingCounts.removeAll()
+        clusterEmbeddingsSinceLastMatch.removeAll()
+        identifications = identifications.filter { $0.value.isManual }
+
+        var used = 0
+        for (segmentId, clusterId) in assignments {
+            guard let emb = retainedEmbeddings[segmentId] else { continue }
+            addEmbeddingToCluster(clusterId: clusterId, embedding: emb)
+            used += 1
+        }
+        forceMatchAllPendingClusters()
+        print("[Voiceprint] Re-aggregated \(used)/\(assignments.count) assignments across \(clusterEmbeddingCounts.count) clusters")
+    }
+
+    /// L2-normalized centroid of a cluster's accumulated evidence, or
+    /// nil if the cluster has none. Same math as `identifyCluster`'s
+    /// matching average — exposed for the engine's consolidation pass
+    /// (centroid-similarity merging).
+    func clusterCentroid(clusterId: String) -> [Float]? {
+        guard let sum = clusterEmbeddingSums[clusterId],
+              let count = clusterEmbeddingCounts[clusterId],
+              count > 0 else { return nil }
+        let scale = 1.0 / Float(count)
+        var average = sum.map { $0 * scale }
+        var normSquared: Float = 0
+        for value in average { normSquared += value * value }
+        let norm = normSquared.squareRoot()
+        guard norm > 0 else { return nil }
+        for i in 0..<average.count { average[i] /= norm }
+        return average
+    }
+
+    /// Number of embeddings credited to a cluster.
+    func clusterEvidenceCount(clusterId: String) -> Int {
+        clusterEmbeddingCounts[clusterId] ?? 0
+    }
+
+    /// The cluster's automatically matched name IF the match clears
+    /// the high-confidence bar — the engine's consolidation pass uses
+    /// agreement between these as merge evidence and disagreement as
+    /// a cannot-merge constraint. Returns nil for manual
+    /// identifications (those are constraints of their own) and for
+    /// low-confidence matches (too weak to merge on).
+    func confidentAutoName(forCluster clusterId: String) -> String? {
+        guard let id = identifications[clusterId],
+              !id.isManual,
+              id.confidence >= highConfidenceThreshold else { return nil }
+        return id.name
+    }
+
+    /// The cluster's manual identification name, if any.
+    func manualName(forCluster clusterId: String) -> String? {
+        guard let id = identifications[clusterId], id.isManual else { return nil }
+        return id.name
+    }
+
+    /// Fold cluster `from`'s evidence into `into` after the engine
+    /// relabels the segments. Sums and counts add; `from`'s
+    /// identification is dropped (the survivor re-derives its own
+    /// from the merged evidence unless manually locked); the survivor
+    /// is force-matched immediately so the merged name lands without
+    /// waiting for new audio.
+    func consolidate(from: String, into: String) {
+        if let fromSum = clusterEmbeddingSums[from] {
+            if var intoSum = clusterEmbeddingSums[into], intoSum.count == fromSum.count {
+                for i in 0..<intoSum.count { intoSum[i] += fromSum[i] }
+                clusterEmbeddingSums[into] = intoSum
+            } else if clusterEmbeddingSums[into] == nil {
+                clusterEmbeddingSums[into] = fromSum
+            }
+            clusterEmbeddingCounts[into, default: 0] += clusterEmbeddingCounts[from] ?? 0
+        }
+        clusterEmbeddingSums.removeValue(forKey: from)
+        clusterEmbeddingCounts.removeValue(forKey: from)
+        clusterEmbeddingsSinceLastMatch.removeValue(forKey: from)
+        identifications.removeValue(forKey: from)
+        if identifications[into]?.isManual != true {
+            clusterEmbeddingsSinceLastMatch[into] = 5
+            identifyCluster(clusterId: into)
+        }
     }
 
     /// Manually assign a speaker to a cluster. Stored as `isManual=true`
@@ -602,69 +693,33 @@ final class VoiceprintService: ObservableObject {
     /// segment identifications since those are session-specific too.
     func resetForNewSession() {
         identifications.removeAll()
-        segmentIdentifications.removeAll()
+        retainedEmbeddings.removeAll()
         sessionSpeakerHistory.removeAll()
         clusterEmbeddingSums.removeAll()
         clusterEmbeddingCounts.removeAll()
         clusterEmbeddingsSinceLastMatch.removeAll()
     }
 
-    /// Look up the display info for a specific segment. The transcript
-    /// pane uses this for badge rendering and group construction.
-    ///
-    /// **Precedence:**
-    ///   1. Segment-level manual identification (most specific user action)
-    ///   2. Cluster-level manual identification (broad user action)
-    ///   3. Segment-level automatic identification (matcher's per-segment guess)
-    ///   4. Cluster ID (fallback — diarizer's raw label)
-    ///
-    /// Note: the engine's `speakerNames[clusterId]` rename takes
-    /// priority above ALL of these — that's applied in the engine's
-    /// `displayName(for:)` method which wraps this one. The precedence
-    /// here only covers cases where there's no manual cluster rename.
-    func displayInfo(forSegmentId segmentId: UUID, clusterId: String?) -> (name: String, isIdentified: Bool, isUncertain: Bool) {
-        // 1 — segment-manual: user tagged just this segment
-        if let seg = segmentIdentifications[segmentId], seg.isManual {
-            return (seg.name, true, false)
-        }
-
-        // 2 — cluster-manual: user tagged the entire cluster
-        if let cluster = clusterId,
-           let clusterIdent = identifications[cluster],
-           clusterIdent.isManual {
-            return (clusterIdent.name, true, false)
-        }
-
-        // 3 — segment-auto: legacy per-segment voiceprint match.
-        // Retained so any old segment-level identifications set
-        // during a session still surface, but the new primary
-        // auto path lands in step 4 (cluster-auto) instead.
-        if let seg = segmentIdentifications[segmentId] {
-            let uncertain = seg.confidence < highConfidenceThreshold
-            return (seg.name, true, uncertain)
-        }
-
-        // 4 — cluster-auto: cluster-level voiceprint match. This is
-        // the primary automatic identification path since the shift
-        // from per-segment to per-cluster identification. Without
-        // this step, cluster identifications from `identifyCluster`
-        // never surface in the UI — the transcript keeps showing
-        // "Speaker 1" even though the cluster has been correctly
-        // matched to Rep. Hal Rogers in `identifications`.
-        if let cluster = clusterId,
-           let clusterIdent = identifications[cluster] {
-            let uncertain = clusterIdent.confidence < highConfidenceThreshold
-            return (clusterIdent.name, true, uncertain)
-        }
-
-        // 5 — cluster ID fallback
-        return (clusterId ?? "Unknown", false, false)
-    }
-
     /// Look up display info using just a cluster ID. Used by callers
     /// that don't have a segment UUID (legacy paths, exports).
     /// Reflects cluster-level identifications only — for per-segment
     /// detail, use `displayInfo(forSegmentId:clusterId:)`.
+    /// All distinct enrolled identity names from the loaded template
+    /// bank (~660 voiceprints from R2), sorted for display. This is
+    /// the catalog the user picks from when manually matching an
+    /// unknown speaker to a stored identity — the speaker-panel
+    /// "match to stored identity" workflow (2026-07-27). Empty until
+    /// the template bank finishes loading.
+    var allTemplateNames: [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        for t in templates where !seen.contains(t.name) {
+            seen.insert(t.name)
+            names.append(t.name)
+        }
+        return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
     func displayInfo(forClusterId clusterId: String) -> (name: String, isIdentified: Bool, isUncertain: Bool) {
         guard let id = identifications[clusterId] else {
             return (clusterId, false, false)

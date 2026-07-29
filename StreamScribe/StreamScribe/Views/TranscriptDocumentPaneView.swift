@@ -26,6 +26,11 @@ struct TranscriptDocumentPaneView: View {
     /// the speaker/pin panels work identically under both renderers.
     @Binding var openRightPanel: ContentView.RightPanel?
 
+    /// Pin-jump navigation: the pins panel's "Show" writes a segment
+    /// ID here; the pane scrolls to it, flashes it, and resets the
+    /// binding. Same contract the classic pane implements.
+    @Binding var scrollToSegmentID: UUID?
+
     /// The model owns the NSTextStorage. Created once per pane
     /// lifetime; State keeps it stable across SwiftUI re-renders.
     @State private var model = TranscriptDocumentModel()
@@ -63,6 +68,9 @@ struct TranscriptDocumentPaneView: View {
     // Identify-sheet state (Phase 4) — mirrors the classic pane's,
     // sharing the same IdentifySpeakerSheet.
     @State private var showIdentifySheet: Bool = false
+    @State private var showEditSheet: Bool = false
+    @State private var editTargetSegmentID: UUID? = nil
+    @State private var editDraftText: String = ""
     @State private var identifyMode: TranscriptIdentifyMode = .cluster
     @State private var identifyClusterID: String? = nil
     @State private var identifySegmentIDs: [UUID] = []
@@ -85,6 +93,24 @@ struct TranscriptDocumentPaneView: View {
                 buildSelectionContextItems: { range in selectionContextItems(for: range) }
             )
         }
+        .sheet(isPresented: $showEditSheet) {
+            SegmentEditSheet(
+                draft: $editDraftText,
+                onSave: {
+                    if let id = editTargetSegmentID {
+                        engine.updateSegmentText(id: id, newText: editDraftText)
+                    }
+                    showEditSheet = false
+                },
+                onDelete: {
+                    if let id = editTargetSegmentID {
+                        engine.deleteSegments(ids: [id])
+                    }
+                    showEditSheet = false
+                },
+                onCancel: { showEditSheet = false }
+            )
+        }
         .sheet(isPresented: $showIdentifySheet) {
             IdentifySpeakerSheet(
                 mode: identifyMode,
@@ -101,11 +127,11 @@ struct TranscriptDocumentPaneView: View {
                             )
                         }
                     case .segments:
-                        for segID in identifySegmentIDs {
-                            VoiceprintService.shared.setManualSegmentIdentification(
-                                segmentId: segID, name: chosenName
-                            )
-                        }
+                        // Unified model: identifying segments splits
+                        // them into a new machine speaker and names
+                        // that cluster — the person always lands in
+                        // the Speakers panel.
+                        engine.identifySegments(Set(identifySegmentIDs), as: chosenName)
                     }
                     showIdentifySheet = false
                 }
@@ -123,7 +149,6 @@ struct TranscriptDocumentPaneView: View {
         }
         .onReceive(engine.$speakerNames) { _ in resync() }
         .onReceive(voiceprints.$identifications) { _ in resync() }
-        .onReceive(voiceprints.$segmentIdentifications) { _ in resync() }
         .onReceive(NotificationCenter.default.publisher(for: .miniplayerTimeUpdate)) { note in
             guard let t = (note.object as? NSNumber)?.doubleValue else { return }
             handlePlayheadTime(t)
@@ -147,6 +172,31 @@ struct TranscriptDocumentPaneView: View {
             }
             resync()
         }
+        .onChange(of: scrollToSegmentID) { _, target in
+            guard let target else { return }
+            defer { scrollToSegmentID = nil }
+            // Resolve the pin's anchor: by segment ID when it still
+            // exists, else by the pin's timestamp (splits and
+            // refinement can retire IDs; the first split piece keeps
+            // the original ID so this mostly hits, but time is the
+            // durable fallback).
+            var range = model.range(ofSegment: target)
+            if range == nil,
+               let pin = engine.pinnedQuotes.first(where: { $0.sourceSegmentID == target }),
+               let seg = engine.segments.first(where: { pin.start >= $0.start && pin.start < $0.end })
+                    ?? engine.segments.first(where: { $0.start >= pin.start }) {
+                range = model.range(ofSegment: seg.id)
+            }
+            guard let r = range else { return }
+            // Jumping is a deliberate navigation — suspend Follow so
+            // the live tail / playhead doesn't yank the view back.
+            if follow {
+                follow = false
+                pendingScrollTask?.cancel()
+            }
+            controller.scroll(to: r, animated: true)
+            controller.flash(range: r)
+        }
         .onChange(of: follow) { _, isOn in
             guard isOn else { return }
             // Re-enable → snap to the playhead's position. Clearing
@@ -164,14 +214,21 @@ struct TranscriptDocumentPaneView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text("Transcript")
+            // Session title replaces the old "Document renderer · beta"
+            // capsule (2026-07-22, user request): the beta badge
+            // outlived its usefulness once this renderer became the
+            // default, and the probed media title is what belongs at
+            // the top of a transcript. Falls back to "Transcript"
+            // before metadata arrives (and for local files without
+            // any).
+            Text({
+                if let title = engine.detectedTitle, !title.isEmpty { return title }
+                return "Transcript"
+            }())
                 .font(.system(size: 14, weight: .semibold))
-            Text("Document renderer · beta")
-                .font(.system(size: 10))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color.accentColor.opacity(0.15)))
-                .foregroundStyle(Color.accentColor)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(engine.detectedTitle ?? "")
             Spacer()
             if let status = actionStatus {
                 Text(status)
@@ -226,6 +283,31 @@ struct TranscriptDocumentPaneView: View {
             }
             .buttonStyle(.borderless)
             .help(openRightPanel == .pins ? "Hide pinned quotes" : "Show pinned quotes")
+
+            Button {
+                controller.showFindBar()
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut("f", modifiers: .command)
+            .help("Find in transcript (⌘F)")
+            .disabled(engine.segments.isEmpty)
+
+            // Manual LLM cleanup — user-triggered so the multi-minute
+            // cost on long transcripts is a choice, not an ambush.
+            Button {
+                engine.startManualTranscriptCleanup()
+            } label: {
+                Image(systemName: engine.isCleanupRunning ? "sparkles.rectangle.stack" : "sparkles")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.borderless)
+            .help(engine.isCleanupRunning
+                  ? "Cleanup running… progress shows in the status area"
+                  : "Clean up transcript with the local LLM (punctuation, fillers, duplicates, names). Verbatim text is preserved; a change report is written afterward.")
+            .disabled(engine.state.isActive || engine.isCleanupRunning || engine.segments.isEmpty)
 
             Button {
                 openWindow(id: WindowID.miniplayer)
@@ -306,11 +388,10 @@ struct TranscriptDocumentPaneView: View {
     }
 
     private func resync() {
-        let majorities = engine.clusterMajorityIdentifications()
         let groups = TranscriptDocumentModel.makeGroups(
             segments: engine.segments,
             nameResolver: { seg in
-                engine.displayName(forSegment: seg, clusterMajorities: majorities)
+                engine.displayName(forSegment: seg)
             }
         )
         model.sync(groups: groups)
@@ -345,7 +426,6 @@ struct TranscriptDocumentPaneView: View {
 
         var segByID: [UUID: TranscriptSegment] = [:]
         for seg in engine.segments { segByID[seg.id] = seg }
-        let majorities = engine.clusterMajorityIdentifications()
 
         struct QuoteBlock {
             var name: String
@@ -355,7 +435,7 @@ struct TranscriptDocumentPaneView: View {
         var blocks: [QuoteBlock] = []
         for slice in slices {
             guard let seg = segByID[slice.id] else { continue }
-            let name = engine.displayName(forSegment: seg, clusterMajorities: majorities)
+            let name = engine.displayName(forSegment: seg)
                 ?? seg.speaker ?? "Speaker"
             if var last = blocks.last, last.name == name {
                 last.texts.append(slice.text)
@@ -464,6 +544,20 @@ struct TranscriptDocumentPaneView: View {
             engine.pinGroup(pinGroup)
         })
 
+        // Edit Text — targets the exact segment under the click
+        // (falls back to the group's first segment when the click
+        // landed on the header rather than body text). Corrections
+        // are best made here, next to the miniplayer, rather than
+        // after export.
+        let clickedSegID = model.segmentID(at: characterIndex) ?? groupSegments.first?.id
+        if let segID = clickedSegID, let seg = segByID[segID] {
+            items.append(HandlerMenuItem(title: "Edit Text…") {
+                editTargetSegmentID = segID
+                editDraftText = seg.text
+                showEditSheet = true
+            })
+        }
+
         // Identify actions require templates + a cluster identity.
         let voiceprints = VoiceprintService.shared
         if let clusterId, !voiceprints.templates.isEmpty {
@@ -566,6 +660,32 @@ struct TranscriptDocumentPaneView: View {
             })
         }
 
+        // Delete Selected Text — the DEFAULT delete (2026-07-22 UX
+        // feedback: segment boundaries are invisible to users; partial
+        // deletion is the common case). Removes exactly the selected
+        // words via the same slice machinery as reassignment;
+        // immediate, like saving an edit. Whole-segment removal stays
+        // available as the explicit secondary action below, with its
+        // confirmation (larger blast radius, no undo).
+        if !selectedSegments.isEmpty {
+            items.append(HandlerMenuItem(title: "Delete Selected Text") {
+                engine.deleteSelectedText(splittingSlices)
+            })
+
+            let deleteIDs = Set(selectedSegments.map(\.id))
+            items.append(HandlerMenuItem(title: "Delete \(deleteIDs.count) Entire Segment\(deleteIDs.count == 1 ? "" : "s")…") {
+                let alert = NSAlert()
+                alert.messageText = "Delete \(deleteIDs.count) entire segment\(deleteIDs.count == 1 ? "" : "s")?"
+                alert.informativeText = "Every segment the selection touches will be removed in full — including text outside the selection. This cannot be undone."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Delete")
+                alert.addButton(withTitle: "Cancel")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    engine.deleteSegments(ids: deleteIDs)
+                }
+            })
+        }
+
         let submenu = NSMenu()
         for label in machineSpeakers {
             let displayName = engine.displayName(for: label) ?? label
@@ -584,6 +704,18 @@ struct TranscriptDocumentPaneView: View {
             }
             submenu.addItem(item)
         }
+
+        // New Speaker — the recovery path for a diarizer that merged
+        // two people into one cluster: no existing label is correct
+        // for the selection, so mint a fresh one and move the text
+        // there. The new label appears immediately as its own group;
+        // right-click it to identify or rename like any speaker.
+        submenu.addItem(.separator())
+        submenu.addItem(HandlerMenuItem(title: "New Speaker") {
+            let fresh = engine.nextUnusedMachineLabel
+            print("[DocRenderer] Reassign action: \(splittingSlices.count) slice(s) → NEW label \(fresh); current labels: \(currentLabels.sorted())")
+            engine.reassignSpeaker(splittingSlices: splittingSlices, to: fresh)
+        })
 
         let parent = NSMenuItem(
             title: "Reassign Selection To",
@@ -664,6 +796,60 @@ final class DocumentPlayheadController {
         guard let lm = textView?.layoutManager, let old = highlightedRange else { return }
         lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: old)
         highlightedRange = nil
+    }
+
+    /// Show the NSTextView find bar (⌘F). `usesFindBar` was enabled
+    /// at construction; this triggers it explicitly — SwiftUI's
+    /// default Edit menu carries no Find item to route through the
+    /// responder chain, so the pane's search button (and its ⌘F
+    /// shortcut) drive it directly.
+    func showFindBar() {
+        guard let tv = textView else { return }
+        tv.window?.makeFirstResponder(tv)
+        let sender = NSMenuItem()
+        sender.tag = NSTextFinder.Action.showFindInterface.rawValue
+        tv.performTextFinderAction(sender)
+    }
+
+    /// Attention flash for pin-jump navigation: a brief orange
+    /// emphasis on the target range that fades after ~1.6s. Separate
+    /// bookkeeping from the playhead highlight — the two coexist
+    /// (jumping to a pin while something is playing must not eat the
+    /// playhead's highlight when the flash clears).
+    private var flashRange: NSRange? = nil
+    private var flashClearTask: Task<Void, Never>? = nil
+
+    func flash(range: NSRange) {
+        guard let lm = textView?.layoutManager,
+              let storageLength = textView?.textStorage?.length,
+              NSMaxRange(range) <= storageLength else { return }
+        // Clear any previous flash first (rapid double-jumps).
+        if let old = flashRange, old != highlightedRange {
+            lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: old)
+        }
+        lm.addTemporaryAttribute(
+            .backgroundColor,
+            value: NSColor.systemOrange.withAlphaComponent(0.35),
+            forCharacterRange: range
+        )
+        flashRange = range
+        flashClearTask?.cancel()
+        flashClearTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            guard !Task.isCancelled, let self, let r = self.flashRange else { return }
+            self.textView?.layoutManager?
+                .removeTemporaryAttribute(.backgroundColor, forCharacterRange: r)
+            self.flashRange = nil
+            // If the flash covered the playhead's segment, restore
+            // its highlight rather than leaving it bare.
+            if let playing = self.highlightedRange, NSIntersectionRange(playing, r).length > 0 {
+                self.textView?.layoutManager?.addTemporaryAttribute(
+                    .backgroundColor,
+                    value: NSColor.controlAccentColor.withAlphaComponent(0.28),
+                    forCharacterRange: playing
+                )
+            }
+        }
     }
 
     /// Scroll so `range` sits in the upper third of the viewport —
@@ -985,5 +1171,44 @@ private final class BadgeLayoutManager: NSLayoutManager {
             capsule.lineWidth = 0.5
             capsule.stroke()
         }
+    }
+}
+
+/// Modal editor for one segment's text (2026-07-21 transcript-editing
+/// feature). Deliberately segment-scoped rather than free-form inline
+/// editing: the document renderer's range bookkeeping (badges, seek
+/// hit-testing, selection slicing) assumes render-owned text, and a
+/// modal keeps the mutation atomic through the engine API where the
+/// userEdited protections apply.
+private struct SegmentEditSheet: View {
+    @Binding var draft: String
+    let onSave: () -> Void
+    let onDelete: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Edit Segment Text")
+                .font(.headline)
+            TextEditor(text: $draft)
+                .font(.system(size: 13))
+                .frame(minWidth: 420, minHeight: 140)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+            Text("The original transcription is preserved verbatim behind the scenes. Edited segments are protected from refinement and cleanup overwrites. Saving empty text deletes the segment.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Delete Segment", role: .destructive, action: onDelete)
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Save", action: onSave)
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
     }
 }

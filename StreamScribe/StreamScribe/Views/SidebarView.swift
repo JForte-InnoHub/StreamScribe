@@ -304,13 +304,21 @@ struct SidebarView: View {
     /// **Visibility rules:**
     ///   - URL field must be non-empty
     ///   - Must look like a URL (contain `://`), not a local file path
-    ///   - Source can't be `.hls` — bare HLS streams are usually live
-    ///     and would never terminate. Everything else (yt-dlp sources,
-    ///     direct audio, etc.) MIGHT be a live stream (YouTube can be
-    ///     either), but the vast majority aren't. If a user tries to
-    ///     download an active livestream, yt-dlp will error out with a
-    ///     clear message — acceptable failure mode vs. hiding the
-    ///     button entirely.
+    ///   - `.hls` is shown ONLY once the probe has confirmed the
+    ///     stream is static/VOD (2026-07-29): a finite HLS playlist
+    ///     (PLAYLIST-TYPE:VOD/EVENT, #EXT-X-ENDLIST) downloads fine —
+    ///     yt-dlp/ffmpeg concatenate its segments into one file — so
+    ///     hiding the button for ALL HLS was wrong. We gate on the
+    ///     probe's own liveness verdict (`engine.probeStatus`), the
+    ///     same signal the mode chip uses, rather than the source-type
+    ///     guess. Before the probe lands, HLS stays hidden (we can't
+    ///     yet tell live from VOD); a true livestream stays hidden
+    ///     because the probe reports `.live`.
+    ///   - Everything else (yt-dlp sources, direct audio/video) MIGHT
+    ///     be a live stream (YouTube can be either), but the vast
+    ///     majority aren't. If a user tries to download an active
+    ///     livestream, yt-dlp errors out with a clear message —
+    ///     acceptable vs. hiding the button entirely.
     ///
     /// The status text is intentionally NOT a gate here — we want the
     /// button to remain visible during a download so users see why
@@ -322,9 +330,13 @@ struct SidebarView: View {
         let source = liveDetectedSource
         // Local files are already on disk, no download needed.
         if source == .localFile { return false }
-        // Bare HLS streams are typically live — hide button to avoid
-        // encouraging a download that would never finish.
-        if source == .hls { return false }
+        // HLS: only offer download once the probe confirms it's finite
+        // (static/VOD). A live HLS would never terminate; an unprobed
+        // one is ambiguous — both stay hidden.
+        if source == .hls {
+            if case .finite = engine.probeStatus { return true }
+            return false
+        }
         return true
     }
 
@@ -597,6 +609,12 @@ struct SidebarView: View {
             // See the @AppStorage doc comment above for why this lives
             // in UserDefaults rather than as in-memory state.
             .onChange(of: engine.transcriptionEngine) { _, newValue in
+                // Per-mode auto-selection also lands here — it must
+                // neither pin the engine nor fire the autopair
+                // (auto-picking Parakeet for a live session must not
+                // silently switch the diarizer away from the user's
+                // FluidAudio default).
+                guard !engine.consumeAutoEngineChangeFlag() else { return }
                 guard newValue == .parakeet,
                       !parakeetSortformerAutopairFired else { return }
                 engine.diarizationEngine = .sortformer
@@ -615,11 +633,14 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
 
                 switch engine.transcriptionEngine {
-                case .parakeetEOU:
-                    // Single-model engine — no picker. The 120M EOU
-                    // model downloads automatically via FluidAudio's
-                    // hub on first session start.
-                    Text("Parakeet EOU 120M — single streaming model, downloaded automatically on first use. English only, no punctuation; pair with a refined-pass model for polished text.")
+                case .canary:
+                    modelStatusRow(
+                        key: .canary,
+                        downloadAction: {
+                            Task { await modelDownloadManager.downloadCanaryModel() }
+                        }
+                    )
+                    Text("Canary 1B v2 — single CoreML model (int4, ~573MB from the R2 mirror). The accuracy pick: attention encoder-decoder, multilingual, punctuated output.")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -954,6 +975,14 @@ struct SidebarView: View {
             .disabled(!postFinishRediarizeControlsEnabled)
             .opacity(postFinishRediarizeControlsEnabled ? 1.0 : 0.5)
 
+            // Expected speaker count — feeds the post-diarization
+            // consolidation pass (see TranscriptionEngine
+            // .consolidateClusters). Self-contained subview so it owns
+            // its AppStorage binding.
+            ExpectedSpeakersRow()
+
+            AudioNormalizationRow()
+
             // Timing knobs. Only meaningful when refinement is on AND we're
             // in Live mode; double-gate the disable so they don't suggest
             // applicability they don't have. Sliders rather than text inputs
@@ -1017,14 +1046,10 @@ struct SidebarView: View {
                 .foregroundStyle(.secondary)
 
             switch engine.refinedTranscriptionEngine {
-            case .parakeetEOU:
-                // EOU on the refined slot is architecturally wrong —
-                // it's a stateful streaming model, and refinement
-                // re-transcribes windows out of stream order. Steer
-                // users away rather than hard-blocking.
-                Text("Parakeet EOU is streaming-only and not suitable as a refined-pass model. Choose WhisperKit or Parakeet (MLX) here instead.")
+            case .canary:
+                Text("Canary 1B v2 — single model, no picker. A strong refined-pass choice: highest accuracy in the stack, and the refined pass is where accuracy pays.")
                     .font(.system(size: 10))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             case .whisperKit:
                 Group {
@@ -1652,6 +1677,52 @@ struct SidebarView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
+
+            // YouTube player-client override. yt-dlp's own client
+            // selection (tv-family when cookies are present) is NOT
+            // covered by the bgutil WebPO token provider, which means
+            // flagged clients get fragment starvation. Default
+            // web_safari; the field exists so the user can rotate
+            // clients when YouTube flags the current one — without a
+            // rebuild. Free-form text (unlike the cert file picker)
+            // because valid values are yt-dlp client names and
+            // comma-lists, not filesystem paths.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "play.rectangle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 16)
+                    Text("YouTube player client")
+                        .font(.system(size: 11))
+                    TextField(ToolManager.youtubePlayerClientDefault, text: $toolManager.youtubePlayerClient)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .font(.system(size: 11, design: .monospaced))
+                    if toolManager.youtubePlayerClient != ToolManager.youtubePlayerClientDefault {
+                        Button {
+                            toolManager.youtubePlayerClient = ToolManager.youtubePlayerClientDefault
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward.circle.fill")
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reset to \(ToolManager.youtubePlayerClientDefault)")
+                    }
+                }
+                Text("Passed to yt-dlp as youtube:player_client. Web-family clients (web_safari, web) work with the PO-token provider; tv clients don't. If YouTube flags the current client (\"Read timed out\" loops, missing formats), switch to another web client here. Empty = yt-dlp default.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Proxy for all yt-dlp traffic. The in-app remedy for
+            // IP-level bot walls (see AudioStreamExtractor's
+            // handleBotWall): when YouTube interstitials this
+            // machine's address, only a different network path gets
+            // through.
+            ProxyURLRow()
+            ProxyFallbacksRow()
 
             // Custom yt-dlp binary path. The bundled yt-dlp ships as a
             // PyInstaller bundle which ignores SSL_CERT_FILE entirely
@@ -2364,6 +2435,7 @@ struct SidebarView: View {
         case .granicus:     return "building.2.fill"
         case .hls:          return "antenna.radiowaves.left.and.right"
         case .directAudio:  return "waveform"
+        case .directVideo:  return "film"
         case .localFile:    return "doc.fill"
         case .unknown:      return "questionmark.circle"
         }
@@ -2568,6 +2640,126 @@ private struct FlowLayout: Layout {
             )
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+/// "Expected speakers" setting row. A hearing has a known roster —
+/// telling the pipeline how many distinct voices to expect lets the
+/// post-diarization consolidation pass merge over-splits down to
+/// reality (never below the centroid-similarity floor, and never
+/// across conflicting identities). 0 or empty = unconstrained.
+private struct ExpectedSpeakersRow: View {
+    @AppStorage(TranscriptionEngine.expectedSpeakerCountDefaultsKey)
+    private var expectedSpeakers: Int = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.2")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 16)
+                Text("Expected speakers")
+                    .font(.system(size: 11))
+                Spacer()
+                TextField("auto", value: $expectedSpeakers, format: .number)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .font(.system(size: 11, design: .monospaced))
+                    .frame(width: 52)
+                    .multilineTextAlignment(.trailing)
+                Stepper("", value: $expectedSpeakers, in: 0...99)
+                    .labelsHidden()
+                    .controlSize(.mini)
+            }
+            Text("How many distinct voices this session should contain (e.g. members + witnesses on a hearing roster). Used after diarization to merge over-split speakers. 0 = no constraint.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// yt-dlp proxy setting row. Routes every yt-dlp invocation (probe,
+/// stream pipe, downloads, video cache) through `--proxy` when set.
+/// Accepts http(s)://, socks5://, socks5h:// URLs. Empty = direct.
+private struct ProxyFallbacksRow: View {
+    @AppStorage(ToolManager.proxyFallbacksDefaultsKey)
+    private var proxyFallbacks: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Fallback proxies")
+                .font(.system(size: 11, weight: .semibold))
+            TextEditor(text: $proxyFallbacks)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(height: 56)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+            Text("One proxy URL per line (http://user:pass@host:port). When YouTube blocks the current IP — bot wall, or 403s surviving every client escalation — the session automatically retries through the next proxy here, and stays on a working one. Credentials are never logged. Empty disables rotation.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct ProxyURLRow: View {
+    @AppStorage(ToolManager.proxyURLDefaultsKey)
+    private var proxyURL: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "network.badge.shield.half.filled")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 16)
+                Text("Proxy")
+                    .font(.system(size: 11))
+                TextField("none (direct)", text: $proxyURL)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .font(.system(size: 11, design: .monospaced))
+                if !proxyURL.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Button {
+                        proxyURL = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear (direct connection)")
+                }
+            }
+            Text("Routes all yt-dlp traffic through a proxy (http://, socks5://, socks5h://). Use when YouTube blocks this network with its \"confirm you're not a bot\" wall — the block is per-IP, so a different network path is the only way through it.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// Opt-in input loudness normalization for the transcription PCM path.
+/// See AudioStreamExtractor's dynaudnorm comment for rationale (hot
+/// broadcast masters trigger Whisper's all-caps collapse).
+private struct AudioNormalizationRow: View {
+    @AppStorage("extractor.audioNormalizationEnabled")
+    private var normalizationEnabled: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: $normalizationEnabled) {
+                Text("Normalize input loudness")
+                    .font(.system(size: 11))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            Text("Evens out hot, heavily compressed broadcast audio (e.g. cable news) before transcription. Reduces Whisper's tendency to emit ALL-CAPS caption-style text on such sources. Applies from the next session start.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

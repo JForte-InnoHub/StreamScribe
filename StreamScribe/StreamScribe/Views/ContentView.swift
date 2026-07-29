@@ -6,7 +6,10 @@ struct ContentView: View {
     @EnvironmentObject var engine: TranscriptionEngine
     @State private var urlInput: String = ""
     @State private var showExportSheet: Bool = false
-    @State private var exportFormat: TranscriptFormat = .rtf
+    // Default export format is Word (2026-07-22, user decision): the
+    // team's workflow exports directly to .docx; RTF remains available
+    // in the picker.
+    @State private var exportFormat: TranscriptFormat = .docx
 
     // Export formatting preferences. Read from UserDefaults via @AppStorage,
     // populated by the Settings window. Defaults match the historical export
@@ -72,9 +75,10 @@ struct ContentView: View {
 
             if useDocumentRenderer {
                 // Document renderer (default since Phase 4).
-                // scrollToSegmentID plumbing (pin-jump navigation)
-                // remains classic-pane-only — known follow-up.
-                TranscriptDocumentPaneView(openRightPanel: $openRightPanel)
+                TranscriptDocumentPaneView(
+                    openRightPanel: $openRightPanel,
+                    scrollToSegmentID: $scrollToSegmentID
+                )
                     .frame(minWidth: 480)
             } else {
                 TranscriptPaneView(
@@ -238,25 +242,13 @@ struct ContentView: View {
     /// because segments with different identified names now have
     /// different speaker fields.
     private func segmentsForExport(engine: TranscriptionEngine) -> [TranscriptSegment] {
-        // Compute cluster majorities once so the per-segment loop
-        // below is O(N), not O(N²). Without this, every displayName
-        // call would re-walk segments to determine its cluster's
-        // majority.
-        let majorities = engine.clusterMajorityIdentifications()
-
         return engine.segments.map { seg -> TranscriptSegment in
             var copy = seg
-            // `displayName(forSegment:clusterMajorities:)` returns the
-            // effective name already factoring in voiceprint
-            // identifications + manual cluster reassignments +
-            // per-segment overrides + cluster majority smoothing.
-            // For unidentified speakers with no cluster majority it
-            // returns the cluster ID unchanged, so this is a safe
-            // transformation in all cases.
-            if let resolved = engine.displayName(
-                forSegment: seg,
-                clusterMajorities: majorities
-            ) {
+            // Unified resolution: rename → cluster voiceprint ID →
+            // machine label. Returns the cluster ID unchanged for
+            // unidentified speakers, so this is a safe transformation
+            // in all cases.
+            if let resolved = engine.displayName(forSegment: seg) {
                 copy.speaker = resolved
             }
             return copy

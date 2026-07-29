@@ -67,6 +67,7 @@ final class ModelDownloadManager: ObservableObject {
         case sortformer
         case speakerKit
         case fluidAudio
+        case canary
 
         /// Short identifier for log lines. Avoids dumping a full repo path
         /// into every status print.
@@ -76,6 +77,7 @@ final class ModelDownloadManager: ObservableObject {
             case .parakeet(let r): return "parakeet:\(r)"
             case .sortformer:      return "sortformer"
             case .speakerKit:      return "speakerKit"
+            case .canary:          return "canary"
             case .fluidAudio:      return "fluidAudio"
             }
         }
@@ -288,6 +290,8 @@ final class ModelDownloadManager: ObservableObject {
             cached = SpeakerKitBackend.isModelCached()
         case .fluidAudio:
             cached = FluidAudioBackend.isModelCached()
+        case .canary:
+            cached = CanaryBackend.isModelCached()
         }
         print("[ModelDownload] Probe \(key.logTag): \(cached ? "cached" : "not on disk")")
         return cached
@@ -466,6 +470,14 @@ final class ModelDownloadManager: ObservableObject {
         await runDownload(key: key) {
             let backend = ParakeetBackend(modelRepo: repo, chunkDuration: 5.0)
             try await backend.prepare()
+        }
+    }
+
+    /// Manual Canary bundle download (R2 tarball) — download and
+    /// load testable separately, like the other models.
+    func downloadCanaryModel() async {
+        await runDownload(key: .canary) {
+            try await CanaryBackend.downloadModels()
         }
     }
 
@@ -698,7 +710,30 @@ final class ModelDownloadManager: ObservableObject {
                 // both downloading and loading.
                 await markLoading(key)
                 print("[ModelDownload] \(key.logTag): mirror download succeeded, loading weights into memory…")
-                try await work()
+                // OFFLINE LOAD (2026-07-27): the bytes are already on
+                // disk from the R2 tarball, but the backends' prepare()
+                // (WhisperKit's model load, MLX's Parakeet loader) will
+                // otherwise reach back to HuggingFace to re-validate
+                // and fetch small sidecar files (e.g. weight.bin,
+                // config hashes). On a machine that can reach HF that's
+                // invisible; on a Netskope fleet machine those fetches
+                // STALL, prepare() throws, and — the bug in gabrams's
+                // 2026-07-27 log — the throw was caught as "R2 mirror
+                // failed" and dragged the whole flow into a doomed HF
+                // fallback, wasting ~5 min per model and ultimately
+                // reporting "Model not found" for a model that was
+                // fully downloaded and extracted. HF_HUB_OFFLINE forces
+                // the loader to trust the extracted snapshot. Scoped:
+                // set before prepare(), cleared after (success OR
+                // throw), so the no-mirror HF path below still works.
+                setenv("HF_HUB_OFFLINE", "1", 1)
+                do {
+                    try await work()
+                    unsetenv("HF_HUB_OFFLINE")
+                } catch {
+                    unsetenv("HF_HUB_OFFLINE")
+                    throw error
+                }
                 ticker.cancel()
                 let total = Date().timeIntervalSince(startedAt)
                 print(String(format: "[ModelDownload] %@: complete via R2 mirror in %.2fs", key.logTag, total))
@@ -841,7 +876,12 @@ final class ModelDownloadManager: ObservableObject {
     /// HF identifier with a `.tar.gz` suffix (e.g.
     /// `openai_whisper-small.en.tar.gz`,
     /// `diar_streaming_sortformer_4spk-v2.1-fp16.tar.gz`).
-    private static let mirrorBaseURL = "https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/"
+    /// Canonical R2 mirror base. Internal (not private): the
+    /// FluidAudio-family backends default ModelRegistry.baseURL to
+    /// this, so ALL model downloads route to R2 unless a custom
+    /// mirror is set — fleet machines have no HuggingFace access,
+    /// so HF-as-default was a latent failure.
+    static let mirrorBaseURL = "https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/"
 
     /// Debug-menu override: when true, every model download skips the
     /// HuggingFace primary path and goes straight to the R2 mirror.
@@ -922,6 +962,11 @@ final class ModelDownloadManager: ObservableObject {
         let hfRoot = modelsRoot.appendingPathComponent("huggingface")
 
         switch key {
+        case .canary:
+            // Canary's tarball download lives in CanaryBackend
+            // (ensureModelBundle) — the generic mirror extractor
+            // isn't used, so no mirror entry here.
+            return nil
         case .whisper(let modelName):
             return ModelMirror(
                 url: base.appendingPathComponent("\(modelName).tar.gz"),

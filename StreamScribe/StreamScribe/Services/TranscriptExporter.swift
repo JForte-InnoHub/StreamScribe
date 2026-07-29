@@ -301,7 +301,9 @@ enum TranscriptExporter {
 
             parts.append(block)
         }
-        return parts.joined(separator: "\n\n") + "\n"
+        // Press-convention end mark. Plain text has no centering;
+        // the bare "###" line carries the same meaning.
+        return parts.joined(separator: "\n\n") + "\n\n###\n"
     }
 
     private static func renderMarkdown(_ segs: [TranscriptSegment], sourceURL: String?,
@@ -395,6 +397,11 @@ enum TranscriptExporter {
                 out += "\(prefix)\(group.combinedText)\n\n"
             }
         }
+        // Press-convention end mark. Bare ### would render as a
+        // heading in markdown, so use the HTML centered form (GFM and
+        // pandoc both honor it; readers that strip HTML still show the
+        // literal ###).
+        out += "<div align=\"center\">###</div>\n"
         return out
     }
 
@@ -426,7 +433,16 @@ enum TranscriptExporter {
         var out = "{\\rtf1\\ansi\\ansicpg1252\\deflang1033"
         out += "{\\fonttbl{\\f0\\fswiss Helvetica;}}"
         out += "{\\colortbl;\\red102\\green102\\blue102;}"  // color 1 = mid-grey for timestamps
-        out += "\\f0\\fs22 "  // default body: 11pt Helvetica
+        // \sa0\sb0: explicit ZERO space-after/space-before on
+        // paragraphs (2026-07-22). RTF without paragraph-spacing
+        // directives inherits the READER's defaults — Word's Normal
+        // style adds ~8pt space after every paragraph, which the
+        // user's team then strips by hand from every export. Declaring
+        // it zero makes paragraph separation come exclusively from the
+        // transcript's own explicit blank lines (\par\par), identical
+        // in every reader. Paragraph properties persist across \par
+        // (we never issue \pard), so once here covers the document.
+        out += "\\f0\\fs22\\sa0\\sb0 "  // default body: 11pt Helvetica, no para spacing
 
         // Title — conditional on `options.includeTitle`. Kept at \fs36 (18pt)
         // when shown; the title is the one place we deliberately use a
@@ -567,10 +583,69 @@ enum TranscriptExporter {
             }
         }
 
+        // Press-convention end mark (2026-07-22): centered "###" as
+        // the final paragraph — the standard signal that the document
+        // ends here and nothing was truncated. Group-scoped so \qc
+        // can't leak into anything appended later.
+        out += "{\\qc ###\\par}"
+
         // Close document. The trailing `\n` after `}` is convention; some readers
         // are picky about a missing newline at EOF.
         out += "}\n"
         return out
+    }
+
+    /// Inject `<w:spacing w:before="0" w:after="0"/>` into every
+    /// paragraph of a .docx produced by Foundation's OOXML writer.
+    /// See the call site for why this exists. Mechanics: a .docx is a
+    /// ZIP; unpack to a temp dir with /usr/bin/unzip, string-patch
+    /// word/document.xml (the writer's output is structurally uniform
+    /// — every <w:p> carries a <w:pPr>, so inserting immediately
+    /// after the open tag is schema-safe: w:spacing precedes w:ind
+    /// and w:jc in the CT_PPr sequence), rezip with /usr/bin/zip -X.
+    /// Returns nil on any failure so the caller falls back to the
+    /// unpatched (functional, just Word-default-spaced) document —
+    /// this must never be the reason an export fails.
+    private static func postProcessDocxParagraphSpacing(_ data: Data) -> Data? {
+        let fm = FileManager.default
+        let workDir = fm.temporaryDirectory
+            .appendingPathComponent("ss-docx-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: workDir) }
+        let zipPath = workDir.appendingPathComponent("in.docx")
+        let unpackDir = workDir.appendingPathComponent("pkg", isDirectory: true)
+        do {
+            try fm.createDirectory(at: unpackDir, withIntermediateDirectories: true)
+            try data.write(to: zipPath)
+        } catch { return nil }
+
+        func run(_ launchPath: String, _ args: [String], cwd: URL) -> Bool {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: launchPath)
+            proc.arguments = args
+            proc.currentDirectoryURL = cwd
+            proc.standardOutput = Pipe(); proc.standardError = Pipe()
+            do { try proc.run() } catch { return false }
+            proc.waitUntilExit()
+            return proc.terminationStatus == 0
+        }
+
+        guard run("/usr/bin/unzip", ["-o", "-q", zipPath.path, "-d", unpackDir.path], cwd: workDir) else { return nil }
+        let docXMLURL = unpackDir.appendingPathComponent("word/document.xml")
+        guard var xml = try? String(contentsOf: docXMLURL, encoding: .utf8) else { return nil }
+        let spacing = "<w:spacing w:before=\"0\" w:after=\"0\"/>"
+        guard !xml.contains("<w:spacing") else { return data }  // future writer emits its own — leave alone
+        xml = xml.replacingOccurrences(of: "<w:pPr>", with: "<w:pPr>" + spacing)
+        xml = xml.replacingOccurrences(of: "<w:pPr/>", with: "<w:pPr>" + spacing + "</w:pPr>")
+        guard (try? xml.write(to: docXMLURL, atomically: true, encoding: .utf8)) != nil else { return nil }
+
+        let outZip = workDir.appendingPathComponent("out.docx")
+        // -X strips extra file attributes; recurse the package root so
+        // [Content_Types].xml and _rels land at the archive root as
+        // the OPC spec requires.
+        guard run("/usr/bin/zip", ["-X", "-q", "-r", outZip.path, "."], cwd: unpackDir) else { return nil }
+        guard let patched = try? Data(contentsOf: outZip), !patched.isEmpty else { return nil }
+        print("[Export] docx paragraph spacing normalized (\(xml.components(separatedBy: "<w:spacing").count - 1) paragraphs).")
+        return patched
     }
 
     /// Escape a string for embedding inside RTF body text. Handles:
@@ -721,6 +796,10 @@ enum TranscriptExporter {
         let inlineParaStyle = NSMutableParagraphStyle()
         inlineParaStyle.firstLineHeadIndent = 0
         inlineParaStyle.headIndent = hangingIndent
+        // Explicit zero paragraph spacing — see baseParaStyle below.
+        inlineParaStyle.paragraphSpacing = 0
+        inlineParaStyle.paragraphSpacingBefore = 0
+
 
         for group in groups {
             let nameOpt = displayName(group.speaker, speakerNames)
@@ -782,6 +861,17 @@ enum TranscriptExporter {
             }
         }
 
+        // Press-convention end mark, matching the RTF/plain/markdown
+        // exports: centered "###" as the final paragraph.
+        let endMarkStyle = NSMutableParagraphStyle()
+        endMarkStyle.alignment = .center
+        endMarkStyle.paragraphSpacing = 0
+        endMarkStyle.paragraphSpacingBefore = 0
+        result.append(NSAttributedString(string: "###\n", attributes: [
+            .font: bodyFont,
+            .paragraphStyle: endMarkStyle,
+        ]))
+
         // Hand off to Foundation's Office Open XML writer. The
         // `documentType` key tells it which container format to produce;
         // the rest of the attributes dictionary is left default so the
@@ -794,7 +884,22 @@ enum TranscriptExporter {
             .documentType: NSAttributedString.DocumentType.officeOpenXML
         ]
         do {
-            return try result.data(from: range, documentAttributes: docAttrs)
+            let raw = try result.data(from: range, documentAttributes: docAttrs)
+            // WORD SPACING (2026-07-22, verified against a field-
+            // exported package): Foundation's OOXML writer emits an
+            // EMPTY <w:pPr> for every paragraph and silently omits
+            // zero-valued paragraph spacing — attaching a zero-spacing
+            // NSParagraphStyle produces no <w:spacing> element at all
+            // (confirmed: 51 paragraphs, zero spacing elements), so
+            // Word falls through to its built-in Normal default of
+            // ~8pt space-after. No styles.xml is emitted either, so
+            // there is no style sheet to override. The only
+            // deterministic channel is the package itself:
+            // post-process the .docx ZIP and inject explicit zero
+            // spacing into every paragraph's properties. Alignment
+            // (w:jc) DOES survive the writer, which is why the
+            // centered ### needs no such treatment.
+            return postProcessDocxParagraphSpacing(raw) ?? raw
         } catch {
             print("[Export] DOCX serialization failed: \(error.localizedDescription)")
             return nil
