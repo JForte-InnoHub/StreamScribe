@@ -103,6 +103,7 @@ private struct SpeakerRow: View {
     @EnvironmentObject var engine: TranscriptionEngine
     @ObservedObject private var voiceprints = VoiceprintService.shared
     let machineLabel: String
+    @State private var showIdentifySheet = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -173,52 +174,44 @@ private struct SpeakerRow: View {
     /// identity" removes a manual/auto ID and falls back to the
     /// machine label. When the template bank hasn't loaded and no
     /// session speakers exist yet, the menu still offers Clear.
+    /// Opens the SAME searchable identity sheet the transcript's
+    /// "Choose Speaker" flow uses (2026-07-29, user request: the
+    /// stored-template catalog is far too large to scroll — the
+    /// original Menu here was unusable at ~660 names). Literal reuse
+    /// of IdentifySpeakerSheet: categorized sections, live search,
+    /// Enter confirms the first match, checkmark on the current
+    /// identity. Every pick still identifies the whole CLUSTER via
+    /// setManualIdentification. "Clear identity" (which the sheet
+    /// doesn't carry) lives on this button's right-click menu.
     private var identityMenu: some View {
-        Menu {
-            let sessionNames = voiceprints.sessionSpeakerHistory.sorted {
-                $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
-            }
-            let catalog = voiceprints.allTemplateNames
-            let currentInfo = voiceprints.displayInfo(forClusterId: machineLabel)
-
-            if !sessionNames.isEmpty {
-                Section("This session") {
-                    ForEach(sessionNames, id: \.self) { name in
-                        identityButton(name, current: currentInfo.isIdentified && currentInfo.name == name)
-                    }
-                }
-            }
-            if !catalog.isEmpty {
-                Section("Stored identities") {
-                    ForEach(catalog, id: \.self) { name in
-                        identityButton(name, current: currentInfo.isIdentified && currentInfo.name == name)
-                    }
-                }
-            }
-            if currentInfo.isIdentified {
-                Divider()
-                Button("Clear identity", role: .destructive) {
-                    voiceprints.clearIdentification(clusterId: machineLabel)
-                }
-            }
-            if sessionNames.isEmpty && catalog.isEmpty {
-                Text("Identity list still loading…")
-            }
+        Button {
+            showIdentifySheet = true
         } label: {
             Image(systemName: "person.crop.circle.badge.questionmark")
                 .font(.system(size: 12))
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
+        .buttonStyle(.plain)
         .help("Match this speaker to a stored identity")
-    }
-
-    private func identityButton(_ name: String, current: Bool) -> some View {
-        Button {
-            voiceprints.setManualIdentification(clusterId: machineLabel, name: name)
-        } label: {
-            if current { Label(name, systemImage: "checkmark") } else { Text(name) }
+        .contextMenu {
+            if voiceprints.displayInfo(forClusterId: machineLabel).isIdentified {
+                Button("Clear identity", role: .destructive) {
+                    voiceprints.clearIdentification(clusterId: machineLabel)
+                }
+            }
+        }
+        .sheet(isPresented: $showIdentifySheet) {
+            let info = voiceprints.displayInfo(forClusterId: machineLabel)
+            IdentifySpeakerSheet(
+                mode: .cluster,
+                clusterID: machineLabel,
+                segmentIDs: [],
+                currentName: info.isIdentified ? info.name : nil,
+                onCancel: { showIdentifySheet = false },
+                onConfirm: { name in
+                    voiceprints.setManualIdentification(clusterId: machineLabel, name: name)
+                    showIdentifySheet = false
+                }
+            )
         }
     }
 

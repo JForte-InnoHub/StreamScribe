@@ -125,6 +125,26 @@ final class TranscriptionEngine: ObservableObject {
     /// read.
     private var engineAutoChangedTranscription = false
 
+    /// Apply the per-mode engine default (Whisper static / Parakeet
+    /// live) unless the user explicitly picked an engine this launch.
+    /// FIRES AT PROBE COMPLETION (2026-07-29, user request): the
+    /// original Start-time-only application meant users saw the auto
+    /// choice only AFTER committing — overriding it cost cancel →
+    /// change → restart. Now the picker updates the moment the probe
+    /// classifies the source, so a user who wants the other engine
+    /// just changes it before pressing Start (which pins their pick).
+    /// Start (rebuildBackends) keeps a fallback application for
+    /// sessions whose probe never resolved — idempotent, so double
+    /// application is a no-op.
+    func applyPerModeEngineDefault(isStatic: Bool) {
+        guard !userPinnedTranscriptionEngine else { return }
+        let auto: TranscriptionEngineKind = isStatic ? .whisperKit : .parakeet
+        guard transcriptionEngine != auto else { return }
+        engineAutoChangedTranscription = true
+        transcriptionEngine = auto
+        print("[Engine] Auto-selected \(auto.rawValue) for \(isStatic ? "static" : "live") source (no explicit engine pick this launch).")
+    }
+
     /// Called by the sidebar picker's onChange. Returns true when the
     /// change it observed was the engine's own per-mode auto-selection
     /// (→ neither pin the choice nor fire pick-coupled behaviors like
@@ -1904,20 +1924,12 @@ final class TranscriptionEngine: ObservableObject {
 
     @MainActor
     private func rebuildBackends() {
-        // PER-MODE ENGINE DEFAULTS (2026-07-22, user decision): resolve
-        // the raw engine by session mode at every Start unless the user
-        // explicitly picked one this launch. resolvedSessionMode is set
-        // by the pre-Start probe (URLs) or at file selection (local);
-        // an unknown mode conservatively resolves .live → Parakeet.
-        if !userPinnedTranscriptionEngine {
-            let auto: TranscriptionEngineKind =
-                (resolvedSessionMode == .static) ? .whisperKit : .parakeet
-            if transcriptionEngine != auto {
-                engineAutoChangedTranscription = true
-                transcriptionEngine = auto
-                print("[Engine] Auto-selected \(auto.rawValue) for \(resolvedSessionMode) session (no explicit engine pick this launch).")
-            }
-        }
+        // Per-mode engine default — FALLBACK application only (the
+        // primary firing moved to probe completion, 2026-07-29, so
+        // users can override before Start). This covers sessions
+        // started without a resolved probe; idempotent when the probe
+        // already applied it.
+        applyPerModeEngineDefault(isStatic: resolvedSessionMode == .static)
 
         // Raw pair: the always-on primary. For single-pass live mode and
         // static mode this is the only pair, and the chunked pipeline drives
@@ -6792,6 +6804,7 @@ final class TranscriptionEngine: ObservableObject {
             if let seconds = Self.probeDuration(of: fileURL) {
                 probedDuration = seconds
                 probeStatus = .finite(seconds)
+                applyPerModeEngineDefault(isStatic: true)
             } else {
                 probeStatus = .failed("Couldn't read \(fileURL.lastPathComponent)")
             }
@@ -7043,10 +7056,14 @@ final class TranscriptionEngine: ObservableObject {
                 case .finite(let seconds):
                     self.probedDuration = seconds
                     self.probeStatus = .finite(seconds)
+                    // Engine default fires HERE so the picker shows the
+                    // plan before Start (see applyPerModeEngineDefault).
+                    self.applyPerModeEngineDefault(isStatic: true)
                     print("[Probe] \(source.rawValue): \(String(format: "%.1f", seconds))s → Static.")
                 case .live:
                     self.probedDuration = nil
                     self.probeStatus = .live
+                    self.applyPerModeEngineDefault(isStatic: false)
                     print("[Probe] \(source.rawValue): no finite duration → Live.")
                 case .failed(let reason):
                     self.probedDuration = nil
