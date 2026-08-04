@@ -63,6 +63,41 @@ final class CriticalMentionBrowserExtractor: NSObject {
     private var timeoutTask: Task<Void, Never>?
     private var finished = false
 
+    /// CANDIDATE COLLECTION (2026-07-29). Previously the first URL the
+    /// shim reported won outright, which is wrong whenever a page
+    /// exposes more than one manifest: players commonly fetch the
+    /// master and then a rendition, so first-past-the-post can hand
+    /// ffmpeg a single-bitrate VARIANT playlist (the `index_3.m3u8`
+    /// shape) instead of the master, or an ad/bumper manifest that
+    /// loaded before the real one. We now gather everything the shim
+    /// sees for a short settle window, rank the candidates, and verify
+    /// the front-runners over the network before committing.
+    private struct Candidate {
+        let url: URL
+        let tier: ManifestTier
+        let order: Int
+    }
+
+    /// HLS outranks other adaptive formats: the whole pipeline
+    /// (probe, ffmpeg copy, miniplayer) is best-tested against it.
+    private enum ManifestTier: Int {
+        case alternative = 0   // DASH `.mpd`, Smooth `.ism/manifest`
+        case hls = 1
+    }
+
+    private enum ManifestKind {
+        case master          // has #EXT-X-STREAM-INF (or is a DASH MPD)
+        case mediaPlaylist   // segments only — a single rendition
+        case unreachable     // network/HTTP failure, or not a manifest
+    }
+
+    private var candidates: [Candidate] = []
+    private var seenCandidateURLs: Set<String> = []
+    private var settleTask: Task<Void, Never>?
+    /// Page URL, kept for Referer/Origin on verification requests —
+    /// several CDNs reject manifest fetches that omit them.
+    private var pageURL: URL?
+
     /// Whether the page being resolved is a Critical Mention page —
     /// selects the strict CM-CDN host filter vs. the permissive
     /// filter used for other sources (Granicus). Set in `start`.
@@ -75,6 +110,7 @@ final class CriticalMentionBrowserExtractor: NSObject {
 
     private func start(pageURL: URL, timeout: TimeInterval, completion: @escaping (ExtractionResult?) -> Void) {
         self.completion = completion
+        self.pageURL = pageURL
         // Drives the message handler's host filter — strict CDN
         // matching for CM pages, scheme-only for everything else
         // (Granicus streams live on third-party CDNs like Wowza).
@@ -92,6 +128,15 @@ final class CriticalMentionBrowserExtractor: NSObject {
         config.userContentController.addUserScript(interceptScript)
         config.userContentController.add(self, name: "stream")
 
+        // Let media start without a user gesture (2026-07-29). Many
+        // players don't request their manifest until playback actually
+        // begins; with the default policy WebKit blocks the shim's
+        // `play()` nudge outright, so the request we're waiting for is
+        // never made. Harmless headless — nothing is audible, and the
+        // view is torn down as soon as we have a URL.
+        config.mediaTypesRequiringUserActionForPlayback = []
+        config.allowsAirPlayForMediaPlayback = false
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         self.webView = webView
@@ -105,6 +150,13 @@ final class CriticalMentionBrowserExtractor: NSObject {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             await MainActor.run {
                 guard let self, !self.finished else { return }
+                // Candidates in hand at timeout are still usable — the
+                // settle window simply hadn't elapsed yet.
+                if !self.candidates.isEmpty {
+                    print("[CriticalMentionBrowser] Timeout after \(Int(timeout))s with \(self.candidates.count) candidate(s) — selecting now.")
+                    Task { @MainActor [weak self] in await self?.selectAndFinish() }
+                    return
+                }
                 print("[CriticalMentionBrowser] Timeout after \(Int(timeout))s waiting for stream URL — page may have failed to load or clip is private.")
                 self.finish(result: nil)
             }
@@ -118,11 +170,144 @@ final class CriticalMentionBrowserExtractor: NSObject {
         webView.load(URLRequest(url: pageURL))
     }
 
+    /// Record a manifest the shim spotted and arm the settle window.
+    private func addCandidate(url: URL, tier: ManifestTier) {
+        guard !finished else { return }
+        guard seenCandidateURLs.insert(url.absoluteString).inserted else { return }
+        candidates.append(Candidate(url: url, tier: tier, order: candidates.count))
+        print("[CriticalMentionBrowser] Candidate \(candidates.count) (\(tier == .hls ? "HLS" : "alt")): \(url.absoluteString)")
+
+        // First sighting starts a short window so sibling manifests
+        // (master + renditions) can arrive and be compared. Kept brief:
+        // players request them back-to-back, and this delay is added to
+        // every extraction.
+        guard settleTask == nil else { return }
+        settleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard let self, !self.finished else { return }
+            await self.selectAndFinish()
+        }
+    }
+
+    /// Rank the collected candidates, verify the leaders over the
+    /// network, and finish with the best manifest available.
+    private func selectAndFinish() async {
+        guard !finished else { return }
+        guard !candidates.isEmpty else { finish(result: nil); return }
+
+        let all = candidates
+        let ranked = all.sorted { Self.score($0, among: all) > Self.score($1, among: all) }
+        if ranked.count > 1 {
+            print("[CriticalMentionBrowser] \(ranked.count) candidates; ranked: " +
+                  ranked.map { "\($0.url.lastPathComponent)(\(Self.score($0, among: all)))" }.joined(separator: ", "))
+        }
+
+        // Heuristics order the queue; fetching decides. A master
+        // manifest is definitive, and a fetch failure demotes a
+        // candidate that would otherwise have been chosen blind —
+        // which is the other half of the consistency win, since a
+        // signed URL that 403s is worse than the next candidate.
+        var mediaFallback: Candidate?
+        for candidate in ranked.prefix(3) {
+            if finished { return }
+            switch await Self.classifyManifest(url: candidate.url, referer: pageURL) {
+            case .master:
+                finishWith(candidate, note: "master manifest, verified")
+                return
+            case .mediaPlaylist:
+                if mediaFallback == nil { mediaFallback = candidate }
+            case .unreachable:
+                print("[CriticalMentionBrowser] Candidate unreachable, trying next: \(candidate.url.lastPathComponent)")
+            }
+        }
+        if finished { return }
+        if let mediaFallback {
+            finishWith(mediaFallback, note: "single-rendition playlist (no master found)")
+        } else {
+            // Nothing verified — every fetch failed, most likely
+            // because the CDN wants headers or cookies we don't carry.
+            // Fall back to the ranking, which is never worse than the
+            // pre-2026-07-29 first-match behavior.
+            finishWith(ranked[0], note: "unverified, highest-ranked")
+        }
+    }
+
+    private func finishWith(_ candidate: Candidate, note: String) {
+        let rawTitle = webView?.title
+        let pageTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
+        print("[CriticalMentionBrowser] Captured stream URL: \(candidate.url.absoluteString) [\(note)]\(pageTitle.map { " — title: \"\($0)\"" } ?? "")")
+        finish(result: ExtractionResult(streamURL: candidate.url, pageTitle: pageTitle))
+    }
+
+    /// Rank a candidate. Higher is better. Tier dominates; the rest are
+    /// naming conventions that distinguish a master playlist from one
+    /// rendition of it.
+    private static func score(_ candidate: Candidate, among all: [Candidate]) -> Int {
+        var score = candidate.tier == .hls ? 1000 : 0
+        let file = candidate.url.lastPathComponent.lowercased()
+        let stem = (file as NSString).deletingPathExtension
+        let directory = candidate.url.deletingLastPathComponent().absoluteString
+
+        if file.contains("master") { score += 300 }
+        if ["index", "playlist", "main", "manifest", "stream"].contains(stem) { score += 200 }
+        // Rendition markers: `index_3`, `chunklist_w12`, `media_1`,
+        // `…_720p`, `…_800k` — all name ONE bitrate/resolution.
+        if stem.range(of: #"_\d+$"#, options: .regularExpression) != nil { score -= 300 }
+        if stem.hasPrefix("chunklist") || stem.hasPrefix("media_") { score -= 300 }
+        if stem.range(of: #"\d{3,4}[kp]"#, options: .regularExpression) != nil { score -= 200 }
+        // Strongest structural signal: another candidate sits in the
+        // same directory and is named after this one with a suffix
+        // (`index.m3u8` alongside `index_3.m3u8`) — this one is the
+        // master and that one is its rendition.
+        for other in all where other.url.absoluteString != candidate.url.absoluteString {
+            guard other.url.deletingLastPathComponent().absoluteString == directory else { continue }
+            let otherStem = (other.url.lastPathComponent.lowercased() as NSString).deletingPathExtension
+            if otherStem.hasPrefix(stem + "_") || otherStem.hasPrefix(stem + "-") {
+                score += 250
+                break
+            }
+        }
+        // Tiebreak toward what arrived first: players fetch the master
+        // before the rendition it points at.
+        score -= candidate.order
+        return score
+    }
+
+    /// Fetch a manifest and decide what it is. Sends Referer/Origin
+    /// because signed CDN manifests frequently require them.
+    private nonisolated static func classifyManifest(url: URL, referer: URL?) async -> ManifestKind {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 6
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent")
+        if let referer {
+            request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+            if let scheme = referer.scheme, let host = referer.host {
+                request.setValue("\(scheme)://\(host)", forHTTPHeaderField: "Origin")
+            }
+        }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              // Manifests are text and small; a prefix is plenty and
+              // caps the cost if we hit something unexpected.
+              let text = String(data: data.prefix(65_536), encoding: .utf8) else {
+            return .unreachable
+        }
+        if text.contains("#EXT-X-STREAM-INF") { return .master }
+        if text.contains("<MPD") || text.contains("<SmoothStreamingMedia") { return .master }
+        if text.contains("#EXTINF") || text.contains("#EXTM3U") { return .mediaPlaylist }
+        return .unreachable
+    }
+
     private func finish(result: ExtractionResult?) {
         guard !finished else { return }
         finished = true
         timeoutTask?.cancel()
         timeoutTask = nil
+        settleTask?.cancel()
+        settleTask = nil
 
         webView?.stopLoading()
         webView?.navigationDelegate = nil
@@ -154,22 +339,96 @@ final class CriticalMentionBrowserExtractor: NSObject {
     ///      `currentSrc` — belt-and-suspenders for anything assigned
     ///      before our hooks installed in a late-created subframe, or
     ///      through framework internals that bypass both hooks. The
-    ///      scan also nudges paused players with a muted `play()`,
-    ///      since some players only resolve their stream URL after a
-    ///      play attempt.
+    ///      scan also nudges paused players with a muted `play()` and
+    ///      CLICKS the player's own play control (2026-07-29) — many
+    ///      players don't create a media element or request a manifest
+    ///      until their handler runs, so `play()` alone has nothing to
+    ///      act on. Bounded (8 clicks, once per element, stops as soon
+    ///      as anything is reported) and never clicks a link that
+    ///      would navigate away.
+    ///   4. **Resource Timing** (`PerformanceObserver` on `resource`
+    ///      entries) — the closest in-page equivalent to the
+    ///      `webRequest` API that browser extensions use, and the
+    ///      reason those extensions detect streams more consistently
+    ///      than in-page hooks can (2026-07-29). Layers 1-2 only see
+    ///      requests that pass through the specific JS surfaces we
+    ///      patched; the Resource Timing buffer records EVERY network
+    ///      request the frame made, whoever issued it — WebKit's
+    ///      native HLS stack loading a manifest without touching JS,
+    ///      a framework that captured `fetch`/`XHR` references before
+    ///      our hooks installed, or a player that builds its request
+    ///      through internals we don't know about. Cross-origin
+    ///      entries still expose `name` (the URL), which is all we
+    ///      need — only detailed timings are restricted.
     ///
-    /// URL match: contains `.m3u8` (standard) or `fmt=m3u8`
-    /// (Critical Mention's stream.php convention).
+    /// **Match tiers** (2026-07-29, broadened from `.m3u8`/`fmt=m3u8`):
+    ///   - *HLS, posted immediately* — `.m3u8`, bare `.m3u`, and the
+    ///     query-param forms (`fmt=`/`format=`/`type=m3u8`) that some
+    ///     services use instead of an extension, e.g. Critical
+    ///     Mention's `stream.php?…&fmt=m3u8`.
+    ///   - *Other adaptive manifests* — `.mpd` (DASH),
+    ///     `.ism/manifest` (Smooth), tagged `alt`. The native side
+    ///     ranks HLS above these, so a page offering both still yields
+    ///     the HLS manifest, while DASH-only players remain usable.
+    ///   - *Content-type confirmation* — a response declaring an
+    ///     HLS/DASH MIME type is reported even when its URL carries no
+    ///     recognizable extension (common: `/playlist/<token>/1234`).
+    ///     Weak URL shapes like a bare `/playlist/` segment are
+    ///     deliberately NOT matched on their own: an ordinary JSON
+    ///     endpoint can look identical, and handing ffmpeg one would
+    ///     fail the session, so the server's declared type decides.
     private static let observerJavaScript = """
     (function() {
-        function report(url) {
+        // HLS patterns, all unambiguous: a URL containing any of these
+        // is a playlist, not a coincidence. `.m3u` (no 8) and the
+        // query-param forms cover services that omit the conventional
+        // extension.
+        var HLS_PATTERN = /\\.m3u8|\\.m3u(?![a-z0-9])|fmt=m3u8|format=m3u8|type=m3u8/i;
+        // Non-HLS adaptive manifests. Matched but DEFERRED (see below).
+        var ALT_PATTERN = /\\.mpd(?![a-z0-9])|\\.ism\\/manifest/i;
+        // Manifest MIME types, for responses whose URL carries no
+        // recognizable extension at all.
+        var HLS_CONTENT_TYPE = /(application|audio)\\/(vnd\\.apple\\.mpegurl|x-mpegurl|mpegurl)/i;
+        var ALT_CONTENT_TYPE = /application\\/(dash\\+xml|vnd\\.ms-sstr\\+xml)/i;
+
+        // Every match is posted immediately with its tier. Ranking and
+        // the HLS-over-DASH preference are the NATIVE side's job now
+        // (it collects candidates over a settle window and verifies
+        // them), which is why the earlier client-side hold-and-defer
+        // dance is gone.
+        var postedAny = false;
+
+        function post(url, tier) {
             try {
-                if (typeof url === 'string' &&
-                    (url.indexOf('.m3u8') !== -1 || url.indexOf('fmt=m3u8') !== -1)) {
-                    window.webkit.messageHandlers.stream.postMessage(url);
-                }
+                postedAny = true;
+                window.webkit.messageHandlers.stream.postMessage({ url: url, tier: tier });
             } catch (e) {
                 // Message handler not attached — ignore.
+            }
+        }
+
+        function report(url) {
+            if (typeof url !== 'string' || !url) return;
+            if (HLS_PATTERN.test(url)) {
+                post(url, 'hls');
+            } else if (ALT_PATTERN.test(url)) {
+                post(url, 'alt');
+            }
+        }
+
+        // Content-type confirmation: the only reliable way to recognize
+        // an EXTENSIONLESS manifest (plenty of services serve playlists
+        // from paths like `/playlist/<token>/1234` with no hint in the
+        // URL). Guessing from weak URL shapes such as `/playlist/` would
+        // risk handing ffmpeg an ordinary JSON endpoint, so we let the
+        // server's own declared type decide instead.
+        function reportWithContentType(url, contentType) {
+            if (typeof url !== 'string' || !url || !contentType) return;
+            if (HLS_PATTERN.test(url) || ALT_PATTERN.test(url)) return;  // already handled
+            if (HLS_CONTENT_TYPE.test(contentType)) {
+                post(url, 'hls');
+            } else if (ALT_CONTENT_TYPE.test(contentType)) {
+                post(url, 'alt');
             }
         }
 
@@ -177,11 +436,30 @@ final class CriticalMentionBrowserExtractor: NSObject {
         if (window.fetch) {
             var originalFetch = window.fetch;
             window.fetch = function(input, init) {
+                var url;
                 try {
-                    var url = typeof input === 'string' ? input : (input && input.url);
+                    url = typeof input === 'string' ? input : (input && input.url);
                     if (url) report(url);
                 } catch (e) {}
-                return originalFetch.apply(this, arguments);
+                var promise = originalFetch.apply(this, arguments);
+                try {
+                    if (url && promise && promise.then) {
+                        // Observe only — we attach to a DERIVED promise
+                        // and return the original, so the page's own
+                        // chain and error handling are untouched. Reading
+                        // headers does not consume the body.
+                        promise.then(function(response) {
+                            try {
+                                reportWithContentType(
+                                    url,
+                                    response && response.headers &&
+                                        response.headers.get('content-type')
+                                );
+                            } catch (e) {}
+                        }, function() {});
+                    }
+                } catch (e) {}
+                return promise;
             };
         }
 
@@ -189,8 +467,31 @@ final class CriticalMentionBrowserExtractor: NSObject {
         if (window.XMLHttpRequest && XMLHttpRequest.prototype.open) {
             var originalOpen = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(method, url) {
-                try { report(url); } catch (e) {}
+                try {
+                    this.__ssRequestURL = url;
+                    report(url);
+                } catch (e) {}
                 return originalOpen.apply(this, arguments);
+            };
+        }
+
+        // Hook XMLHttpRequest.send to read the response's content type
+        // (the extensionless-manifest path, same rationale as fetch).
+        if (window.XMLHttpRequest && XMLHttpRequest.prototype.send) {
+            var originalSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function() {
+                try {
+                    var xhr = this;
+                    xhr.addEventListener('load', function() {
+                        try {
+                            reportWithContentType(
+                                xhr.__ssRequestURL,
+                                xhr.getResponseHeader('content-type')
+                            );
+                        } catch (e) {}
+                    });
+                } catch (e) {}
+                return originalSend.apply(this, arguments);
             };
         }
 
@@ -226,6 +527,109 @@ final class CriticalMentionBrowserExtractor: NSObject {
             };
         }
 
+        // Resource Timing: report every network request the frame
+        // makes, regardless of which API issued it (see layer 4 in the
+        // docstring). `report` already gates on the URL pattern, so the
+        // noise from images/scripts/segments costs one string scan each.
+        function reportEntries(entries) {
+            try {
+                for (var i = 0; i < entries.length; i++) {
+                    var e = entries[i];
+                    if (e && e.name) report(e.name);
+                }
+            } catch (e) {}
+        }
+        try {
+            // Grow the buffer before any request lands (we run at
+            // document-start): the default cap is small enough that a
+            // segment-heavy player could evict the manifest entry
+            // before the buffered replay below reads it.
+            if (window.performance && performance.setResourceTimingBufferSize) {
+                performance.setResourceTimingBufferSize(1000);
+            }
+            if (window.PerformanceObserver) {
+                var po = new PerformanceObserver(function(list) {
+                    reportEntries(list.getEntries());
+                });
+                // `buffered: true` replays entries recorded before this
+                // observer attached — important in subframes, whose
+                // document may already be loading when we install.
+                try {
+                    po.observe({ type: 'resource', buffered: true });
+                } catch (e) {
+                    // Older syntax; no buffered replay, so the explicit
+                    // drain below covers it.
+                    po.observe({ entryTypes: ['resource'] });
+                }
+            }
+            // Explicit drain, for engines without `buffered` support and
+            // as a no-cost backstop when PerformanceObserver is absent.
+            if (window.performance && performance.getEntriesByType) {
+                reportEntries(performance.getEntriesByType('resource'));
+            }
+        } catch (e) {}
+
+        // Play controls, by framework convention. Clicking the player's
+        // OWN control matters because many players don't create a media
+        // element or request a manifest until their handler runs —
+        // calling play() on a <video> that doesn't exist yet does
+        // nothing. A synthetic click isn't a user gesture for autoplay
+        // policy, but it does invoke the player's JS, which is the part
+        // we need. (`mediaTypesRequiringUserActionForPlayback` on the
+        // native config covers the policy half.)
+        var PLAY_SELECTORS = [
+            '.vjs-big-play-button',              // video.js
+            '.jw-icon-display', '.jw-icon-playback',  // JW Player
+            '.plyr__control--overlaid',          // Plyr
+            '.bmpui-ui-hugeplaybacktogglebutton',// Bitmovin
+            '.shaka-play-button',                // Shaka
+            '.flowplayer .fp-play',              // Flowplayer
+            '.mejs__overlay-button',             // MediaElement.js
+            '[class*="big-play"]', '[class*="play-button"]', '[class*="playButton"]',
+            '[class*="poster"][class*="play"]',
+            'button[aria-label*="play" i]', '[role="button"][aria-label*="play" i]',
+            'button[title*="play" i]', '[data-testid*="play" i]'
+        ].join(', ');
+
+        var clicksSpent = 0;
+        var MAX_CLICKS = 8;
+
+        function nudgePlayControls() {
+            // Once something has been reported the player is fetching;
+            // further clicking is needless risk.
+            if (postedAny || clicksSpent >= MAX_CLICKS) return;
+            var controls;
+            try { controls = document.querySelectorAll(PLAY_SELECTORS); } catch (e) { return; }
+            for (var i = 0; i < controls.length && clicksSpent < MAX_CLICKS; i++) {
+                var el = controls[i];
+                if (!el || el.__ssPlayClicked) continue;
+                // Never click a link that would navigate away from the
+                // page we're extracting from.
+                if (el.tagName === 'A') {
+                    var href = el.getAttribute('href') || '';
+                    if (href && href.charAt(0) !== '#' && href.indexOf('javascript:') !== 0) continue;
+                }
+                el.__ssPlayClicked = true;
+                clicksSpent++;
+                // Full pointer/mouse sequence: some players bind
+                // pointerdown or mousedown rather than click.
+                try {
+                    ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach(function(type) {
+                        var evt;
+                        try {
+                            evt = new MouseEvent(type, { bubbles: true, cancelable: true, view: window });
+                        } catch (e) {
+                            evt = document.createEvent('MouseEvents');
+                            evt.initEvent(type, true, true);
+                        }
+                        el.dispatchEvent(evt);
+                    });
+                } catch (e) {
+                    try { if (el.click) el.click(); } catch (e2) {}
+                }
+            }
+        }
+
         // Periodic DOM scan + autoplay nudge.
         setInterval(function() {
             try {
@@ -244,6 +648,7 @@ final class CriticalMentionBrowserExtractor: NSObject {
                     }
                 }
             } catch (e) {}
+            nudgePlayControls();
         }, 500);
     })();
     """
@@ -253,9 +658,21 @@ final class CriticalMentionBrowserExtractor: NSObject {
 
 extension CriticalMentionBrowserExtractor: WKScriptMessageHandler {
     nonisolated func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "stream",
-              let urlString = message.body as? String,
-              let url = URL(string: urlString) else { return }
+        guard message.name == "stream" else { return }
+        // The shim posts `{url, tier}`; plain strings are still accepted
+        // so the handler stays compatible with any other caller.
+        let urlString: String
+        var tierRaw = "hls"
+        if let dict = message.body as? [String: Any], let u = dict["url"] as? String {
+            urlString = u
+            if let t = dict["tier"] as? String { tierRaw = t }
+        } else if let u = message.body as? String {
+            urlString = u
+        } else {
+            return
+        }
+        guard let url = URL(string: urlString) else { return }
+        let tier: ManifestTier = (tierRaw == "alt") ? .alternative : .hls
 
         guard let host = url.host?.lowercased() else { return }
         guard url.scheme == "https" || url.scheme == "http" else { return }
@@ -281,11 +698,7 @@ extension CriticalMentionBrowserExtractor: WKScriptMessageHandler {
                       !host.hasPrefix("app.") else { return }
             }
 
-            let rawTitle = self.webView?.title
-            let pageTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
-
-            print("[CriticalMentionBrowser] Captured stream URL: \(url.absoluteString)\(pageTitle.map { " — title: \"\($0)\"" } ?? "")")
-            self.finish(result: ExtractionResult(streamURL: url, pageTitle: pageTitle))
+            self.addCandidate(url: url, tier: tier)
         }
     }
 }

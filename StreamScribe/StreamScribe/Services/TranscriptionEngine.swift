@@ -631,6 +631,38 @@ final class TranscriptionEngine: ObservableObject {
     /// pipeline completes.
     @Published private(set) var playbackMediaURL: URL?
 
+    /// Publish the BEST available playback media for the miniplayer:
+    /// the laundered downloaded video when we have one, otherwise the
+    /// session cache file.
+    ///
+    /// END-OF-SESSION CLOBBER FIX (2026-07-30). Both finalize paths
+    /// (normal completion and Stop) used to assign
+    /// `MediaCacheManager.currentFileURL` unconditionally, which
+    /// overwrote the `session-video.mp4` URL published minutes earlier
+    /// when the download finished. On a STATIC session the pipe cache
+    /// is audio-only by design, so the miniplayer lost its picture the
+    /// instant transcription completed — the reported "video is
+    /// missing, miniplayer just shows audio". The video-caching
+    /// setting was a red herring: toggling it off legitimately
+    /// produced audio-only, and toggling it back on didn't appear to
+    /// help because every session still reverted to audio at the end.
+    @MainActor
+    private func publishBestPlaybackMedia() {
+        let fm = FileManager.default
+        let video = MediaCacheManager.videoDownloadFileURL
+        if fm.fileExists(atPath: video.path) {
+            if playbackMediaURL != video {
+                playbackMediaURL = video
+                print("[Pipeline] Miniplayer media: downloaded video cache (kept over the audio-only session cache).")
+            }
+            return
+        }
+        let cache = MediaCacheManager.currentFileURL
+        if fm.fileExists(atPath: cache.path) {
+            playbackMediaURL = cache
+        }
+    }
+
     /// Resolve an HLS m3u8 URL for the live miniplayer preview and set
     /// `playbackMediaURL`. Called from `start()` as a detached task so
     /// the resolve latency (~500 ms for senate.gov, near-zero for direct
@@ -666,7 +698,7 @@ final class TranscriptionEngine: ObservableObject {
             } catch {
                 print("[LivePreview] Senate.gov extractor failed: \(error.localizedDescription) — no live preview this session.")
             }
-        case .criticalMention, .granicus:
+        case .criticalMention, .granicus, .iqMedia:
             // Critical Mention clips are static (finite duration), not
             // live — but they still benefit from the same "give the
             // miniplayer the resolved stream URL" wiring since AVPlayer
@@ -1438,7 +1470,7 @@ final class TranscriptionEngine: ObservableObject {
                 let timeout: TimeInterval
                 switch source {
                 case .senateGov:                   timeout = 6.0
-                case .criticalMention, .granicus:  timeout = 18.0
+                case .criticalMention, .granicus, .iqMedia: timeout = 18.0
                 case _ where source.requiresYTDlp: timeout = 12.0
                 default:                           timeout = 3.0
                 }
@@ -1519,7 +1551,7 @@ final class TranscriptionEngine: ObservableObject {
                             }
                         }
                     }
-                } else if source == .criticalMention || source == .granicus {
+                } else if source == .criticalMention || source == .granicus || source == .iqMedia {
                     // Same rationale as beginProbe's criticalMention
                     // branch — resolve first, then ffmpeg-probe the
                     // m3u8. Hit when the direct-Start path bypassed
@@ -2140,10 +2172,35 @@ final class TranscriptionEngine: ObservableObject {
                 : nil
             defer { ticker?.cancel() }
             do {
+                // OFFLINE LOAD FOR ALREADY-CACHED MODELS (2026-08-04).
+                // Companion to the same guard in
+                // ModelDownloadManager.runDownload — which only covered
+                // the load that FOLLOWS an R2 mirror download. This is
+                // the other path to the same failure: when the model is
+                // already on disk, no download runs at all, so that
+                // guard never applies and prepare() was left
+                // unprotected.
+                //
+                // The backends' prepare() (WhisperKit's CoreML load,
+                // MLX's Parakeet loader) re-validates against
+                // HuggingFace and re-fetches sidecar files such as
+                // weight.bin. On a machine that can reach HF that's an
+                // invisible sub-second check; on a Netskope fleet
+                // machine it STALLS, and the resulting timeout surfaces
+                // as the thoroughly misleading "Model not found. Please
+                // check the model or repo name" — for a model sitting
+                // complete on disk, that the app had just probed as
+                // `cached` seconds earlier.
+                //
+                // Gated on isAlreadyCached: a NOT-yet-downloaded model
+                // must still be allowed to reach the network, since
+                // fetching is the whole point of that path.
+                if isAlreadyCached { setenv("HF_HUB_OFFLINE", "1", 1) }
+                defer { if isAlreadyCached { unsetenv("HF_HUB_OFFLINE") } }
                 try await prepare()
                 ticker?.cancel()
                 let total = Date().timeIntervalSince(startedAt)
-                print(String(format: "[Pipeline/Prepare] %@: complete in %.2fs", key.logTag, total))
+                print(String(format: "[Pipeline/Prepare] %@: complete in %.2fs%@", key.logTag, total, isAlreadyCached ? " (offline load from disk cache)" : ""))
                 if shouldReport {
                     await MainActor.run { ModelDownloadManager.shared.markReady(key) }
                 }
@@ -2422,6 +2479,8 @@ final class TranscriptionEngine: ObservableObject {
             // miniplayer's onChange swaps from the (audio-only) cache
             // to the real video file, mid-session or after. Failure is
             // non-fatal — the session simply behaves like pre-split.
+            // See `publishBestPlaybackMedia()` for why the finalize
+            // paths must not blindly overwrite what this publishes.
             if useFastDownload && wantsVideo && source != .localFile {
                 Task { [weak self] in
                     let ok = await VideoCacheDownloader.shared.run(url: url)
@@ -2569,12 +2628,7 @@ final class TranscriptionEngine: ObservableObject {
             // sources skipped the cache request and already have
             // playbackMediaURL set to the original file path.
             if source != .localFile {
-                let cacheURL = MediaCacheManager.currentFileURL
-                if FileManager.default.fileExists(atPath: cacheURL.path) {
-                    await MainActor.run {
-                        self.playbackMediaURL = cacheURL
-                    }
-                }
+                await MainActor.run { self.publishBestPlaybackMedia() }
             }
 
             // Optional LLM cleanup pass (Settings → Transcript
@@ -2613,12 +2667,7 @@ final class TranscriptionEngine: ObservableObject {
             // simply stays disabled — better than crashing on a
             // malformed mkv.
             if source != .localFile {
-                let cacheURL = MediaCacheManager.currentFileURL
-                if FileManager.default.fileExists(atPath: cacheURL.path) {
-                    await MainActor.run {
-                        self.playbackMediaURL = cacheURL
-                    }
-                }
+                await MainActor.run { self.publishBestPlaybackMedia() }
             }
             await setState(.idle)
             await MainActor.run {
@@ -6527,19 +6576,76 @@ final class TranscriptionEngine: ObservableObject {
         let title: String?
     }
 
-    /// Shared HTML fetch for the resolvers below: desktop UA, short
-    /// timeout, returns decoded text or nil. Kept small and dependency
-    /// -free — these run on the main-session path.
+    /// Shared HTML fetch for the resolvers below.
+    ///
+    /// Sends a FULL browser header set (2026-07-30), not just a
+    /// User-Agent: bot-protection services (Akamai, Cloudflare et al.)
+    /// score requests on header completeness, and a lone UA with no
+    /// Accept/Accept-Language/Sec-Fetch-* reads as automation even
+    /// when the UA string is perfect. Several news sites we care about
+    /// sit behind exactly that.
+    ///
+    /// Failures are LOGGED rather than swallowed. These resolvers are
+    /// fail-open by design, which is right for behaviour but was
+    /// terrible for diagnosis: a blocked fetch and a page with no
+    /// media looked identical from the log (both silent), so "no
+    /// sniffer lines" couldn't distinguish them.
     private static func fetchHTML(_ url: URL, timeout: TimeInterval = 15) async -> String? {
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
-        req.setValue(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-            forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await URLSession.shared.data(for: req),
-              let http = response as? HTTPURLResponse,
-              (200...299).contains(http.statusCode) else { return nil }
-        return String(data: data, encoding: .utf8)
+        let headers = [
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        ]
+        for (key, value) in headers { req.setValue(value, forHTTPHeaderField: key) }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: req)
+        } catch {
+            print("[Sniffer] Fetch failed for \(url.host ?? url.absoluteString): \(error.localizedDescription)")
+            return nil
+        }
+        guard let http = response as? HTTPURLResponse else { return nil }
+        guard (200...299).contains(http.statusCode) else {
+            print("[Sniffer] Fetch returned HTTP \(http.statusCode) for \(url.host ?? url.absoluteString) — likely bot protection or a redirect wall.")
+            return nil
+        }
+        // Lossy decode: strict UTF-8 returns nil on a single bad byte,
+        // and a large news page with one stray byte would have been
+        // discarded wholesale. Replacement characters are harmless
+        // here — we only regex-match URLs out of this text.
+        let html = String(decoding: data, as: UTF8.self)
+        guard !html.isEmpty else {
+            print("[Sniffer] Fetch returned an empty body for \(url.host ?? url.absoluteString).")
+            return nil
+        }
+        print("[Sniffer] Fetched \(data.count) bytes from \(url.host ?? url.absoluteString).")
+        return html
+    }
+
+    /// Normalize a page's escaped URL forms before scanning it.
+    ///
+    /// JSON embedded in HTML escapes slashes two different ways, and
+    /// NBC News uses BOTH in the same document (2026-07-30): plain
+    /// `\/` in some blocks and `\u002F` in others. A scan that only
+    /// undoes `\/` sees `https:\u002F\u002Fhost\u002F…` as no URL at
+    /// all, which is exactly how a page can be fetched successfully and
+    /// still yield nothing. `\u0026` (ampersand) gets the same
+    /// treatment so query strings survive intact.
+    private static func unescapedForScanning(_ html: String) -> String {
+        html
+            .replacingOccurrences(of: "\\/", with: "/")
+            .replacingOccurrences(of: "\\u002F", with: "/")
+            .replacingOccurrences(of: "\\u002f", with: "/")
+            .replacingOccurrences(of: "\\u0026", with: "&")
     }
 
     /// Extract an HTML <title> for display, trimmed. nil if absent.
@@ -6559,7 +6665,7 @@ final class TranscriptionEngine: ObservableObject {
     /// not the generic sniffer. Ordered by appearance; master/index
     /// manifests tend to appear before variant playlists.
     private static func m3u8URLs(in text: String) -> [URL] {
-        let unescaped = text.replacingOccurrences(of: "\\/", with: "/")
+        let unescaped = unescapedForScanning(text)
         let pattern = #"https?://[^"'\s\\]+?\.m3u8(?:\?[^"'\s\\]*)?"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(unescaped.startIndex..., in: unescaped)
@@ -6583,16 +6689,108 @@ final class TranscriptionEngine: ObservableObject {
     /// path (yt-dlp generic) still runs as the true fallback.
     private static func sniffEmbeddedHLS(url: URL) async -> ResolvedMedia? {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        guard StreamSource.detect(from: url) == .unknown else { return nil }
+        let classification = StreamSource.detect(from: url)
+        guard classification == .unknown else {
+            print("[Sniffer] Skipped \(url.host ?? "page"): classified as \(classification.rawValue), not an unrecognized page.")
+            return nil
+        }
         // A path that already looks like media isn't a player page.
         let lowerPath = url.path.lowercased()
         guard !lowerPath.hasSuffix(".m3u8"), !lowerPath.hasSuffix(".mp4"), !lowerPath.hasSuffix(".mp3") else { return nil }
 
+        print("[Sniffer] Inspecting \(url.host ?? "page") for embedded media…")
         guard let html = await fetchHTML(url) else { return nil }
-        let manifests = m3u8URLs(in: html)
-        guard let first = manifests.first else { return nil }
-        print("[Statehouse] Generic sniffer found an embedded HLS manifest on \(url.host ?? "page"): \(first.absoluteString)")
-        return ResolvedMedia(mediaURL: first, title: htmlTitle(from: html))
+
+        // 1. Media the page DECLARES as its own content — og:audio /
+        //    og:video, schema.org contentUrl, common player-config JSON
+        //    keys, <audio>/<video>/<source> src.
+        //
+        //    This runs FIRST (2026-07-30) because a raw manifest scan
+        //    is not the same question. News articles routinely embed a
+        //    related-videos playlist, and its manifests can appear in
+        //    the markup BEFORE the article's own video — on a real NBC
+        //    News page the first `.m3u8` in document order belonged to
+        //    a different episode entirely, so a first-match scan would
+        //    have silently transcribed the wrong video. What the page
+        //    declares as its content is the article's actual media;
+        //    everything else on the page is context.
+        //
+        //    Reading only declared fields (rather than scraping every
+        //    media-looking URL) is also what keeps podcast pages safe:
+        //    a blind scan would happily return a UI sound effect, an ad
+        //    bumper, or a background loop, and under a fail-open
+        //    resolver a confidently wrong URL is worse than falling
+        //    through to yt-dlp.
+        if let declared = structuredMediaURL(in: html) {
+            print("[Sniffer] Declared media on \(url.host ?? "page"): \(declared.absoluteString)")
+            return ResolvedMedia(mediaURL: declared, title: htmlTitle(from: html))
+        }
+        // 2. Base64-embedded media (the Texas trick, reusable anywhere).
+        if let decoded = decodedMediaURL(inBase64Blobs: html) {
+            print("[Sniffer] Base64-embedded media on \(url.host ?? "page"): \(decoded.absoluteString)")
+            return ResolvedMedia(mediaURL: decoded, title: htmlTitle(from: html))
+        }
+        // 3. Any absolute HLS manifest on the page — the catch-all for
+        //    player pages that declare nothing (most statehouse and
+        //    municipal players). Last because of the ordering hazard
+        //    described above.
+        if let manifest = m3u8URLs(in: html).first {
+            print("[Sniffer] Embedded HLS manifest on \(url.host ?? "page"): \(manifest.absoluteString)")
+            return ResolvedMedia(mediaURL: manifest, title: htmlTitle(from: html))
+        }
+        // Report WHAT the page contained, so a no-match is immediately
+        // attributable: markers present means our patterns missed
+        // something; markers absent means the served HTML genuinely
+        // carries no media (auth/paywall-gated rendering, or a shell
+        // that loads it later).
+        let scanned = unescapedForScanning(html)
+        func occurrences(_ needle: String) -> Int {
+            scanned.components(separatedBy: needle).count - 1
+        }
+        print("""
+        [Sniffer] Fetched \(url.host ?? "page") but found no media — falling through. \
+        Markers in the served HTML: .m3u8=\(occurrences(".m3u8")) .mp4=\(occurrences(".mp4")) \
+        .mp3=\(occurrences(".mp3")) contentUrl=\(occurrences("contentUrl")) \
+        og:video=\(occurrences("og:video")) og:audio=\(occurrences("og:audio")) \
+        <video=\(occurrences("<video")) <source=\(occurrences("<source"))
+        """)
+        return nil
+    }
+
+    /// Media URLs a page explicitly declares as its content. Ordered by
+    /// how strong the declaration is. Returns audio or video; HLS is
+    /// handled by the caller before this runs.
+    private static func structuredMediaURL(in html: String) -> URL? {
+        let unescaped = unescapedForScanning(html)
+        // Each pattern captures group 1 = the URL.
+        let patterns = [
+            // Open Graph / Twitter media
+            #"<meta[^>]+(?:property|name)=["'](?:og:audio|og:audio:url|og:audio:secure_url|og:video|og:video:url|og:video:secure_url|twitter:player:stream)["'][^>]+content=["']([^"']+)["']"#,
+            #"<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:audio|og:video)["']"#,
+            // schema.org / JSON-LD and common player-config keys
+            #""(?:contentUrl|audioUrl|audio_url|enclosureUrl|enclosure_url|mediaUrl|media_url|streamUrl|stream_url|fileUrl|file)"\s*:\s*"([^"]+)""#,
+            // Direct element src
+            #"<(?:audio|video)[^>]+src=["']([^"']+)["']"#,
+            #"<source[^>]+src=["']([^"']+)["']"#,
+        ]
+        let mediaExtensions = ["mp3", "m4a", "aac", "mp4", "m4v", "mov", "wav", "flac", "ogg", "opus", "webm"]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let range = NSRange(unescaped.startIndex..., in: unescaped)
+            for match in regex.matches(in: unescaped, range: range) {
+                guard match.numberOfRanges > 1,
+                      let r = Range(match.range(at: 1), in: unescaped) else { continue }
+                let candidate = String(unescaped[r]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard candidate.lowercased().hasPrefix("http"),
+                      let mediaURL = URL(string: candidate) else { continue }
+                // The extension check keeps a poster image or a page
+                // link from being mistaken for the media itself.
+                let path = mediaURL.path.lowercased()
+                guard mediaExtensions.contains(where: { path.hasSuffix(".\($0)") }) else { continue }
+                return mediaURL
+            }
+        }
+        return nil
     }
 
     /// TIER 1 — per-state resolvers. Dispatches by host to a precise
@@ -6761,7 +6959,8 @@ final class TranscriptionEngine: ObservableObject {
                   let decoded = String(data: data, encoding: .utf8) else { continue }
             let lower = decoded.lowercased()
             guard lower.hasPrefix("http"),
-                  lower.contains(".m3u8") || lower.contains(".mp4") || lower.contains(".m3u8?") else { continue }
+                  lower.contains(".m3u8") || lower.contains(".mp4") ||
+                    lower.contains(".mp3") || lower.contains(".m4a") else { continue }
             if let u = URL(string: decoded.trimmingCharacters(in: .whitespacesAndNewlines)) { return u }
         }
         return nil
@@ -6959,7 +7158,7 @@ final class TranscriptionEngine: ObservableObject {
                         probeResult = .failed("Senate.gov resolution failed and yt-dlp probe also failed — check URL or network.")
                     }
                 }
-            } else if source == .criticalMention || source == .granicus {
+            } else if source == .criticalMention || source == .granicus || source == .iqMedia {
                 // Critical Mention: resolve the SPA clip page to its
                 // signed HLS URL via our browser extractor, then
                 // ffmpeg-probe the m3u8 for duration. Without this

@@ -255,7 +255,7 @@ actor AudioStreamExtractor {
                 inputURL = "-"
                 inputIsLocalFile = false
             }
-        } else if source == .criticalMention || source == .granicus {
+        } else if source == .criticalMention || source == .granicus || source == .iqMedia {
             // Browser-extractor path (Critical Mention + Granicus):
             // both serve pages whose JS player fetches the real HLS
             // URL at runtime — CM a signed assets stream, Granicus a

@@ -327,6 +327,7 @@ enum StreamSource: String, CaseIterable {
     case senateGov = "U.S. Senate"
     case criticalMention = "Critical Mention"
     case granicus = "Granicus"
+    case iqMedia = "IQ Media"
     case hls = "HLS Stream"
     case directAudio = "Direct Audio"
     case directVideo = "Direct Video"
@@ -371,7 +372,7 @@ enum StreamSource: String, CaseIterable {
         switch self {
         case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
             return true
-        case .senateGov, .criticalMention, .granicus, .hls, .directAudio, .directVideo, .localFile:
+        case .senateGov, .criticalMention, .granicus, .iqMedia, .hls, .directAudio, .directVideo, .localFile:
             return false
         }
     }
@@ -477,6 +478,25 @@ enum StreamSource: String, CaseIterable {
         //     via the JS shim on first observation).
         if host == "criticalmention.com" || host.hasSuffix(".criticalmention.com") {
             return .criticalMention
+        }
+        // IQ Media / Kinetiq (2026-07-29): broadcast-monitoring service
+        // whose own transcripts are poor, so users want Whisper or
+        // Parakeet on the clips. Two recognized shapes, mirroring the
+        // Critical Mention treatment:
+        //   - `www.iqmediacorp.com/ExternalIframeMedia?mediaId=<uuid>…`
+        //     — the embed page. Its JS player fetches the real manifest
+        //     from Kinetiq's playout service, so the WKWebView sniffer
+        //     watches the page for it (same permissive third-party-CDN
+        //     path Granicus uses — the stream is NOT on the page host).
+        // Deliberately the PAGE host only. A direct Kinetiq manifest
+        // (`*.kinetiq.tv/…/playlist/…/N.m3u8`) must NOT come here: this
+        // branch precedes the `.hls` check, and routing a bare manifest
+        // to the WKWebView sniffer would hand it a URL with no page JS
+        // to observe — it would time out where plain HLS handling works
+        // today. Letting it fall through classifies it `.hls`, which
+        // transcribes and (post-2026-07-29) downloads correctly.
+        if host == "iqmediacorp.com" || host.hasSuffix(".iqmediacorp.com") {
+            return .iqMedia
         }
         // Granicus: government meeting/stream platform used by many
         // city and county governments (e.g. dc.granicus.com). Player

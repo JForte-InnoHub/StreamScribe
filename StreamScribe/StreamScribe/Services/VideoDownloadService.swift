@@ -172,7 +172,7 @@ final class VideoDownloadService: ObservableObject {
         let source = StreamSource.detect(from: sourceURL)
         let downloadedPath: String
 
-        if source == .criticalMention || source == .granicus {
+        if source == .criticalMention || source == .granicus || source == .iqMedia {
             // Browser-extractor flow (Critical Mention + Granicus):
             // resolve the player page → HLS URL → ffmpeg copies the
             // stream to disk. ffmpeg reads the m3u8, downloads
@@ -181,9 +181,11 @@ final class VideoDownloadService: ObservableObject {
             // would provide, but via a path that doesn't depend on
             // yt-dlp knowing about the source.
             await MainActor.run {
-                self.statusText = source == .granicus
-                    ? "Resolving Granicus stream…"
-                    : "Resolving Critical Mention clip…"
+                switch source {
+                case .granicus: self.statusText = "Resolving Granicus stream…"
+                case .iqMedia:  self.statusText = "Resolving IQ Media clip…"
+                default:        self.statusText = "Resolving Critical Mention clip…"
+                }
             }
             let resolved = try await CriticalMentionExtractor.resolve(url: sourceURL)
             downloadedPath = try await runFFmpegHLSDownload(

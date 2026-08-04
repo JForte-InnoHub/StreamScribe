@@ -22,7 +22,7 @@ enum CriticalMentionExtractor {
         var errorDescription: String? {
             switch self {
             case .invalidURL:
-                return "Not a supported player-page URL (Critical Mention or Granicus)."
+                return "Not a supported player-page URL (Critical Mention, Granicus, or IQ Media)."
             case .extractionFailed(let reason):
                 return "Stream extraction failed: \(reason)"
             }
@@ -61,7 +61,14 @@ enum CriticalMentionExtractor {
         guard let host = url.host?.lowercased(),
               host.hasSuffix("criticalmention.com")
                 || host == "granicus.com"
-                || host.hasSuffix(".granicus.com") else {
+                || host.hasSuffix(".granicus.com")
+                // IQ Media / Kinetiq embed pages (2026-07-29). Their
+                // manifest lives on Kinetiq's playout service, a
+                // third-party host relative to the page — so they use
+                // the same permissive filter Granicus does, not the
+                // strict same-domain-CDN filter Critical Mention needs.
+                || host == "iqmediacorp.com"
+                || host.hasSuffix(".iqmediacorp.com") else {
             throw ExtractorError.invalidURL
         }
 
