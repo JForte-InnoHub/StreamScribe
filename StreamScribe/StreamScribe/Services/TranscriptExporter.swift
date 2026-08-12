@@ -242,7 +242,16 @@ enum TranscriptExporter {
 
     /// Resolve a machine label to its display name, falling back to the machine label.
     private static func displayName(_ machineLabel: String?, _ speakerNames: [String: String]) -> String? {
-        guard let label = machineLabel else { return nil }
+        // A nil label used to render as NOTHING here — the exported
+        // block showed a bare timestamp with no speaker, mid-way
+        // through one person's monologue, which reads like a formatting
+        // bug rather than the diarization coverage hole it actually is
+        // (field report 2026-08-12). Name the uncertainty instead; see
+        // `TranscriptSegment.unknownSpeakerDisplayName` for why this is
+        // not given a speaker NUMBER.
+        guard let label = machineLabel else {
+            return TranscriptSegment.unknownSpeakerDisplayName
+        }
         if let custom = speakerNames[label]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !custom.isEmpty {
             return custom

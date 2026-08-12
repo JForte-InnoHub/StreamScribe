@@ -89,6 +89,30 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
     /// nil (= false), same pattern as `rawText`.
     var userEdited: Bool?
 
+    /// Set when the cleanup model DECLINED to repair this segment
+    /// because the passage was too disfluent to correct safely
+    /// (2026-08-07). The text is left exactly as the ASR produced it.
+    /// This is a review signal, not a defect: a flagged segment is one
+    /// where confident editing would have been more dangerous than
+    /// leaving it alone. Optional so pre-flag sessions decode as nil.
+    var needsReview: Bool?
+
+    /// Rendered in place of a speaker name when a segment carries NO
+    /// diarizer label at all (2026-08-12).
+    ///
+    /// The bare word "Speaker" used to fill this slot, which read like
+    /// a nameless sibling of "Speaker 1"/"Speaker 2" and invited the
+    /// reasonable question "why isn't it numbered?". The answer is that
+    /// there is nothing to number: a nil label means the diarizer
+    /// produced no turn covering this span — a coverage hole — NOT a
+    /// claim that some additional person spoke. Minting "Speaker 2"
+    /// here would fabricate an identity the audio never evidenced, and
+    /// it would leak into the Speakers panel and the voiceprint
+    /// clusters as a phantom participant. Naming the uncertainty is the
+    /// honest rendering; `pickSpeaker`'s neighbour inheritance is what
+    /// actually removes most of these.
+    static let unknownSpeakerDisplayName = "Unknown Speaker"
+
     init(
         id: UUID = UUID(),
         text: String,
@@ -99,7 +123,8 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
         refinementState: SegmentRefinementState = .refined,
         words: [WordToken]? = nil,
         rawText: String? = nil,
-        userEdited: Bool? = nil
+        userEdited: Bool? = nil,
+        needsReview: Bool? = nil
     ) {
         self.id = id
         self.text = text
@@ -111,6 +136,7 @@ struct TranscriptSegment: Identifiable, Equatable, Codable {
         self.words = words
         self.rawText = rawText
         self.userEdited = userEdited
+        self.needsReview = needsReview
     }
 
     var duration: TimeInterval { end - start }

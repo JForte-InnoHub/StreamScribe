@@ -125,6 +125,19 @@ final class VoiceprintService: ObservableObject {
     private var clusterEmbeddingSums: [String: [Float]] = [:]
     private var clusterEmbeddingCounts: [String: Int] = [:]
 
+    /// Total EVIDENCE WEIGHT per cluster (2026-08-07). The centroid is
+    /// now a duration-weighted mean rather than a plain mean: a 0.4s
+    /// interjection and a 25s answer used to contribute equally, but a
+    /// speaker embedding extracted from a fraction of a second is
+    /// mostly noise, so short segments were dragging cluster centroids
+    /// away from the speaker's true voice and costing matches. Weight
+    /// is capped so one very long turn can't wholly dominate.
+    private var clusterEmbeddingWeights: [String: Float] = [:]
+
+    /// Per-segment weight, retained alongside the embedding so
+    /// `reaggregate` can rebuild weighted sums after a relabel.
+    private var retainedWeights: [UUID: Float] = [:]
+
     /// Every extracted embedding, keyed by segment UUID — the raw
     /// evidence, independent of which cluster it was credited to at
     /// extraction time. This is what makes identity SURVIVE
@@ -373,7 +386,7 @@ final class VoiceprintService: ObservableObject {
     /// Suitable for per-segment identification if we ever want that
     /// granularity — currently used per-cluster (once per new
     /// FluidAudio cluster ID per session).
-    func identify(embedding: [Float]) -> Identification? {
+    func identify(embedding: [Float], minimumSimilarity: Double? = nil) -> Identification? {
         guard isEnabled, !templates.isEmpty else { return nil }
         guard !embedding.isEmpty else { return nil }
 
@@ -395,7 +408,8 @@ final class VoiceprintService: ObservableObject {
             }
         }
 
-        guard let name = bestName, bestSimilarity >= lowConfidenceThreshold else {
+        guard let name = bestName,
+              bestSimilarity >= (minimumSimilarity ?? lowConfidenceThreshold) else {
             return nil
         }
         return Identification(name: name, confidence: bestSimilarity, isManual: false)
@@ -451,15 +465,21 @@ final class VoiceprintService: ObservableObject {
     /// a sub-cluster selection now SPLITS it into a new machine
     /// speaker instead — see TranscriptionEngine.identifySegments.)
     ///
-    func recordEmbedding(segmentId: UUID, embedding: [Float], clusterId: String?) {
+    /// `weight` should be the segment's speech duration in seconds;
+    /// it scales the embedding's contribution to the cluster centroid.
+    /// Defaults to 1.0 so any caller that doesn't supply one behaves
+    /// exactly as before.
+    func recordEmbedding(segmentId: UUID, embedding: [Float], clusterId: String?, weight: Float = 1.0) {
         guard isEnabled else { return }
+        let w = Self.normalizedWeight(weight)
         retainedEmbeddings[segmentId] = embedding
+        retainedWeights[segmentId] = w
 
         // Add to cluster running total — always, regardless of
         // manual override state. Keeps the average correct if the
         // manual identification is later cleared.
         if let clusterId {
-            addEmbeddingToCluster(clusterId: clusterId, embedding: embedding)
+            addEmbeddingToCluster(clusterId: clusterId, embedding: embedding, weight: w)
         }
 
         // Manual cluster assignment is user truth — don't re-match.
@@ -477,19 +497,31 @@ final class VoiceprintService: ObservableObject {
     /// Add an embedding to the running total for a cluster. Element-
     /// wise addition; count increments by 1. The `since-last-match`
     /// counter also increments, driving when we re-run identification.
-    private func addEmbeddingToCluster(clusterId: String, embedding: [Float]) {
+    private func addEmbeddingToCluster(clusterId: String, embedding: [Float], weight: Float = 1.0) {
+        let w = Self.normalizedWeight(weight)
         if var existingSum = clusterEmbeddingSums[clusterId] {
             let limit = min(existingSum.count, embedding.count)
             for i in 0..<limit {
-                existingSum[i] += embedding[i]
+                existingSum[i] += embedding[i] * w
             }
             clusterEmbeddingSums[clusterId] = existingSum
         } else {
-            // First embedding for this cluster — copy in as the sum.
-            clusterEmbeddingSums[clusterId] = embedding
+            // First embedding for this cluster — seed the weighted sum.
+            clusterEmbeddingSums[clusterId] = embedding.map { $0 * w }
         }
+        clusterEmbeddingWeights[clusterId, default: 0] += w
         clusterEmbeddingCounts[clusterId, default: 0] += 1
         clusterEmbeddingsSinceLastMatch[clusterId, default: 0] += 1
+    }
+
+    /// Clamp an evidence weight into a sane range. Sub-second audio
+    /// yields unreliable embeddings so it earns proportionally little
+    /// say; beyond ~10s the embedding has stopped improving, so the
+    /// cap stops one long monologue from swamping every other turn in
+    /// the cluster.
+    private static func normalizedWeight(_ seconds: Float) -> Float {
+        guard seconds.isFinite, seconds > 0 else { return 1.0 }
+        return min(seconds, 10.0)
     }
 
     /// Match a cluster's running-average embedding against templates
@@ -511,7 +543,19 @@ final class VoiceprintService: ObservableObject {
 
         guard let sum = clusterEmbeddingSums[clusterId],
               let count = clusterEmbeddingCounts[clusterId],
-              count >= 3 else { return }
+              count >= 1 else { return }
+
+        // SHORT-CLUSTER POLICY (2026-08-07). The floor used to be a
+        // hard `count >= 3`, and `forceMatchAllPendingClusters` only
+        // bumps the since-last-match counter — it does NOT bypass the
+        // floor. So a cluster with one or two segments could never be
+        // identified at all, in any pass, ever. In a hearing that is
+        // exactly the brief questioner or the one-line interjection,
+        // which is a large share of the speakers users most want named.
+        // Rather than exclude them we still match — but demand the
+        // HIGH-confidence bar, because thin evidence deserves a
+        // stronger claim. Clusters with 3+ segments keep the normal bar.
+        let requiredSimilarity = count >= 3 ? lowConfidenceThreshold : highConfidenceThreshold
 
         // Only match if enough new evidence has arrived since last
         // match. Prevents re-matching on every single segment.
@@ -522,7 +566,8 @@ final class VoiceprintService: ObservableObject {
         // Compute running average and L2-normalize. Templates are
         // also L2-normalized (see `refreshFromRemote`), so cosine
         // similarity reduces to dot product.
-        let scale = 1.0 / Float(count)
+        let totalWeight = clusterEmbeddingWeights[clusterId] ?? Float(count)
+        let scale = 1.0 / max(totalWeight, .leastNonzeroMagnitude)
         var average = sum.map { $0 * scale }
         var normSquared: Float = 0
         for value in average { normSquared += value * value }
@@ -537,7 +582,7 @@ final class VoiceprintService: ObservableObject {
         // apply to the cluster. If not, leave the cluster
         // unidentified (or keep its previous identification if any —
         // don't overwrite with nil).
-        if let newMatch = identify(embedding: average) {
+        if let newMatch = identify(embedding: average, minimumSimilarity: requiredSimilarity) {
             let previousName = identifications[clusterId]?.name
             identifications[clusterId] = newMatch
             sessionSpeakerHistory.insert(newMatch.name)
@@ -584,13 +629,15 @@ final class VoiceprintService: ObservableObject {
     func reaggregate(assignments: [UUID: String]) {
         clusterEmbeddingSums.removeAll()
         clusterEmbeddingCounts.removeAll()
+        clusterEmbeddingWeights.removeAll()
         clusterEmbeddingsSinceLastMatch.removeAll()
         identifications = identifications.filter { $0.value.isManual }
 
         var used = 0
         for (segmentId, clusterId) in assignments {
             guard let emb = retainedEmbeddings[segmentId] else { continue }
-            addEmbeddingToCluster(clusterId: clusterId, embedding: emb)
+            addEmbeddingToCluster(clusterId: clusterId, embedding: emb,
+                                  weight: retainedWeights[segmentId] ?? 1.0)
             used += 1
         }
         forceMatchAllPendingClusters()
@@ -605,7 +652,7 @@ final class VoiceprintService: ObservableObject {
         guard let sum = clusterEmbeddingSums[clusterId],
               let count = clusterEmbeddingCounts[clusterId],
               count > 0 else { return nil }
-        let scale = 1.0 / Float(count)
+        let scale = 1.0 / max(clusterEmbeddingWeights[clusterId] ?? Float(count), .leastNonzeroMagnitude)
         var average = sum.map { $0 * scale }
         var normSquared: Float = 0
         for value in average { normSquared += value * value }
@@ -694,9 +741,11 @@ final class VoiceprintService: ObservableObject {
     func resetForNewSession() {
         identifications.removeAll()
         retainedEmbeddings.removeAll()
+        retainedWeights.removeAll()
         sessionSpeakerHistory.removeAll()
         clusterEmbeddingSums.removeAll()
         clusterEmbeddingCounts.removeAll()
+        clusterEmbeddingWeights.removeAll()
         clusterEmbeddingsSinceLastMatch.removeAll()
     }
 

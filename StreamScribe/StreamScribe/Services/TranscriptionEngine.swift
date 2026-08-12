@@ -1352,38 +1352,18 @@ final class TranscriptionEngine: ObservableObject {
             return
         }
 
-        // CIVICCLERK PORTALS (2026-07-22): resolve portal event URLs
-        // to their direct media BEFORE anything downstream sees the
-        // URL — the probe, yt-dlp's generic extractor, the downloader,
-        // and the miniplayer cache all handle a plain remote mp4/m3u8
-        // natively; only the SPA wrapper defeats them.
-        if let civic = await Self.resolveCivicClerkMedia(url: url) {
-            url = civic.mediaURL
-            if let portalTitle = civic.title, !portalTitle.isEmpty, detectedTitle == nil {
-                detectedTitle = portalTitle
-            }
-        }
-
-        // STATE LEGISLATURE HEARINGS (2026-07-28). Two tiers, most
-        // specific first:
-        //   1. Per-state resolvers (currently Texas) — precise, know
-        //      the exact page→media mapping for one system.
-        //   2. Generic HLS page-sniffer — fetches an HTML player page
-        //      and pulls the first .m3u8 it references. Catches the
-        //      many state/municipal players that simply embed an
-        //      m3u8 in page JS, without a bespoke resolver each.
-        // Both run only for http(s) non-file URLs that aren't already
-        // a recognized yt-dlp site or direct media, and both fail open
-        // (nil → original URL proceeds). The generic sniffer is LAST so
-        // a precise resolver always wins.
-        if !url.isFileURL {
-            if let resolved = await Self.resolveStatehousePlayer(url: url) {
-                url = resolved.mediaURL
-                if let t = resolved.title, !t.isEmpty, detectedTitle == nil { detectedTitle = t }
-            } else if let sniffed = await Self.sniffEmbeddedHLS(url: url) {
-                url = sniffed.mediaURL
-                if let t = sniffed.title, !t.isEmpty, detectedTitle == nil { detectedTitle = t }
-            }
+        // PORTAL / PLAYER PAGE RESOLUTION: rewrite portal event URLs to
+        // their direct media BEFORE anything downstream sees the URL —
+        // the probe, yt-dlp's generic extractor, the downloader, and
+        // the miniplayer cache all handle a plain remote mp4/m3u8
+        // natively; only the SPA wrapper defeats them. Covers
+        // CivicClerk, per-state legislature players, Invintus, and the
+        // generic page sniffer, in most-specific-first order, sharing
+        // one page fetch (see `resolvePortalMedia`). Fails open — nil
+        // leaves the original URL untouched.
+        if let resolved = await Self.resolvePortalMedia(url: url) {
+            url = resolved.mediaURL
+            if let t = resolved.title, !t.isEmpty, detectedTitle == nil { detectedTitle = t }
         }
 
         let source = StreamSource.detect(from: url)
@@ -2451,6 +2431,33 @@ final class TranscriptionEngine: ObservableObject {
             let wantsVideo = UserDefaults.standard.object(forKey: mediaCacheIncludeVideoKey) as? Bool
                 ?? mediaCacheIncludeVideoDefault
 
+            // SPLIT-STREAM COMPLETION (2026-08-12). The block below
+            // gives STATIC sessions their miniplayer video from a
+            // separate complete-file download — so the pipe's cache
+            // output must NOT also carry video. It was doing exactly
+            // that: `wantsVideoInCache: wantsVideo` was passed
+            // unconditionally, so ffmpeg added `-map 0:V?` plus an
+            // h264_videotoolbox transcode as a SECOND output on the
+            // live pipe.
+            //
+            // That transcode is what made static sessions slow. ffmpeg
+            // reads stdin, so its slowest output paces the whole
+            // process, and a blocked ffmpeg means a blocked stdin pipe,
+            // which back-pressures yt-dlp. Field evidence (57s X VOD):
+            // audio arrived at a pinned 1.29-1.30x realtime while the
+            // separate downloader pulled the SAME asset ~8x faster on
+            // the same link — the pipe was encoder-bound, not
+            // network-bound, and the log shows h264_videotoolbox
+            // initializing on the pipe's ffmpeg ~1s after spawn.
+            //
+            // Net effect of the fix: static sessions decode video ONCE
+            // (in the downloader that actually owns the miniplayer
+            // file) instead of twice, and audio reaches the
+            // transcriber as fast as bytes arrive. Live sessions are
+            // untouched — they have no separate downloader, so the
+            // pipe's cache output remains their only source of video.
+            let videoHandledBySeparateDownload = useFastDownload && wantsVideo && source != .localFile
+
             let audioStream = try await extractor.start(
                 url: url,
                 source: source,
@@ -2468,9 +2475,9 @@ final class TranscriptionEngine: ObservableObject {
                 // (bandwidth/disk save) and ffmpeg writes an audio-only
                 // mp4 — still plays in the miniplayer, just with no
                 // video track.
-                wantsVideoInCache: wantsVideo
+                wantsVideoInCache: wantsVideo && !videoHandledBySeparateDownload
             )
-            print("[Pipeline] Audio stream open. Beginning to read frames. (cache video: \(wantsVideo))")
+            print("[Pipeline] Audio stream open. Beginning to read frames. (cache video: \(wantsVideo)\(videoHandledBySeparateDownload ? " — pipe audio-only; video via separate download" : ""))")
 
             // SPLIT-STREAM: static sessions get miniplayer video from a
             // separate complete-file download (the pipe is audio-only
@@ -2789,7 +2796,9 @@ final class TranscriptionEngine: ObservableObject {
             // B's text into A and dropping B. See the docstring for
             // the safety thresholds (word count, terminal punctuation,
             // time gap) that prevent folding real short utterances.
-            self.segments = self.reabsorbTinyTrailingFragments(splitOut)
+            self.segments = self.fillSpeakerCoverageGaps(
+                self.reabsorbTinyTrailingFragments(splitOut)
+            )
             // De-shout pass. Whisper occasionally emits long runs of
             // ALL-CAPS text — an artifact of its training on broadcast/
             // SDH caption data, which is frequently uppercase. It tends
@@ -3471,7 +3480,8 @@ final class TranscriptionEngine: ObservableObject {
             VoiceprintService.shared.recordEmbedding(
                 segmentId: segment.id,
                 embedding: embedding,
-                clusterId: segment.speaker
+                clusterId: segment.speaker,
+                weight: Float(max(0, segment.end - segment.start))
             )
             if let cluster = segment.speaker,
                let id = VoiceprintService.shared.identifications[cluster],
@@ -3559,7 +3569,8 @@ final class TranscriptionEngine: ObservableObject {
                 VoiceprintService.shared.recordEmbedding(
                     segmentId: seg.id,
                     embedding: embedding,
-                    clusterId: seg.speaker
+                    clusterId: seg.speaker,
+                    weight: Float(max(0, seg.end - seg.start))
                 )
 
                 // Cluster identification may have just landed. Check
@@ -3705,7 +3716,8 @@ final class TranscriptionEngine: ObservableObject {
                 VoiceprintService.shared.recordEmbedding(
                     segmentId: seg.id,
                     embedding: embedding,
-                    clusterId: seg.speaker
+                    clusterId: seg.speaker,
+                    weight: Float(max(0, seg.end - seg.start))
                 )
                 if let cluster = seg.speaker,
                    VoiceprintService.shared.identifications[cluster] != nil {
@@ -4990,14 +5002,14 @@ final class TranscriptionEngine: ObservableObject {
                 Array(Set(self.speakerNames.values)
                     .union(VoiceprintService.shared.sessionSpeakerHistory))
             }
-            let cleaned = try await TranscriptCleanupService.shared.cleanTranscript(
+            let cleanupResult = try await TranscriptCleanupService.shared.cleanTranscript(
                 segments: snapshot,
                 knownNames: knownNames,
                 progress: { done, total in
                     Task { await self.setState(.preparing("Cleaning up transcript (\(done)/\(total))…")) }
                 }
             )
-            await MainActor.run { self.applyCleanedTexts(cleaned) }
+            await MainActor.run { self.applyCleanedTexts(cleanupResult) }
 
             // Cleanup report: every change as before → after with
             // time + speaker, written to a reviewable file. This is
@@ -5005,15 +5017,33 @@ final class TranscriptionEngine: ObservableObject {
             // to see exactly what the model did (and judge whether
             // it's catching the error classes you care about) instead
             // of hunting for diffs by eye in the transcript.
-            if !cleaned.isEmpty {
+            if !cleanupResult.corrections.isEmpty || !cleanupResult.needsReview.isEmpty {
                 var lines: [String] = ["StreamScribe Cleanup Report — \(Date())", ""]
                 for seg in snapshot {
-                    guard let after = cleaned[seg.id] else { continue }
-                    let who = displayName(forSegment: seg) ?? seg.speaker ?? "Speaker"
+                    guard let after = cleanupResult.corrections[seg.id] else { continue }
+                    let who = displayName(forSegment: seg) ?? seg.speaker ?? TranscriptSegment.unknownSpeakerDisplayName
                     lines.append("[\(TranscriptSegment.formatTime(seg.start))] \(who)")
                     lines.append("  BEFORE: \(seg.text.trimmingCharacters(in: .whitespacesAndNewlines))")
                     lines.append("  AFTER:  \(after)")
                     lines.append("")
+                }
+
+                // Declined passages (2026-08-07). The model left these
+                // exactly as spoken because it judged them too
+                // disfluent to reconstruct. They are the review
+                // worklist — and until now nothing surfaced them at
+                // all, which made the flag useless. Listing them here
+                // costs nothing and puts them in the one artifact
+                // that already exists to be read after a session.
+                if !cleanupResult.needsReview.isEmpty {
+                    lines.append("── FLAGGED: too disfluent to repair, left verbatim ──")
+                    lines.append("")
+                    for seg in snapshot where cleanupResult.needsReview.contains(seg.id) {
+                        let who = displayName(forSegment: seg) ?? seg.speaker ?? TranscriptSegment.unknownSpeakerDisplayName
+                        lines.append("[\(TranscriptSegment.formatTime(seg.start))] \(who)")
+                        lines.append("  VERBATIM: \(seg.text.trimmingCharacters(in: .whitespacesAndNewlines))")
+                        lines.append("")
+                    }
                 }
                 let reportDir = FileManager.default
                     .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -5023,7 +5053,7 @@ final class TranscriptionEngine: ObservableObject {
                     .replacingOccurrences(of: ":", with: "-")
                 let reportURL = reportDir.appendingPathComponent("cleanup-\(stamp).txt")
                 try? lines.joined(separator: "\n").write(to: reportURL, atomically: true, encoding: .utf8)
-                print("[Cleanup] Report (\(cleaned.count) change(s)) written to: \(reportURL.path)")
+                print("[Cleanup] Report (\(cleanupResult.corrections.count) change(s), \(cleanupResult.needsReview.count) flagged) written to: \(reportURL.path)")
             }
         } catch {
             print("[Cleanup] Pass failed: \(error.localizedDescription). Transcript keeps verbatim text.")
@@ -5037,25 +5067,65 @@ final class TranscriptionEngine: ObservableObject {
     /// and a wrong mapping is worse than interpolation (which the
     /// seek/split paths fall back to automatically).
     @MainActor
-    func applyCleanedTexts(_ cleaned: [UUID: String]) {
-        guard !cleaned.isEmpty else {
+    func applyCleanedTexts(_ result: TranscriptCleanupService.CleanupResult) {
+        guard !result.corrections.isEmpty || !result.needsReview.isEmpty else {
             print("[Cleanup] No segments changed.")
             return
         }
         var updated = 0
+        var flagged = 0
         var newSegments = segments
         for i in newSegments.indices {
-            guard let newText = cleaned[newSegments[i].id] else { continue }
             // User-edited text is final — the cleanup model doesn't
-            // get to overrule the human (2026-07-21).
+            // get to overrule the human (2026-07-21). That applies to
+            // the review flag too: a human who edited a line has
+            // already made their call on it.
             if newSegments[i].userEdited == true { continue }
+
+            // Declined passages keep their verbatim text and get
+            // flagged. Checked BEFORE corrections because a declined
+            // line never carries one.
+            if result.needsReview.contains(newSegments[i].id) {
+                newSegments[i].needsReview = true
+                flagged += 1
+                continue
+            }
+            guard let newText = result.corrections[newSegments[i].id] else { continue }
             newSegments[i].rawText = newSegments[i].rawText ?? newSegments[i].text
             newSegments[i].text = newText
             newSegments[i].words = nil
             updated += 1
         }
         segments = newSegments
-        print("[Cleanup] Applied cleaned text to \(updated) segment(s); verbatim preserved in rawText.")
+        print("[Cleanup] Applied cleaned text to \(updated) segment(s); \(flagged) flagged as too disfluent to repair; verbatim preserved in rawText.")
+    }
+
+    /// Restore a segment's verbatim ASR text, undoing whatever the
+    /// cleanup pass (or a refinement) replaced it with.
+    ///
+    /// The verbatim text has ALWAYS been preserved in `rawText` — the
+    /// gap was that nothing in the UI could reach it (2026-08-07), so
+    /// an over-aggressive cleanup was unrecoverable in practice even
+    /// though it was recoverable in principle. With this, a bad edit
+    /// costs a click instead of a lost quote, which is what makes it
+    /// safe to keep cleanup aggressive by default.
+    func restoreVerbatim(ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        var restored = 0
+        var newSegments = segments
+        for i in newSegments.indices where ids.contains(newSegments[i].id) {
+            guard let raw = newSegments[i].rawText, !raw.isEmpty else { continue }
+            newSegments[i].text = raw
+            newSegments[i].rawText = nil
+            newSegments[i].needsReview = nil
+            // The line is the ASR's own words again, so it is no longer
+            // a human edit — but it must still resist being re-cleaned
+            // automatically, or the next pass would undo the restore.
+            newSegments[i].userEdited = true
+            restored += 1
+        }
+        segments = newSegments
+        print("[Cleanup] Restored verbatim text for \(restored) segment(s).")
     }
 
     /// Boundary times for a split at character offsets [lo, hi) of
@@ -5329,7 +5399,81 @@ final class TranscriptionEngine: ObservableObject {
         return tokens
     }
 
+    /// Fill diarization COVERAGE HOLES on a finished segment array.
+    ///
+    /// A hole is a segment the diarizer produced no turn for — VAD
+    /// routinely drops a short utterance across a breath or a level dip
+    /// that Whisper hears perfectly well. It is NOT a speaker change,
+    /// but it renders as one: the run breaks and the orphan shows up as
+    /// "Unknown Speaker" mid-monologue (field report 2026-08-12, a 2s
+    /// "But today, we won." inside a single-speaker clip).
+    ///
+    /// **Why this is an array pass and not a lookup during labelling.**
+    /// `pickSpeaker`'s neighbour fallback reads `self.segments`, which
+    /// works live (earlier segments are already appended and labelled)
+    /// but is useless in the whole-file pass: that builds its labels by
+    /// mapping over `self.segments`, so while the map runs EVERY
+    /// segment there still carries the nil speaker static mode gives
+    /// it, and the neighbour search finds nothing informative. The gap
+    /// fill has to happen after the labels exist — hence here, on the
+    /// final array, once splitting and reabsorption have settled.
+    ///
+    /// Rule: inherit only when the nearest labelled segments on BOTH
+    /// sides carry the same speaker. A hole between two different
+    /// speakers is a genuine ambiguity at a handoff and keeps its nil,
+    /// which is exactly the "people talking over each other" case that
+    /// should still read as unknown. Holes at the very start or end of
+    /// a transcript have only one side and are left alone.
+    @MainActor
+    private func fillSpeakerCoverageGaps(_ segs: [TranscriptSegment]) -> [TranscriptSegment] {
+        guard diarizationEngine != .off else { return segs }
+        var out = segs
+        var filled = 0
+        for i in out.indices where out[i].speaker == nil || out[i].speaker == "UNKNOWN" {
+            var before: String?
+            var j = i - 1
+            while j >= 0 {
+                if let label = out[j].speaker, label != "UNKNOWN" { before = label; break }
+                j -= 1
+            }
+            guard let before else { continue }
+
+            var after: String?
+            var k = i + 1
+            while k < out.count {
+                if let label = out[k].speaker, label != "UNKNOWN" { after = label; break }
+                k += 1
+            }
+            guard let after, after == before else { continue }
+
+            out[i].speaker = before
+            filled += 1
+        }
+        if filled > 0 {
+            print("[Diarize] Filled \(filled) diarization coverage hole(s) by inheriting the surrounding speaker.")
+        }
+        return out
+    }
+
     /// Choose the speaker with the largest temporal overlap for this text segment.
+    ///
+    /// **Gap inheritance (2026-08-12).** When no diarizer turn overlaps
+    /// the segment at all, this used to return nil, leaving the segment
+    /// speakerless — which surfaces as a nameless block mid-monologue
+    /// (field report: a 2-second "But today, we won." split out of an
+    /// otherwise single-speaker clip and rendered with no speaker name).
+    /// The cause is not a speaker change: diarizer VAD routinely misses
+    /// a short utterance that Whisper hears, especially across a breath
+    /// or a level dip, so the segment falls into a coverage hole.
+    ///
+    /// The refined path already handled this — `dominantSpeakerLabel`
+    /// consults `neighborContextLabel` before giving up — but the raw
+    /// path never got the same treatment, so static sessions (which use
+    /// this method) kept producing holes. Same helper, same rule: adopt
+    /// the surrounding speaker only when the informative neighbours
+    /// agree, which is precisely the "sandwiched inside one person's
+    /// monologue" case and never overrides a genuine handoff, since
+    /// disagreeing neighbours still return nil.
     @MainActor
     private func pickSpeaker(start: TimeInterval, end: TimeInterval) -> String? {
         guard diarizationEngine != .off, !allSpeakerTurns.isEmpty else { return nil }
@@ -5340,7 +5484,14 @@ final class TranscriptionEngine: ObservableObject {
                 best = (t.speaker, ov)
             }
         }
-        return best?.label
+        if let best { return best.label }
+        // No overlap anywhere — a diarization coverage hole, not a
+        // handoff. Inherit from context when the neighbours agree.
+        if let inherited = neighborContextLabel(start: start, end: end) {
+            print("[Diarize] Segment [\(fmt(start))..\(fmt(end))] had no diarizer coverage → inherited \(inherited) from matching neighbors.")
+            return inherited
+        }
+        return nil
     }
 
     /// Phase 5: refined-segment label assignment via time-weighted vote across
@@ -6687,20 +6838,10 @@ final class TranscriptionEngine: ObservableObject {
     /// site or a direct-media URL — and only accepts a page that is
     /// actually HTML. nil on anything else, so the pipeline's normal
     /// path (yt-dlp generic) still runs as the true fallback.
-    private static func sniffEmbeddedHLS(url: URL) async -> ResolvedMedia? {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        let classification = StreamSource.detect(from: url)
-        guard classification == .unknown else {
-            print("[Sniffer] Skipped \(url.host ?? "page"): classified as \(classification.rawValue), not an unrecognized page.")
-            return nil
-        }
-        // A path that already looks like media isn't a player page.
-        let lowerPath = url.path.lowercased()
-        guard !lowerPath.hasSuffix(".m3u8"), !lowerPath.hasSuffix(".mp4"), !lowerPath.hasSuffix(".mp3") else { return nil }
-
-        print("[Sniffer] Inspecting \(url.host ?? "page") for embedded media…")
-        guard let html = await fetchHTML(url) else { return nil }
-
+    /// Gates and the page fetch live in `resolvePortalMedia`, which
+    /// hands the already-fetched HTML to this and to the Invintus
+    /// resolver so one page load serves both.
+    private static func sniffEmbeddedHLS(url: URL, html: String) -> ResolvedMedia? {
         // 1. Media the page DECLARES as its own content — og:audio /
         //    og:video, schema.org contentUrl, common player-config JSON
         //    keys, <audio>/<video>/<source> src.
@@ -6738,22 +6879,22 @@ final class TranscriptionEngine: ObservableObject {
             print("[Sniffer] Embedded HLS manifest on \(url.host ?? "page"): \(manifest.absoluteString)")
             return ResolvedMedia(mediaURL: manifest, title: htmlTitle(from: html))
         }
-        // Report WHAT the page contained, so a no-match is immediately
-        // attributable: markers present means our patterns missed
-        // something; markers absent means the served HTML genuinely
-        // carries no media (auth/paywall-gated rendering, or a shell
-        // that loads it later).
-        let scanned = unescapedForScanning(html)
-        func occurrences(_ needle: String) -> Int {
-            scanned.components(separatedBy: needle).count - 1
-        }
-        print("""
-        [Sniffer] Fetched \(url.host ?? "page") but found no media — falling through. \
-        Markers in the served HTML: .m3u8=\(occurrences(".m3u8")) .mp4=\(occurrences(".mp4")) \
-        .mp3=\(occurrences(".mp3")) contentUrl=\(occurrences("contentUrl")) \
-        og:video=\(occurrences("og:video")) og:audio=\(occurrences("og:audio")) \
-        <video=\(occurrences("<video")) <source=\(occurrences("<source"))
-        """)
+        // Report WHICH media markers the page contained, so a no-match
+        // is immediately attributable: any marker present means our
+        // patterns missed something; none present means the served HTML
+        // genuinely carries no media (auth/paywall-gated rendering, or
+        // a shell that loads it later — the NBC News verdict).
+        //
+        // Deliberately cheap (2026-08-04): `contains` short-circuits at
+        // the first hit, where the original version split the ENTIRE
+        // page on each of eight needles — eight full traversals plus
+        // eight substring arrays, on pages that run to hundreds of KB.
+        // It also skipped the slash-unescaping pass the original did,
+        // which was pointless here: none of these markers contain a
+        // slash, so escaping never affected them.
+        let markers = [".m3u8", ".mp4", ".mp3", "contentUrl", "og:video", "og:audio", "<video", "<source"]
+            .filter { html.contains($0) }
+        print("[Sniffer] Fetched \(url.host ?? "page") but found no media — falling through. Markers present: \(markers.isEmpty ? "none" : markers.joined(separator: " "))")
         return nil
     }
 
@@ -6798,19 +6939,65 @@ final class TranscriptionEngine: ObservableObject {
     /// here as their systems are confirmed against a real page.
     private static func resolveStatehousePlayer(url: URL) async -> ResolvedMedia? {
         guard let host = url.host?.lowercased() else { return nil }
-        // Host-specific resolvers first (know one system precisely).
+        // Host-keyed resolvers only — each knows one system precisely
+        // and fetches only for its own hosts. Content-keyed platform
+        // resolvers (Invintus) moved to `resolvePortalMedia`, which
+        // shares one page fetch with the generic sniffer.
         switch host {
         case "senate.texas.gov", "house.texas.gov":
-            if let tx = await resolveTexasLegislature(url: url) { return tx }
+            return await resolveTexasLegislature(url: url)
         default:
-            break
+            return nil
         }
-        // Platform resolvers, keyed on page CONTENT not host — one
-        // resolver covers every site embedding that platform. Invintus
-        // is used by KTOO/360 North (Alaska) and numerous state
-        // legislatures, so this is high-leverage.
-        if let inv = await resolveInvintusPlayer(url: url) { return inv }
-        return nil
+    }
+
+    /// Single entry point for URL → media resolution. Used by BOTH the
+    /// eager probe and `start()`.
+    ///
+    /// FETCH ECONOMY (2026-08-04). These resolvers used to run as three
+    /// independent passes, each fetching the page for itself: Invintus
+    /// fetched to look for its embed markers, then the generic sniffer
+    /// fetched the same URL all over again — two page loads per pass,
+    /// four per session once probe and Start both ran. Worse, the
+    /// Invintus check ran for EVERY remote URL, so starting a YouTube
+    /// session pointlessly downloaded the YouTube watch page's HTML.
+    ///
+    /// Now: host-keyed resolvers run first and fetch only for their own
+    /// hosts, and the page-backed resolvers SHARE ONE FETCH and run
+    /// only for URLs the classifier didn't recognize. That last gate
+    /// costs nothing in coverage — every Invintus-embedding site is an
+    /// unrecognized host by definition, since a recognized one would
+    /// have its own handler.
+    ///
+    /// Net effect per pass: recognized sites (YouTube, Twitter,
+    /// Granicus, direct media…) do ZERO page fetches where they
+    /// previously did one; unrecognized pages do one where they
+    /// previously did two.
+    private static func resolvePortalMedia(url: URL) async -> ResolvedMedia? {
+        guard !url.isFileURL else { return nil }
+
+        // 1. CivicClerk — host-gated, resolves through its tenant API
+        //    rather than the page, so no HTML fetch at all.
+        if let civic = await resolveCivicClerkMedia(url: url) {
+            return ResolvedMedia(mediaURL: civic.mediaURL, title: civic.title)
+        }
+        // 2. Host-keyed per-state resolvers (Texas).
+        if let statehouse = await resolveStatehousePlayer(url: url) {
+            return statehouse
+        }
+        // 3. Page-backed resolvers — one fetch, shared.
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
+        guard StreamSource.detect(from: url) == .unknown else { return nil }
+        let lowerPath = url.path.lowercased()
+        guard !lowerPath.hasSuffix(".m3u8"), !lowerPath.hasSuffix(".mp4"), !lowerPath.hasSuffix(".mp3") else { return nil }
+
+        print("[Sniffer] Inspecting \(url.host ?? "page") for embedded media…")
+        guard let html = await fetchHTML(url) else { return nil }
+
+        // Invintus first: it's a precise platform match, and its API
+        // gives a better answer than scraping the page would.
+        if let invintus = await resolveInvintusPlayer(url: url, html: html) { return invintus }
+        return sniffEmbeddedHLS(url: url, html: html)
     }
 
     /// Invintus Media player (2026-07-29). Pages embed:
@@ -6825,8 +7012,7 @@ final class TranscriptionEngine: ObservableObject {
     /// Invintus-hosted page (KTOO, 360 North, state legislatures), not
     /// just one host. The eventID may also be in the page URL's query
     /// (?eventID=), used as a fallback if the markup lacks it.
-    private static func resolveInvintusPlayer(url: URL) async -> ResolvedMedia? {
-        guard let html = await fetchHTML(url) else { return nil }
+    private static func resolveInvintusPlayer(url: URL, html: String) async -> ResolvedMedia? {
         guard html.contains("invintus-player") || html.contains("invintusConfig") else { return nil }
 
         func firstMatch(_ pattern: String, _ text: String) -> String? {
@@ -7052,22 +7238,12 @@ final class TranscriptionEngine: ObservableObject {
             // to the normal probe paths unchanged.
             var url = url
             var source = source
-            if !url.isFileURL {
-                var resolvedMedia: ResolvedMedia?
-                if let civic = await Self.resolveCivicClerkMedia(url: url) {
-                    resolvedMedia = ResolvedMedia(mediaURL: civic.mediaURL, title: civic.title)
-                } else if let sh = await Self.resolveStatehousePlayer(url: url) {
-                    resolvedMedia = sh
-                } else if let sniffed = await Self.sniffEmbeddedHLS(url: url) {
-                    resolvedMedia = sniffed
-                }
-                if let resolvedMedia {
-                    url = resolvedMedia.mediaURL
-                    source = StreamSource.detect(from: url)
-                    if let t = resolvedMedia.title, !t.isEmpty {
-                        await MainActor.run { [weak self] in
-                            if self?.detectedTitle == nil { self?.detectedTitle = t }
-                        }
+            if let resolvedMedia = await Self.resolvePortalMedia(url: url) {
+                url = resolvedMedia.mediaURL
+                source = StreamSource.detect(from: url)
+                if let t = resolvedMedia.title, !t.isEmpty {
+                    await MainActor.run { [weak self] in
+                        if self?.detectedTitle == nil { self?.detectedTitle = t }
                     }
                 }
             }

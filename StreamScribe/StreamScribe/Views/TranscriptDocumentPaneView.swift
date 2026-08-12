@@ -436,7 +436,7 @@ struct TranscriptDocumentPaneView: View {
         for slice in slices {
             guard let seg = segByID[slice.id] else { continue }
             let name = engine.displayName(forSegment: seg)
-                ?? seg.speaker ?? "Speaker"
+                ?? seg.speaker ?? TranscriptSegment.unknownSpeakerDisplayName
             if var last = blocks.last, last.name == name {
                 last.texts.append(slice.text)
                 blocks[blocks.count - 1] = last
@@ -556,6 +556,15 @@ struct TranscriptDocumentPaneView: View {
                 editDraftText = seg.text
                 showEditSheet = true
             })
+            // Verbatim recovery (2026-08-07). rawText has always held
+            // the original ASR words whenever cleanup or refinement
+            // replaced them — this is the first way to actually get
+            // them back. Shown only when there is something to restore.
+            if let raw = seg.rawText, !raw.isEmpty, raw != seg.text {
+                items.append(HandlerMenuItem(title: "Restore Verbatim Text") {
+                    engine.restoreVerbatim(ids: [segID])
+                })
+            }
         }
 
         // Identify actions require templates + a cluster identity.

@@ -1445,6 +1445,20 @@ actor AudioStreamExtractor {
         // First attempt: --live-from-start with cookies (if configured).
         // This gives the best result (DVR replay from broadcast start)
         // but triggers the known yt-dlp bug on some YouTube live streams.
+        //
+        // STATIC SESSIONS DO NOT GET IT (2026-08-12). The flag means
+        // "capture a LIVE stream from its beginning rather than the
+        // live edge" — semantically meaningless for a VOD, which has
+        // a beginning by definition. It was being passed
+        // unconditionally, so every static yt-dlp session inherited a
+        // live-oriented download mode. Field evidence: a 57s X VOD
+        // delivered audio at a rock-steady 1.29-1.30x realtime for 40
+        // seconds — the flat rate is the signature of media-timeline
+        // PACING rather than congestion, and the same 39 MB asset
+        // downloaded concurrently by the video cache finished ~8x
+        // faster on the same link at the same moment, which rules out
+        // bandwidth. Removing it for static costs nothing even if the
+        // pacing turns out to have another cause.
         let firstPipe = try spawnYTDlpPipeProcess(
             url: url,
             source: source,
@@ -1452,7 +1466,7 @@ actor AudioStreamExtractor {
             ffmpegPath: ffmpegPath,
             tools: tools,
             isStaticSession: isStaticSession,
-            useLiveFromStart: true,
+            useLiveFromStart: !isStaticSession,
             useCookies: true
         )
 

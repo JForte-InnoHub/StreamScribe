@@ -55,14 +55,22 @@ final class TranscriptCleanupService {
         return stored.isEmpty ? Self.defaultModelRepo : stored
     }
 
+    /// What a cleanup run produced: text corrections, plus the
+    /// segments the model explicitly DECLINED to repair.
+    struct CleanupResult {
+        var corrections: [UUID: String] = [:]
+        var needsReview: Set<UUID> = []
+    }
+
     /// Run cleanup over a segments snapshot. Returns cleaned text by
-    /// segment ID — only entries that changed AND passed validation.
+    /// segment ID — only entries that changed AND passed validation —
+    /// plus the IDs the model flagged as too disfluent to repair.
     /// `progress(done, total)` reports batch completion for UI.
     func cleanTranscript(
         segments: [TranscriptSegment],
         knownNames: [String] = [],
         progress: @escaping (Int, Int) -> Void
-    ) async throws -> [UUID: String] {
+    ) async throws -> CleanupResult {
         // Batches: greedy pack in document order until either budget
         // is hit. Cross-speaker packing is fine — cleanup is per-line.
         var batches: [[TranscriptSegment]] = []
@@ -81,15 +89,16 @@ final class TranscriptCleanupService {
             currentChars += text.count
         }
         if !current.isEmpty { batches.append(current) }
-        guard !batches.isEmpty else { return [:] }
+        guard !batches.isEmpty else { return CleanupResult() }
 
         let model = try await loadModelIfNeeded()
-        var cleaned: [UUID: String] = [:]
+        var cleaned = CleanupResult()
 
         for (i, batch) in batches.enumerated() {
             do {
                 let result = try await cleanBatch(batch, model: model, knownNames: knownNames)
-                for (id, text) in result { cleaned[id] = text }
+                for (id, text) in result.corrections { cleaned.corrections[id] = text }
+                cleaned.needsReview.formUnion(result.needsReview)
             } catch {
                 print("[Cleanup] Batch \(i + 1)/\(batches.count) failed (\(error.localizedDescription)) — keeping verbatim text for its \(batch.count) segment(s).")
             }
@@ -225,7 +234,7 @@ final class TranscriptCleanupService {
         _ batch: [TranscriptSegment],
         model: ModelContainer,
         knownNames: [String]
-    ) async throws -> [UUID: String] {
+    ) async throws -> CleanupResult {
         let numberedInput = batch.enumerated().map { i, seg in
             "[\(i + 1)] \(seg.text.trimmingCharacters(in: .whitespacesAndNewlines))"
         }.joined(separator: "\n")
@@ -276,7 +285,7 @@ final class TranscriptCleanupService {
     static func parseAndValidate(
         output: String,
         batch: [TranscriptSegment]
-    ) throws -> [UUID: String] {
+    ) throws -> CleanupResult {
         var byIndex: [Int: String] = [:]
         for line in output.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -288,7 +297,7 @@ final class TranscriptCleanupService {
             byIndex[n] = text
         }
 
-        var result: [UUID: String] = [:]
+        var result = CleanupResult()
         // Length floor: numeral conversion legitimately shrinks text
         // ("sixty six billion dollars" → "$66 billion"), so the lower
         // bound relaxes when that option is on. The ceiling never
@@ -296,6 +305,17 @@ final class TranscriptCleanupService {
         let floor = UserDefaults.standard.bool(forKey: numeralsKey) ? 0.3 : 0.5
         for (i, seg) in batch.enumerated() {
             guard let cleaned = byIndex[i + 1] else { continue }  // omitted = unchanged
+            // DECLINE MARKER (2026-08-07): the model may return
+            // `!REVIEW` instead of a rewrite when a passage is too
+            // disfluent to repair safely. The text stays exactly as the
+            // ASR produced it and the segment is flagged for a human.
+            // This converts the worst failure mode — confidently
+            // rewriting speech nobody can reconstruct — into the most
+            // benign one, an untouched verbatim line on a worklist.
+            if cleaned.uppercased().hasPrefix("!REVIEW") {
+                result.needsReview.insert(seg.id)
+                continue
+            }
             let original = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !cleaned.isEmpty else {
                 print("[Cleanup] Line \(i + 1): model tried to empty a segment — keeping verbatim.")
@@ -307,7 +327,7 @@ final class TranscriptCleanupService {
                 continue
             }
             if cleaned != original {
-                result[seg.id] = cleaned
+                result.corrections[seg.id] = cleaned
             }
         }
         return result
@@ -363,6 +383,8 @@ final class TranscriptCleanupService {
         - Never delete a line's content: if a line is entirely filler, leave it unchanged (omit it).
         - NEVER paraphrase, reword, summarize, or "improve" phrasing. The speaker's exact words must survive.
         - No commentary, no code fences.
+        - If a passage is so disfluent that you cannot reconstruct what the speaker meant — heavy stumbling, an abandoned thought with no clean restart, a subject change mid-clause — do NOT attempt a repair. Output "[N] !REVIEW" for that line instead. Its text will be kept exactly as spoken and flagged for a human. Prefer this over guessing: a passage nobody can reconstruct is one where a confident rewrite does the most damage.
+        - !REVIEW is for UNREPAIRABLE passages only, not for ordinary false starts, filler, or stutter — repair those normally.
         """
         // Dictionary terms + THIS SESSION's speaker names. The
         // session names are the sleeper feature: witnesses and
@@ -370,9 +392,19 @@ final class TranscriptCleanupService {
         // exactly the proper nouns the ASR is mangling in body text
         // ("Fire" for "Farar"), and no model can fix a name it has
         // never been given.
-        var terms = CustomDictionary.shared.entries.map(\.replace)
-            .filter { !$0.isEmpty }
-        terms.append(contentsOf: knownNames.filter { !$0.isEmpty })
+        // ORDER MATTERS — session names FIRST (2026-08-07). The list is
+        // capped at 60 to bound prefill cost, and `prefix` truncates the
+        // TAIL, so whatever is appended last is what gets dropped. With
+        // dictionary terms first, a user whose dictionary has grown past
+        // 60 entries silently lost EVERY session name — the witnesses
+        // and members identified during this specific hearing, which the
+        // comment above rightly calls the sleeper feature and which are
+        // the terms the ASR is most likely to be mangling right now. The
+        // static dictionary is the general-purpose fallback and is the
+        // correct thing to truncate.
+        var terms = knownNames.filter { !$0.isEmpty }
+        terms.append(contentsOf: CustomDictionary.shared.entries.map(\.replace)
+            .filter { !$0.isEmpty })
         var seen = Set<String>()
         let unique = terms.filter { seen.insert($0).inserted }.prefix(60)
         if !unique.isEmpty {

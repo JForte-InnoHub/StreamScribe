@@ -127,15 +127,38 @@ actor WhisperKitBackend: TranscriptionBackend {
             )
         }()
 
+        // OFFLINE LOAD FOR CACHED MODELS (2026-08-07). Passing
+        // `modelFolder: nil` + `download: true` tells WhisperKit to
+        // resolve the model through the HuggingFace Hub — and it does
+        // that even when the model is ALREADY sitting complete in the
+        // on-disk cache, because Hub resolution is how it discovers
+        // the path. On a normal network that's an invisible check; on
+        // a Netskope fleet machine it stalls and the timeout surfaces
+        // as "Model not found. Please check the model or repo name"
+        // for a model the app itself just probed as `cached`.
+        //
+        // (The `HF_HUB_OFFLINE` env var set around this call in
+        // TranscriptionEngine does NOT prevent it: that's a Python
+        // huggingface_hub variable, and WhisperKit's Swift Hub client
+        // never reads it. Pointing `modelFolder` at the local copy is
+        // what actually guarantees no network access — an explicit
+        // path means there is nothing left to resolve.)
+        //
+        // Priority: bundled copy → on-disk cache → Hub (first run only).
+        let localFolder = bundledFolder ?? Self.resolvedLocalModelFolder(modelName: modelName)
+        if bundledFolder == nil, let localFolder {
+            print("[Whisper] Loading \(modelName) from on-disk cache (no network): \(localFolder)")
+        }
+
         let config = WhisperKitConfig(
             model: modelName,
-            modelFolder: bundledFolder,             // nil = HF cache; non-nil = bundle
+            modelFolder: localFolder,               // nil ONLY when we have no local copy
             computeOptions: computeOptions,
             verbose: false,
             logLevel: .error,
             prewarm: true,
             load: true,
-            download: bundledFolder == nil          // skip the download path when bundled
+            download: localFolder == nil            // download only when nothing is on disk
         )
         whisperKit = try await WhisperKit(config)
         loadedModelName = modelName
@@ -205,6 +228,29 @@ actor WhisperKitBackend: TranscriptionBackend {
     /// Visibility note: was `private` originally — kept internal now so the
     /// `ModelDownloadManager`'s `isModelCached` helper above can reuse the
     /// same path list. No callers outside this module.
+    /// First cache location that holds a USABLE copy of `modelName`,
+    /// or nil if none does.
+    ///
+    /// "Usable" means the folder contains at least one `.mlmodelc`
+    /// package — the check is deliberately stricter than the
+    /// non-empty test used for cache *reporting*, because this result
+    /// suppresses the download path. A half-pulled folder that merely
+    /// exists must NOT convince us to load offline; better to let
+    /// WhisperKit fetch the remainder than to hand CoreML a directory
+    /// missing its encoder.
+    static func resolvedLocalModelFolder(modelName: String) -> String? {
+        let fm = FileManager.default
+        for path in cacheCandidatePaths(modelName: modelName) {
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
+            guard let contents = try? fm.contentsOfDirectory(atPath: path) else { continue }
+            if contents.contains(where: { $0.hasSuffix(".mlmodelc") }) {
+                return path
+            }
+        }
+        return nil
+    }
+
     static func cacheCandidatePaths(modelName: String) -> [String] {
         let fm = FileManager.default
         var paths: [String] = []

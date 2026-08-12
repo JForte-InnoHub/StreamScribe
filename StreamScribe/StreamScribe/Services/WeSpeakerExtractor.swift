@@ -29,16 +29,29 @@ import FluidAudio
 /// compile — first call is ~3-5 seconds for the initial models
 /// resolution, subsequent calls are <100ms.
 ///
-/// **A fresh DiarizerManager per extraction.** We create a new
-/// `DiarizerManager` for each `extractEmbedding` call rather than
-/// caching one across calls. Reason: `DiarizerManager.speakerManager`
-/// accumulates state across `performCompleteDiarization` invocations.
-/// Calling twice with audio from the same person reuses the existing
-/// cluster ID and returns a running-average embedding — fine for
-/// enrollment (where we WANT averaging), wrong for runtime
-/// identification (where each cluster's current state should be
-/// extracted fresh). Creating a fresh manager per call is cheap
-/// (~10ms) since the models are cached.
+/// **One cached DiarizerManager, stateless extraction** (2026-08-12).
+/// Previously we built a fresh `DiarizerManager` per call and ran
+/// `performCompleteDiarization`, because that call mutates
+/// `speakerManager` — it reuses cluster IDs and returns running-average
+/// embeddings across invocations, which is right for enrollment and
+/// wrong for per-segment identification. A fresh manager avoided the
+/// contamination but re-ran `initialize(models:)` on every segment
+/// (~10ms each, plus two log lines per segment — the "Initializing
+/// diarization system" spam Jamie spotted, ~10/second on a busy
+/// stretch).
+///
+/// FluidAudio exposes `extractSpeakerEmbedding(from:)`, which reads
+/// only `embeddingExtractor` + `models` and never touches
+/// `speakerManager` — it masks the whole clip as one speaker and
+/// returns the embedding directly. That is exactly this class's use
+/// case (we hand it audio already sliced to a single segment), so the
+/// manager can now be cached safely: the hazard that justified
+/// rebuilding it is gone because we no longer call the mutating API.
+///
+/// Side benefits: no segmentation/clustering pass per segment (just
+/// the embedding model), and `selectEmbedding`'s dominant-speaker
+/// heuristic becomes unnecessary — there is no multi-speaker result
+/// to disambiguate.
 @MainActor
 final class WeSpeakerExtractor {
 
@@ -48,6 +61,16 @@ final class WeSpeakerExtractor {
     /// across extractions. Survives session boundaries since the
     /// model weights don't change.
     private var cachedModels: DiarizerModels?
+    private var cachedDiarizer: DiarizerManager?
+
+    /// Longest audio window handed to the embedding model. FluidAudio's
+    /// own example sizes a single-speaker clip at 160 000 samples (10s),
+    /// and speaker embeddings stop improving well before that — the same
+    /// reason `VoiceprintService.normalizedWeight` caps evidence weight
+    /// at 10s. Clamping also keeps us clear of any mask/audio length
+    /// mismatch on long segments, since the mask is sized from the
+    /// segmentation model's frame count rather than from our audio.
+    private static let maxEmbeddingWindowSamples = 160_000
 
     private init() {}
 
@@ -82,16 +105,31 @@ final class WeSpeakerExtractor {
             throw ExtractionError.audioTooShort(durationSeconds: durationSeconds)
         }
 
-        let models = try await loadModels()
-        let diarizer = DiarizerManager()
-        diarizer.initialize(models: models)
+        let diarizer = try await loadDiarizer()
 
-        // Same call path as the standalone enrollment CLI's
-        // EnrollCommand. Returns a DiarizationResult with segments,
-        // and populates SpeakerManager with one or more speakers
-        // representing the detected clusters in this audio.
-        let result = try diarizer.performCompleteDiarization(audio)
-        return try selectEmbedding(from: result, diarizer: diarizer)
+        // Clamp long segments to the embedding window, taking the
+        // MIDDLE rather than the head: the start of a diarizer turn
+        // often carries the tail of the previous speaker or the lead-in
+        // breath, while the middle is the most reliably single-speaker
+        // part of the clip.
+        let window: ArraySlice<Float>
+        if audio.count > Self.maxEmbeddingWindowSamples {
+            let start = (audio.count - Self.maxEmbeddingWindowSamples) / 2
+            window = audio[start..<(start + Self.maxEmbeddingWindowSamples)]
+        } else {
+            window = audio[audio.startIndex..<audio.endIndex]
+        }
+
+        // Stateless: masks the whole window as one speaker and returns
+        // the embedding. Never touches `speakerManager`, so repeated
+        // calls on the cached manager cannot contaminate each other.
+        // Returns an L2-normalized vector; VoiceprintService normalizes
+        // again at match time, which is a no-op on a unit vector, and
+        // uniform magnitudes make the duration-weighted cluster
+        // centroid behave exactly as intended.
+        let embedding = try diarizer.extractSpeakerEmbedding(from: window)
+        guard !embedding.isEmpty else { throw ExtractionError.emptyEmbedding }
+        return embedding
     }
 
     // MARK: - Helpers
@@ -107,6 +145,27 @@ final class WeSpeakerExtractor {
         return m
     }
 
+    /// Lazily build the shared `DiarizerManager` and initialize it once.
+    /// `initialize(models:)` is what logs "Initializing diarization
+    /// system" / "EmbeddingExtractor initialized" — running it per
+    /// segment is what produced the log flood.
+    private func loadDiarizer() async throws -> DiarizerManager {
+        if let d = cachedDiarizer { return d }
+        let models = try await loadModels()
+        let d = DiarizerManager()
+        d.initialize(models: models)
+        cachedDiarizer = d
+        print("[WeSpeaker] Diarizer initialized once for this app run (embedding extraction is stateless).")
+        return d
+    }
+
+    /// UNUSED since 2026-08-12 — retained for reference and as a quick
+    /// revert path if `extractSpeakerEmbedding` ever proves worse on
+    /// contested clips. The stateless API masks the whole window as one
+    /// speaker, so there is no longer a multi-speaker result to
+    /// disambiguate; this heuristic only applied to
+    /// `performCompleteDiarization` output.
+    ///
     /// Pick the right speaker embedding from a diarization result —
     /// same logic as the standalone enrollment CLI's selectEmbedding,
     /// with a slightly lower dominance threshold (70% vs 80%) tuned

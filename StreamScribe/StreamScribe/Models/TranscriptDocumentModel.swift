@@ -211,7 +211,7 @@ final class TranscriptDocumentModel {
             let r = renderedGroups[divergence]
             let f = fresh[divergence]
             guard r.groupID == f.group.id,
-                  r.displayName == (f.name ?? "Speaker"),
+                  r.displayName == (f.name ?? TranscriptSegment.unknownSpeakerDisplayName),
                   r.contentHash == f.hash else { break }
             divergence += 1
         }
@@ -246,7 +246,7 @@ final class TranscriptDocumentModel {
 
         var cursor = rerenderLocation
         for item in fresh.suffix(from: divergence) {
-            let name = item.name ?? "Speaker"
+            let name = item.name ?? TranscriptSegment.unknownSpeakerDisplayName
             let (rendered, localSegmentRanges) = Self.render(group: item.group, displayName: name)
             let range = NSRange(location: cursor, length: rendered.length)
             var segIDs: [UUID] = []
