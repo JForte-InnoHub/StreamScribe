@@ -22,6 +22,127 @@ private final class MutableByteBuffer {
 /// ffmpeg's exit must NOT finish the AsyncStream continuation — the
 /// new yt-dlp/ffmpeg pair keeps feeding the same stream. One-shot:
 /// consumed (reset) by the first termination it suppresses.
+/// Converts interleaved stereo PCM to mono, choosing HOW based on what
+/// the channels actually contain.
+///
+/// A fixed (L+R)/2 average is wrong for two real-world feed defects:
+/// polarity-inverted channels (the average cancels to silence) and
+/// audio present on only one channel (the average is 6 dB down and
+/// carries the dead channel's noise). Both are common in government
+/// and broadcast plant wiring, and both are invisible to a human
+/// listening in stereo — which is why they reach us at all.
+///
+/// Strategy: buffer the opening seconds, measure the normalized
+/// correlation between channels, commit to one rule, and keep it for
+/// the session. Nothing is emitted until the verdict lands, so the
+/// opening audio is downmixed correctly too — on an inverted source
+/// a provisional average would have silently destroyed exactly the
+/// window we were measuring.
+private final class StereoDownmixer {
+    enum Mode: String {
+        case average    // r ≈ +1 or uncorrelated — ordinary stereo
+        case difference // r ≈ -1 — polarity-inverted; (L-R)/2 recovers it
+        case left       // right channel effectively dead
+        case right      // left channel effectively dead
+    }
+
+    /// 3 seconds at 16 kHz. Long enough to contain speech on a hearing
+    /// feed, short enough that a wrong opening guess costs little.
+    private let framesNeeded = 48_000
+    private var pending: [Float] = []
+    private var carry: Float?
+    private(set) var mode: Mode?
+
+    /// Interleaved stereo in, mono out. Handles an odd float count
+    /// across calls — a split L/R pair would otherwise swap the
+    /// channels for the remainder of the stream.
+    func downmix(_ interleaved: [Float]) -> [Float] {
+        var input = interleaved
+        if let c = carry {
+            input.insert(c, at: 0)
+            carry = nil
+        }
+        if input.count % 2 == 1 {
+            carry = input.removeLast()
+        }
+        guard !input.isEmpty else { return [] }
+
+        if mode == nil {
+            pending.append(contentsOf: input)
+            guard pending.count >= framesNeeded * 2 else {
+                // Emit NOTHING while deciding. An earlier draft returned
+                // a provisional average here and ALSO kept the samples
+                // buffered, so every sample in the decision window went
+                // downstream twice — caught by a chunk-boundary test
+                // that compared streamed output against a single-call
+                // reference. Holding the window costs ~3s of latency at
+                // session start, immaterial against a 10-30s chunker,
+                // and it means the opening seconds are downmixed with
+                // the CORRECT rule rather than the wrong one.
+                return []
+            }
+            let decided = Self.decide(pending)
+            mode = decided
+            let flushed = Self.apply(decided, to: pending)
+            pending = []
+            return flushed
+        }
+        return Self.apply(mode ?? .average, to: input)
+    }
+
+    /// Flush whatever is buffered when the stream ends before the
+    /// decision window filled (short clips).
+    func drain() -> [Float] {
+        guard mode == nil, !pending.isEmpty else { return [] }
+        let decided = Self.decide(pending)
+        mode = decided
+        let out = Self.apply(decided, to: pending)
+        pending = []
+        return out
+    }
+
+    private static func decide(_ interleaved: [Float]) -> Mode {
+        var sumLL = 0.0, sumRR = 0.0, sumLR = 0.0
+        var i = 0
+        while i + 1 < interleaved.count {
+            let l = Double(interleaved[i]), r = Double(interleaved[i + 1])
+            sumLL += l * l
+            sumRR += r * r
+            sumLR += l * r
+            i += 2
+        }
+        let energyL = sumLL, energyR = sumRR
+        // A channel carrying <1% of the other's energy is dead, not quiet.
+        if energyR < energyL * 0.01 { return .left }
+        if energyL < energyR * 0.01 { return .right }
+
+        let denom = (sumLL * sumRR).squareRoot()
+        guard denom > 0 else { return .average }
+        let r = sumLR / denom
+        // -0.8 rather than -0.5: only a near-perfect inversion should
+        // flip us to subtraction. Genuinely wide stereo can sit mildly
+        // negative without the average cancelling anything important.
+        return r < -0.8 ? .difference : .average
+    }
+
+    private static func apply(_ mode: Mode, to interleaved: [Float]) -> [Float] {
+        var out = [Float]()
+        out.reserveCapacity(interleaved.count / 2)
+        var i = 0
+        while i + 1 < interleaved.count {
+            let l = interleaved[i], r = interleaved[i + 1]
+            switch mode {
+            case .average:    out.append((l + r) * 0.5)
+            case .difference: out.append((l - r) * 0.5)
+            case .left:       out.append(l)
+            case .right:      out.append(r)
+            }
+            i += 2
+        }
+        return out
+    }
+}
+
 private final class EscalationFlag {
     let lock = NSLock()
     var suppressFinishOnce = false
@@ -95,8 +216,10 @@ actor AudioStreamExtractor {
     /// realtime, >1× means downloading-faster-than-realtime (typical for
     /// VOD), <1× means upstream is throttling.
     ///
-    /// 16000 Hz × 4 bytes/sample (Float32) × 1 channel = 64000 bytes/sec.
-    static let bytesPerSecondRealtime: Int = Int(sampleRate) * 4
+    /// 16000 Hz × 4 bytes/sample (Float32) × 2 channels = 128000 bytes/sec.
+    /// Tracks the `-ac 2` request above — get this wrong and every
+    /// "Audio rate: N.NNx realtime" line is off by exactly 2x.
+    static let bytesPerSecondRealtime: Int = Int(sampleRate) * 4 * 2
 
     private var ffmpegProcess: Process?
     private var stderrPipe: Pipe?
@@ -728,7 +851,23 @@ actor AudioStreamExtractor {
             args.append(contentsOf: ["-af", "dynaudnorm=f=250:g=15"])
         }
         args.append(contentsOf: [
-            "-ac", "1",                               // mono
+            // STEREO IN, ADAPTIVE MONO OUT (2026-08-26). This was
+            // `-ac 1`, which is a plain (L+R)/2 average — and on a
+            // POLARITY-INVERTED source that average is mathematically
+            // ZERO. Confirmed on a CT-N hearing: the left channel
+            // measured -32.6 dB mean / -11.9 dB max while our mono feed
+            // read as digital silence, and `(L-R)/2` reproduced the
+            // left channel exactly, proving R = -L. Every ASR failed
+            // identically on it (Parakeet, Canary, Whisper, and Otter)
+            // for the same reason — they all downmix to mono first, so
+            // they all destroyed the same audio.
+            //
+            // We now take both channels and decide the downmix
+            // ourselves in StereoDownmixer, which can also rescue the
+            // adjacent case of a feed carrying audio on one channel
+            // only. Costs one extra PCM channel over the pipe (16 kHz
+            // float ≈ 64 KB/s) — nothing against the video alongside it.
+            "-ac", "2",                               // stereo; downmixed adaptively below
             "-ar", String(Int(Self.sampleRate)),      // 16 kHz
             "-f", "f32le",                            // raw 32-bit float little-endian
             "-acodec", "pcm_f32le",
@@ -843,6 +982,13 @@ actor AudioStreamExtractor {
         // too, but the class makes the intent (shared mutable state) explicit.
         let pendingBytes = MutableByteBuffer()
 
+        // Adaptive stereo→mono, one per ffmpeg spawn. spawnFFmpeg is
+        // re-entered on every escalation respawn, so a new stream
+        // re-decides its downmix rather than inheriting a verdict
+        // formed from a different rendition. Declared beside the PCM
+        // buffer it feeds, since this function owns the stdout reader.
+        let downmixer = StereoDownmixer()
+
         // Audio delivery rate instrumentation. ffmpeg's `readabilityHandler`
         // fires whenever the OS has bytes buffered for us to read; the rate
         // at which those bytes arrive tells us whether the bottleneck is
@@ -914,7 +1060,13 @@ actor AudioStreamExtractor {
                 return Array(buf)
             }
             pendingBytes.bytes.removeSubrange(0..<alignedBytes)
-            continuation.yield(floats)
+            let modeBefore = downmixer.mode
+            let mono = downmixer.downmix(floats)
+            if modeBefore == nil, let decided = downmixer.mode {
+                print("[Extractor] Stereo downmix: \(decided.rawValue)" +
+                      (decided == .average ? "" : " — source channels are not ordinary stereo; corrected"))
+            }
+            if !mono.isEmpty { continuation.yield(mono) }
         }
 
         // Drain stderr so the buffer doesn't fill up; useful for debugging.
@@ -947,7 +1099,16 @@ actor AudioStreamExtractor {
                     return Array(buf)
                 }
                 print("[Extractor] Drained \(floats.count) trailing samples after exit.")
-                continuation.yield(floats)
+                let mono = downmixer.downmix(floats)
+                if !mono.isEmpty { continuation.yield(mono) }
+            }
+            // A clip shorter than the decision window leaves audio
+            // buffered inside the downmixer — flush it or the whole
+            // file goes missing.
+            let tail = downmixer.drain()
+            if !tail.isEmpty {
+                print("[Extractor] Flushed \(tail.count) buffered samples (downmix: \(downmixer.mode?.rawValue ?? "average")).")
+                continuation.yield(tail)
             }
             // Any final 1–3 trailing bytes are dropped — they can't form a sample.
 

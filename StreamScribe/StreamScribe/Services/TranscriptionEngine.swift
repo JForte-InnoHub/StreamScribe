@@ -1390,6 +1390,13 @@ final class TranscriptionEngine: ObservableObject {
         // file is on disk.
         playbackMediaURL = nil
         MediaCacheManager.clearAll()
+
+        // Per-session silence diagnostics — these are app-lifetime
+        // properties, so without this a second session would inherit
+        // the first one's silent run and never warn again.
+        consecutiveSilentChunks = 0
+        silentRunWarned = false
+        quietestSilentPeak = 1.0
         if url.isFileURL {
             playbackMediaURL = url
         }
@@ -1543,7 +1550,11 @@ final class TranscriptionEngine: ObservableObject {
                         if let title = resolved.title, !title.isEmpty, self.detectedTitle == nil {
                             self.detectedTitle = title
                         }
-                        let probeResult = await TranscriptionEngine.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL)
+                        // Same referer treatment as the probe-time branch:
+                        // the CDN that served the manifest to the
+                        // extractor (with headers) must also serve it to
+                        // ffmpeg here.
+                        let probeResult = await TranscriptionEngine.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL, referer: url)
                         if case .finite(let s) = probeResult {
                             totalDurationSeconds = s
                             print("[Pipeline] Critical Mention + ffmpeg probe: \(String(format: "%.1f", s))s")
@@ -2928,12 +2939,30 @@ final class TranscriptionEngine: ObservableObject {
     /// chunk at 16kHz — microseconds. Negligible against the ~1-2s
     /// transcription it can save.
     static func isChunkSilent(_ samples: [Float]) -> Bool {
-        guard !samples.isEmpty else { return true }
+        chunkActivity(samples).silent
+    }
+
+    /// The gate's verdict PLUS the loudest sample it saw (2026-08-26).
+    ///
+    /// The verdict alone proved undiagnosable in the field: a source
+    /// whose audio is genuinely digital silence and one that is merely
+    /// recorded 30 dB too quiet produce the identical "silent chunk"
+    /// line, and the second is both common in government feeds and
+    /// fully recoverable. Reporting the peak separates them at a
+    /// glance — `peak -78.0 dBFS` is a dead track, `peak -44.0 dBFS`
+    /// is a live one sitting just under the threshold.
+    ///
+    /// Note this cannot early-exit the way the old version did: it has
+    /// to see every window to know the true peak. The cost is still
+    /// microseconds against the ~1-2s transcription it saves.
+    static func chunkActivity(_ samples: [Float]) -> (silent: Bool, peak: Float) {
+        guard !samples.isEmpty else { return (true, 0) }
         let windowSize = 1600  // 100ms at 16kHz
         let peakThreshold: Float = 0.008
         let minActiveWindows = 3
 
         var activeWindows = 0
+        var overallPeak: Float = 0
         var index = 0
         while index < samples.count {
             let end = min(index + windowSize, samples.count)
@@ -2942,15 +2971,46 @@ final class TranscriptionEngine: ObservableObject {
                 let a = abs(samples[i])
                 if a > peak { peak = a }
             }
-            if peak > peakThreshold {
-                activeWindows += 1
-                if activeWindows >= minActiveWindows {
-                    return false  // enough activity — not silent, stop early
-                }
-            }
+            if peak > overallPeak { overallPeak = peak }
+            if peak > peakThreshold { activeWindows += 1 }
             index = end
         }
-        return true
+        return (activeWindows < minActiveWindows, overallPeak)
+    }
+
+    /// Linear amplitude → dBFS, floored for display.
+    static func dBFS(_ amplitude: Float) -> Float {
+        amplitude <= 0 ? -120 : max(-120, 20 * log10(amplitude))
+    }
+
+    /// Track runs of silent chunks so a whole-session silence can be
+    /// diagnosed once, loudly, instead of scrolling past as dozens of
+    /// identical skip lines (2026-08-26 field report: "StreamScribe
+    /// thinks this audio is completely silent").
+    private var consecutiveSilentChunks = 0
+    private var silentRunWarned = false
+    private var quietestSilentPeak: Float = 1.0
+
+    @MainActor
+    private func noteSilentChunk(peak: Float) {
+        consecutiveSilentChunks += 1
+        quietestSilentPeak = min(quietestSilentPeak, peak)
+        guard consecutiveSilentChunks == 10, !silentRunWarned else { return }
+        silentRunWarned = true
+        let loudest = Self.dBFS(quietestSilentPeak)
+        if loudest <= -90 {
+            print("""
+            [Silence] ⚠️ 10 consecutive chunks with essentially NO signal (peak \(String(format: "%.1f", Double(loudest))) dBFS). \
+            The decoded audio track is effectively dead. Likely causes: the source exposes several audio tracks and the first one \
+            is empty, or this rendition carries video only. Check with: ffprobe -hide_banner -i "<manifest url>"
+            """)
+        } else {
+            print("""
+            [Silence] ⚠️ 10 consecutive chunks below the speech gate, but the audio is NOT dead — loudest peak so far \
+            \(String(format: "%.1f", Double(loudest))) dBFS vs the -42.0 dBFS gate. This source is simply recorded very quietly. \
+            Enabling audio normalization (Settings → audio normalization) applies dynaudnorm and should bring it above the gate.
+            """)
+        }
     }
 
     private func processChunk(chunk: [Float], chunkStartTime: TimeInterval,
@@ -2985,7 +3045,9 @@ final class TranscriptionEngine: ObservableObject {
         // words permanently. The thresholds are set so only clearly
         // silent audio skips — quiet/distant speech (peaks well above
         // room tone even on bad senate mics) still transcribes.
-        let silent = Self.isChunkSilent(chunk)
+        let activity = Self.chunkActivity(chunk)
+        let silent = activity.silent
+        if silent { noteSilentChunk(peak: activity.peak) } else { consecutiveSilentChunks = 0 }
 
         // In static-diarization mode we'll run SpeakerKit on the whole audio after
         // extraction completes — skip the per-chunk diarization to save time and to
@@ -2998,8 +3060,9 @@ final class TranscriptionEngine: ObservableObject {
                     realtimeFactor = totalAudioProcessed / totalProcessingTime
                 }
                 processedDurationSeconds = chunkStartTime + chunkAudioSeconds
-                print(String(format: "[Silence] Skipped transcription for silent chunk [%.1fs..%.1fs]",
-                             chunkStartTime, chunkStartTime + chunkAudioSeconds))
+                print(String(format: "[Silence] Skipped transcription for silent chunk [%.1fs..%.1fs] (peak %.1f dBFS, gate -42.0)",
+                             chunkStartTime, chunkStartTime + chunkAudioSeconds,
+                             Double(Self.dBFS(activity.peak))))
                 return
             }
             let result = try await transcriber.transcribe(
@@ -3044,7 +3107,7 @@ final class TranscriptionEngine: ObservableObject {
                 realtimeFactor = totalAudioProcessed / totalProcessingTime
             }
             processedDurationSeconds = chunkStartTime + chunkAudioSeconds
-            print(String(format: "[Silence] Skipped transcription for silent chunk [%.1fs..%.1fs] (diarizer fed, %.2fs)",
+            print(String(format: "[Silence] Skipped transcription for silent chunk [%.1fs..%.1fs] (peak \(String(format: "%.1f", Double(Self.dBFS(activity.peak)))) dBFS; diarizer fed, %.2fs)",
                          chunkStartTime, chunkStartTime + chunkAudioSeconds, elapsed))
             return
         }
@@ -6973,6 +7036,23 @@ final class TranscriptionEngine: ObservableObject {
     /// Granicus, direct media…) do ZERO page fetches where they
     /// previously did one; unrecognized pages do one where they
     /// previously did two.
+    /// Resolve a portal/player page to its direct media URL for callers
+    /// OUTSIDE the transcription pipeline — currently the video
+    /// downloader (2026-08-26).
+    ///
+    /// The downloader was handing yt-dlp whatever the user typed, so a
+    /// portal page that transcribes perfectly well (because start() and
+    /// the probe both resolve it first) failed to download with a
+    /// generic-extractor error naming the PAGE. Same URL, two different
+    /// answers, depending on which button you pressed.
+    ///
+    /// Returns nil when the URL isn't a portal page or can't be
+    /// resolved — callers should fall back to the original URL, which
+    /// is correct for YouTube and every other yt-dlp-native site.
+    static func resolvedMediaURL(for url: URL) async -> URL? {
+        await resolvePortalMedia(url: url)?.mediaURL
+    }
+
     private static func resolvePortalMedia(url: URL) async -> ResolvedMedia? {
         guard !url.isFileURL else { return nil }
 
@@ -7355,7 +7435,7 @@ final class TranscriptionEngine: ObservableObject {
                 do {
                     let resolved = try await CriticalMentionExtractor.resolve(url: url)
                     probedTitle = resolved.title
-                    let ff = await Self.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL)
+                    let ff = await Self.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL, referer: url)
                     switch ff {
                     case .finite(let s):
                         probeResult = .finite(s)
@@ -7502,7 +7582,29 @@ final class TranscriptionEngine: ObservableObject {
     /// the full content. Internal so adjacent services
     /// (VideoDownloadService for HLS-download progress calculation)
     /// can share the same probe path.
-    static func probeRemoteDurationViaFFmpeg(url: URL) async -> FFmpegProbeResult {
+    /// Tiny box so the timeout task can tell the waiter it fired.
+    /// Mirrors the `EscalationFlag` pattern in AudioStreamExtractor —
+    /// a class rather than a captured `var` because the write happens
+    /// on the timeout Task and the read on the waiter queue.
+    private final class TimeoutFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var flag = false
+        var value: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return flag }
+            set { lock.lock(); defer { lock.unlock() }; flag = newValue }
+        }
+    }
+
+    /// `referer` supplies Referer/Origin headers for the probe request
+    /// (2026-08-12). Several archive CDNs — Granicus/Wowza among them —
+    /// serve manifests only to requests that carry a plausible page
+    /// referer, and this probe previously sent none. That created a
+    /// silent asymmetry: the browser extractor VERIFIES a candidate
+    /// manifest by fetching it WITH those headers (added when candidate
+    /// ranking shipped), so a URL could be confirmed reachable and then
+    /// fail here on the very next request. Pass the page URL whenever
+    /// the caller has one.
+    static func probeRemoteDurationViaFFmpeg(url: URL, referer: URL? = nil) async -> FFmpegProbeResult {
         // Resolve ffmpeg path. If it's not available, we can't probe.
         guard let ffmpegPath = await MainActor.run(body: { ToolManager.shared.ffmpegPath }),
               FileManager.default.isExecutableFile(atPath: ffmpegPath) else {
@@ -7517,12 +7619,24 @@ final class TranscriptionEngine: ObservableObject {
             // -i <url>: input.
             // -t 0 -f null -: do header parse then exit. Avoids the "output required"
             //                  error path and its noise.
-            process.arguments = [
+            var args = [
                 "-hide_banner",
+                "-user_agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            ]
+            if let referer, let scheme = referer.scheme, let host = referer.host {
+                // ffmpeg wants one CRLF-delimited blob for extra headers.
+                args.append(contentsOf: [
+                    "-headers",
+                    "Referer: \(referer.absoluteString)\r\nOrigin: \(scheme)://\(host)\r\n",
+                ])
+            }
+            args.append(contentsOf: [
                 "-i", url.absoluteString,
                 "-t", "0",
                 "-f", "null", "-"
-            ]
+            ])
+            process.arguments = args
             // We discard stdout. stderr carries all the diagnostic lines.
             process.standardOutput = Pipe()
             process.standardError = stderr
@@ -7535,9 +7649,11 @@ final class TranscriptionEngine: ObservableObject {
             }
 
             // 8-second timeout. If ffmpeg hasn't finished, kill it.
+            let timedOut = TimeoutFlag()
             let timeoutTask = Task {
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
                 if process.isRunning {
+                    timedOut.value = true
                     process.terminate()
                 }
             }
@@ -7551,7 +7667,24 @@ final class TranscriptionEngine: ObservableObject {
 
                 let data = stderr.fileHandleForReading.readDataToEndOfFile()
                 let text = String(data: data, encoding: .utf8) ?? ""
-                cont.resume(returning: parseFFmpegDuration(from: text))
+                let result = parseFFmpegDuration(from: text)
+
+                // Report WHY on any non-duration outcome. This used to be
+                // discarded entirely, so a 403, a DNS failure, a timeout
+                // and a genuinely durationless manifest all surfaced as
+                // the same opaque "no duration" message — undiagnosable
+                // from a log. ffmpeg's own last few lines name the cause
+                // precisely.
+                if case .finite = result {} else {
+                    let tail = text
+                        .split(separator: "\n")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                        .suffix(4)
+                        .joined(separator: " | ")
+                    print("[Probe] ffmpeg duration probe did not yield a duration for \(url.host ?? url.absoluteString)\(timedOut.value ? " (TIMED OUT after 8s)" : "") — ffmpeg said: \(tail.isEmpty ? "(no output)" : tail)")
+                }
+                cont.resume(returning: result)
             }
         }
     }

@@ -438,7 +438,19 @@ struct SidebarView: View {
 
         panel.begin { response in
             guard response == .OK, let destURL = panel.url else { return }
-            videoDownloadService.downloadVideo(from: url, to: destURL)
+            Task { @MainActor in
+                // Resolve portal/player pages to their direct media
+                // first, exactly as Start and the probe do. Without
+                // this the downloader handed yt-dlp the PAGE url and
+                // its generic extractor failed on sources that
+                // transcribe fine (2026-08-26: a CT-N ctnplayer.asp
+                // page). nil = not a portal page, so keep the original.
+                let resolved = await TranscriptionEngine.resolvedMediaURL(for: url) ?? url
+                if resolved != url {
+                    print("[VideoDownload] Resolved portal page to media URL: \(resolved.absoluteString)")
+                }
+                videoDownloadService.downloadVideo(from: resolved, to: destURL)
+            }
         }
     }
 

@@ -22,6 +22,56 @@ import Combine
 ///
 /// **Why an ObservableObject.** Progress + status need to flow to
 /// SwiftUI for inline UI feedback. The class publishes
+/// Holds the running subprocess so a cancellation handler can signal
+/// it, and closes the race where cancellation lands between building
+/// the process and starting it.
+///
+/// Needed because an unstructured `Task { }` does NOT inherit
+/// cancellation from its parent (2026-08-26). Both download paths used
+/// `Task { while process.isRunning { if Task.isCancelled { … } } }`,
+/// which polls the cancellation flag of the NEW task — a task nobody
+/// ever cancels — so `Task.isCancelled` was permanently false and the
+/// SIGTERM never fired. Cancel appeared to work (the UI flipped to
+/// "Cancelled" as soon as the awaiting task threw) while yt-dlp kept
+/// downloading in the background to completion.
+private final class RunningProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    /// Adopt `process`. Returns false when cancellation already
+    /// arrived, in which case the caller must not start it.
+    func adopt(_ process: Process) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled else { return false }
+        self.process = process
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let running = process
+        lock.unlock()
+        if let running, running.isRunning { running.terminate() }
+    }
+
+    /// True once cancellation has been requested.
+    ///
+    /// The termination handlers must consult THIS rather than inferring
+    /// intent from how the process died (2026-08-26). They originally
+    /// keyed on `terminationReason == .uncaughtSignal`, which assumes a
+    /// SIGTERM kills the child outright — but yt-dlp installs its own
+    /// SIGTERM handler, cleans up, and exits NORMALLY with a non-zero
+    /// status. So a cancelled download reported `.exit`, fell through
+    /// to the generic error branch, and the UI said "Failed" for
+    /// something the user had just deliberately cancelled.
+    var wasCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+}
+
 /// `isDownloading`, `progress`, `statusText`, and `lastError` so the
 /// sidebar can render a "Downloading… 42%" indicator and surface
 /// failures inline rather than via console-only logs.
@@ -105,9 +155,10 @@ final class VideoDownloadService: ObservableObject {
         }
     }
 
-    /// Cancel the in-flight download. Yt-dlp gets a SIGTERM and
-    /// teardown proceeds; partial files are removed in
-    /// `performDownload`'s cleanup. No-op when nothing is downloading.
+    /// Cancel the in-flight download. Yt-dlp (or ffmpeg) gets a SIGTERM
+    /// via the `withTaskCancellationHandler` wrapped around each
+    /// subprocess; partial files are removed in `performDownload`'s
+    /// cleanup. No-op when nothing is downloading.
     func cancel() {
         currentTask?.cancel()
     }
@@ -345,7 +396,9 @@ final class VideoDownloadService: ObservableObject {
             return nil
         }()
 
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+        let processBox = RunningProcessBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             let process = Process()
             let errPipe = Pipe()
 
@@ -423,7 +476,9 @@ final class VideoDownloadService: ObservableObject {
             process.terminationHandler = { proc in
                 errPipe.fileHandleForReading.readabilityHandler = nil
                 let exitStatus = proc.terminationStatus
-                if proc.terminationReason == .uncaughtSignal {
+                // Intent first: if we asked it to stop, ANY exit is a
+                // cancellation regardless of status or reason.
+                if processBox.wasCancelled || proc.terminationReason == .uncaughtSignal {
                     cont.resume(throwing: CancellationError())
                     return
                 }
@@ -442,24 +497,22 @@ final class VideoDownloadService: ObservableObject {
                 cont.resume(returning: outputPath)
             }
 
+            // Adopt before starting: if Cancel was pressed while we
+            // were building the process, never launch it at all.
+            guard processBox.adopt(process) else {
+                cont.resume(throwing: CancellationError())
+                return
+            }
+
             do {
                 try process.run()
             } catch {
                 cont.resume(throwing: error)
                 return
             }
-
-            // Cancellation → SIGTERM ffmpeg. Same polling pattern as
-            // the yt-dlp path.
-            Task {
-                while process.isRunning {
-                    if Task.isCancelled {
-                        process.terminate()
-                        return
-                    }
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                }
             }
+        } onCancel: {
+            processBox.cancel()
         }
     }
 
@@ -473,7 +526,9 @@ final class VideoDownloadService: ObservableObject {
         ffmpegPath: String,
         tools: (ytDlpPath: String, denoPath: String?, cookieBrowser: CookieBrowser, disableTLSCheck: Bool, childEnvironment: [String: String]?)
     ) async throws -> String {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+        let processBox = RunningProcessBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             let process = Process()
             let outPipe = Pipe()
             let errPipe = Pipe()
@@ -522,6 +577,22 @@ final class VideoDownloadService: ObservableObject {
             // client so the PO-token provider (WebPO-only) applies.
             args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
             args.append(contentsOf: ToolManager.proxyArguments())
+
+            // TLS check toggle (2026-08-26). This path was the ONE
+            // yt-dlp invocation in the app that ignored the setting,
+            // even though AudioStreamExtractor's own comment asserts
+            // "same toggle drives all yt-dlp invocations" — it drove
+            // five sites there and none here. On a Mac with TLS
+            // interception (Netskope, Zscaler, or a corporate VPN) the
+            // bundled yt-dlp's Python trust store has no corporate root,
+            // so every download died with "certificate verify failed:
+            // self-signed certificate in certificate chain" while
+            // transcription of the same URL worked — a confusing split
+            // that made the downloader look broken rather than
+            // misconfigured.
+            if tools.disableTLSCheck {
+                args.append("--no-check-certificate")
+            }
 
             // Cookies for sites that require login. Session-cached —
             // browser extraction on first invocation, cheap jar reads
@@ -643,8 +714,12 @@ final class VideoDownloadService: ObservableObject {
                 outPipe.fileHandleForReading.readabilityHandler = nil
 
                 let exitStatus = proc.terminationStatus
-                if proc.terminationReason == .uncaughtSignal {
-                    // SIGTERM from cancel() — surface as cancellation
+                // Intent first — see RunningProcessBox.wasCancelled.
+                // yt-dlp traps SIGTERM and exits normally with a
+                // non-zero status, so `.uncaughtSignal` alone never
+                // fires for it and a cancelled download reported
+                // "Failed".
+                if processBox.wasCancelled || proc.terminationReason == .uncaughtSignal {
                     cont.resume(throwing: CancellationError())
                     return
                 }
@@ -693,27 +768,24 @@ final class VideoDownloadService: ObservableObject {
                 cont.resume(returning: path)
             }
 
+            // Adopt before starting: if Cancel was pressed while we
+            // were building the process, never launch it at all.
+            guard processBox.adopt(process) else {
+                cont.resume(throwing: CancellationError())
+                return
+            }
+
             do {
                 try process.run()
             } catch {
                 cont.resume(throwing: error)
                 return
             }
-
-            // Wire cancellation to SIGTERM. The Task wrapping this
-            // continuation already calls `Task.cancel()`; we observe
-            // that via withTaskCancellationHandler at the caller.
-            // Here we attach the signal-handler poll loop to the same
-            // Task — checking periodically and signalling yt-dlp.
-            Task {
-                while process.isRunning {
-                    if Task.isCancelled {
-                        process.terminate()
-                        return
-                    }
-                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
-                }
             }
+        } onCancel: {
+            // Runs immediately on cancellation, on whatever thread
+            // cancels — hence the lock inside the box.
+            processBox.cancel()
         }
     }
 }
