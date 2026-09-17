@@ -765,6 +765,28 @@ actor AudioStreamExtractor {
                 continuation: continuation
             )
             print("[Watchdog] Respawned pipe at live edge (\(step.label)). Transcript timeline continues; the starved gap is not recoverable. Miniplayer cache restarts.")
+
+            // A rung can die INSTANTLY — most often "Requested format is
+            // not available", when the rung's client set offers nothing
+            // our selector accepts. Nothing watched for that, so the
+            // respawned process's termination handler finished the
+            // stream and the ladder stopped at rung 1 with rungs 2 and 3
+            // never tried (field log 2026-09-15: escalation at 14:47:59,
+            // format error at 14:48:02, AsyncStream terminated).
+            //
+            // The starvation watchdog cannot cover this: it measures
+            // delivery over 30s windows, and this rung is dead within
+            // three seconds. Watch briefly here and advance instead.
+            Task { [weak self] in
+                guard let self else { return }
+                let rungDied = await self.waitForEarlyFailure(
+                    timeout: 8.0,
+                    errorPatterns: Self.liveExtractionFailurePatterns
+                )
+                guard rungDied else { return }
+                print("[Watchdog] Escalation rung '\(step.label)' produced no usable format — advancing immediately rather than waiting out a delivery window.")
+                await self.escalateLivePipe(measuredRatio: 0)
+            }
         } catch {
             print("[Watchdog] Escalation respawn failed: \(error.localizedDescription) — will re-evaluate on the next window.")
         }
@@ -1651,10 +1673,7 @@ actor AudioStreamExtractor {
         // broadcasts.
         let failedWithKnownBug = await waitForEarlyFailure(
             timeout: 20.0,
-            errorPatterns: [
-                "No video formats found",
-                "no formats that can be downloaded from the start",
-            ]
+            errorPatterns: Self.liveExtractionFailurePatterns
         )
 
         if failedWithKnownBug {
@@ -2074,11 +2093,48 @@ actor AudioStreamExtractor {
     /// we see yt-dlp's HLS downloader engage ("[hlsnative]") or fragment
     /// download activity, we know it's working and can return immediately
     /// so ffmpeg starts consuming the pipe.
+    /// yt-dlp phrasings that all mean "this attempt produced no usable
+    /// media", each from a different extractor or failure mode. Kept in
+    /// ONE place because they are consulted from two sites now — the
+    /// first-attempt retry and the escalation-rung watchdog — and a list
+    /// that drifts between them silently loses coverage.
+    ///
+    /// The third entry was added 2026-09-15: a YouTube escalation rung
+    /// died with "Requested format is not available" and nothing matched
+    /// it, so the ladder stopped at rung 1.
+    static let liveExtractionFailurePatterns = [
+        "No video formats found",
+        "no formats that can be downloaded from the start",
+        "Requested format is not available",
+    ]
+
     private func waitForEarlyFailure(timeout: TimeInterval, errorPatterns: [String]) async -> Bool {
         func matchesAny(_ stderr: String) -> Bool {
             errorPatterns.contains { stderr.contains($0) }
         }
-        let successPatterns = ["[hlsnative]", "[download] Destination:", "Downloading m3u8"]
+        // STRONG signals mean BYTES ARE MOVING — the HLS downloader engaged
+        // or a destination was opened. Only these end the wait outright.
+        let successPatterns = ["[hlsnative]", "[download] Destination:"]
+
+        // "Downloading m3u8" used to sit in the list above, and that was a
+        // race (2026-09-15). It reports that yt-dlp FETCHED PLAYLIST INFO —
+        // not that it is streaming — and on twitter:broadcast the fatal
+        // "--live-from-start ... no formats that can be downloaded from the
+        // start" check runs AFTER that line. Field log: success signal at
+        // 13:54:30.646, error at 13:54:30.747. We had already returned
+        // "success" 101 ms before the failure we have a retry for, so the
+        // retry never ran and the session died with ffmpeg reporting
+        // "Invalid data found" on an empty pipe.
+        //
+        // It is still a useful hint, so it now opens a short CONFIRMATION
+        // WINDOW instead: keep watching, and only conclude success if the
+        // process is still alive after it. That bounds the added latency
+        // (~1.5s, versus the full timeout) while letting a fast failure
+        // arriving milliseconds later be caught and retried.
+        let progressPatterns = ["Downloading m3u8"]
+        let confirmationWindow: TimeInterval = 1.5
+        var progressDeadline: Date?
+
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             let stderr = ytDlpStreamStderr.flatMap {
@@ -2090,6 +2146,16 @@ actor AudioStreamExtractor {
             // consuming it ASAP.
             for pattern in successPatterns where stderr.contains(pattern) {
                 print("[Extractor] yt-dlp emitted success signal '\(pattern)' — proceeding to ffmpeg.")
+                return false
+            }
+
+            if progressDeadline == nil,
+               progressPatterns.contains(where: { stderr.contains($0) }) {
+                progressDeadline = Date().addingTimeInterval(confirmationWindow)
+                print("[Extractor] yt-dlp fetched m3u8 info — not yet streaming; watching \(confirmationWindow)s for a late failure.")
+            }
+            if let progressDeadline, Date() >= progressDeadline {
+                print("[Extractor] yt-dlp still alive after m3u8 info — proceeding to ffmpeg.")
                 return false
             }
 

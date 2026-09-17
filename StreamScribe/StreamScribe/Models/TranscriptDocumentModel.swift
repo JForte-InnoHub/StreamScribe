@@ -288,11 +288,36 @@ final class TranscriptDocumentModel {
     /// character belongs to segment body text. The primitive that
     /// later phases build on (click→seek, selection→time-span).
     func segmentID(at location: Int) -> UUID? {
-        guard location >= 0, location < textStorage.length else { return nil }
-        guard let raw = textStorage.attribute(.ssSegmentID, at: location, effectiveRange: nil) as? String else {
-            return nil
+        guard textStorage.length > 0 else { return nil }
+        let clamped = min(max(location, 0), textStorage.length - 1)
+        if let raw = textStorage.attribute(.ssSegmentID, at: clamped, effectiveRange: nil) as? String {
+            return UUID(uuidString: raw)
         }
-        return UUID(uuidString: raw)
+
+        // BOUNDARY FALLBACK (2026-09-15). Not every character in a
+        // paragraph carries a segment attribute: the single space this
+        // renderer inserts BETWEEN segments has none, and neither does
+        // the paragraph's trailing newline. A click landing on either
+        // returned nil, and callers fall back to the group's FIRST
+        // segment — so selecting just the period at a segment's end and
+        // choosing Edit Text… opened the editor on the wrong segment,
+        // near the top of a long speaker block.
+        //
+        // Those gap characters belong to the segment they FOLLOW, so
+        // walk backwards. The 4-character bound matters: it covers the
+        // one-space join and the newline while stopping a click inside
+        // a speaker HEADER from silently resolving to the previous
+        // group's last segment — headers are long, so the scan dies
+        // inside them and callers keep their existing nil behaviour.
+        var index = clamped - 1
+        let lowerBound = max(0, clamped - 4)
+        while index >= lowerBound {
+            if let raw = textStorage.attribute(.ssSegmentID, at: index, effectiveRange: nil) as? String {
+                return UUID(uuidString: raw)
+            }
+            index -= 1
+        }
+        return nil
     }
 
     // MARK: Rendering

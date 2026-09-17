@@ -167,7 +167,32 @@ actor FluidAudioBackend: DiarizationBackend {
         let prepareStart = Date()
         if offlineManager == nil {
             let manager = OfflineDiarizerManager(config: OfflineDiarizerConfig())
-            try await manager.prepareModels()
+            do {
+                try await manager.prepareModels()
+            } catch {
+                // FluidAudio hardcodes "HuggingFace" into its download
+                // errors regardless of where ModelRegistry.baseURL
+                // actually points (2026-08-26). With the R2 mirror set
+                // — which the line logged just above proves — a failure
+                // still reads "HuggingFace returned HTML instead of
+                // JSON", which reads like the app ignored the mirror
+                // and went to HF. It didn't: that HTML is R2's own
+                // 404/landing page for an object the bucket doesn't
+                // have. Rewrite the message so the log names the
+                // registry that was actually contacted.
+                let raw = error.localizedDescription
+                if raw.contains("HuggingFace") {
+                    throw NSError(domain: "FluidAudio", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Offline diarizer models could not be fetched from the configured registry "
+                            + "\(ModelRegistry.baseURL) — it returned HTML rather than model data, which "
+                            + "usually means the expected objects are missing from that bucket. "
+                            + "(FluidAudio's own message says \"HuggingFace\" no matter which registry is set.) "
+                            + "Underlying: \(raw)",
+                    ])
+                }
+                throw error
+            }
             self.offlineManager = manager
             print(String(format: "[FluidAudio] Offline diarizer ready (cached=%@, %.1fs).",
                          wasCached ? "true" : "false",

@@ -103,6 +103,10 @@ struct SettingsView: View {
     private var cleanupModelRepo: String = TranscriptCleanupService.defaultModelRepo
     @AppStorage(TranscriptCleanupService.numeralsKey)
     private var cleanupNumerals: Bool = false
+    @AppStorage(TranscriptCleanupService.fastModeKey)
+    private var cleanupFastMode: Bool = false
+    @AppStorage(TranscriptCleanupService.fastModelRepoKey)
+    private var cleanupFastModelRepo: String = TranscriptCleanupService.defaultFastModelRepo
 
     /// Whether the user has opted in to the Debug menu. Bound to the
     /// "Show Debug menu" toggle in the Advanced section. Same
@@ -265,7 +269,23 @@ struct SettingsView: View {
                     TextField("mlx-community/…", text: $cleanupModelRepo)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 320)
+                        .disabled(cleanupFastMode)
                 }
+
+                Divider()
+
+                Toggle("Fast mode (small dedicated cleanup model)", isOn: $cleanupFastMode)
+                HStack {
+                    Text("Fast cleanup model")
+                    Spacer()
+                    TextField("e.g. superwhisper/s1-mini-4bit", text: $cleanupFastModelRepo)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 320)
+                        .disabled(!cleanupFastMode)
+                }
+                Text("Fast mode runs a small model (~0.6B) one segment at a time instead of the 4B model in batches. Much quicker, but it cannot use your Custom Dictionary and known speaker names as spelling hints, and it cannot flag passages as too disfluent to repair — so proper nouns are the thing to check first if accuracy drops. Length validation and verbatim preservation still apply, and Restore Verbatim Text still undoes any change.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("Transcript Cleanup")
             } footer: {

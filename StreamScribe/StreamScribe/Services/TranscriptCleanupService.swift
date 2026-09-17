@@ -33,6 +33,30 @@ final class TranscriptCleanupService {
 
     static let enabledKey = "cleanup.enabled"
     static let modelRepoKey = "cleanup.modelRepo"
+
+    /// Selects the cleanup engine (2026-09-15).
+    ///
+    /// `.thorough` is the original batched Qwen path: numbered lines, DIFF
+    /// output, glossary injection, and the `!REVIEW` decline. `.fast` runs
+    /// a small dedicated cleanup model (S1-mini class, a fine-tuned
+    /// Qwen3-0.6B) ONE SEGMENT AT A TIME, because such models are trained
+    /// to take a transcript and return cleaned text — they do not follow a
+    /// line-numbered protocol and are not instruction-following, so the
+    /// glossary and the decline marker have nowhere to live in that mode.
+    ///
+    /// The speed case: generation dominates cleanup, and `.fast` pairs a
+    /// ~6x cheaper per-token model with the candidate pre-filter. The cost
+    /// is the glossary and the decline — accepted deliberately, to be
+    /// revisited if accuracy suffers.
+    static let fastModeKey = "cleanup.fastMode"
+
+    static var isFastMode: Bool {
+        UserDefaults.standard.bool(forKey: fastModeKey)
+    }
+
+    /// Model repo used when `.fast` is selected. Separate from
+    /// `modelRepoKey` so switching modes doesn't require retyping either.
+    static let fastModelRepoKey = "cleanup.fastModelRepo"
     static let numeralsKey = "cleanup.convertNumerals"
     static let defaultModelRepo = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 
@@ -50,10 +74,34 @@ final class TranscriptCleanupService {
 
     private var container: ModelContainer?
 
+    /// Repo for the CURRENTLY SELECTED mode. Fast mode has its own key so
+    /// switching modes never requires retyping either repo — and, more
+    /// importantly, so fast mode cannot silently load the 4B thorough
+    /// model, which would make it slower than the path it replaces.
     var modelRepo: String {
+        if Self.isFastMode {
+            let fast = UserDefaults.standard.string(forKey: Self.fastModelRepoKey) ?? ""
+            return fast.isEmpty ? Self.defaultFastModelRepo : fast
+        }
         let stored = UserDefaults.standard.string(forKey: Self.modelRepoKey) ?? ""
         return stored.isEmpty ? Self.defaultModelRepo : stored
     }
+
+    /// The fast cleanup model as STAGED IN OUR OWN R2 BUCKET, so a fresh
+    /// install works with no configuration (2026-09-15).
+    ///
+    /// `ensureModelFromMirror` derives the object name by replacing "/"
+    /// with "--", so this value must correspond exactly to the uploaded
+    /// tarball:
+    ///
+    ///     superwhisper/s1-mini-4bit  ->  llm/superwhisper--s1-mini-4bit.tar.gz
+    ///
+    /// Change one without the other and fast mode 404s on the mirror,
+    /// falls back to Hugging Face, and finally reports a missing
+    /// `config.json` — three errors, none of which names the real
+    /// problem. An earlier PLACEHOLDER default caused exactly that.
+    /// Anyone re-staging under a different name must update this line.
+    static let defaultFastModelRepo = "superwhisper/s1-mini-4bit"
 
     /// What a cleanup run produced: text corrections, plus the
     /// segments the model explicitly DECLINED to repair.
@@ -76,9 +124,21 @@ final class TranscriptCleanupService {
         var batches: [[TranscriptSegment]] = []
         var current: [TranscriptSegment] = []
         var currentChars = 0
+        var skipped = 0
         for seg in segments {
             let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
+            // CANDIDATE PRE-FILTER (2026-09-15). Most lines in a hearing
+            // need no repair at all, and sending them costs the same as
+            // sending a broken one. Skipping them is safe under the DIFF
+            // protocol: an absent line already means "unchanged", so a
+            // skipped segment travels the exact path an unmodified one
+            // would. Generation dominates cleanup time, so this cuts the
+            // bill roughly in proportion to how clean the transcript is.
+            guard Self.mayNeedCleanup(text) else {
+                skipped += 1
+                continue
+            }
             if current.count >= Self.maxSegmentsPerBatch
                 || (currentChars + text.count > Self.maxCharsPerBatch && !current.isEmpty) {
                 batches.append(current)
@@ -89,14 +149,34 @@ final class TranscriptCleanupService {
             currentChars += text.count
         }
         if !current.isEmpty { batches.append(current) }
+        if skipped > 0 {
+            print("[Cleanup] Pre-filter: \(skipped) segment(s) already clean, skipped; \(batches.reduce(0) { $0 + $1.count }) sent to the model.")
+        }
         guard !batches.isEmpty else { return CleanupResult() }
 
         let model = try await loadModelIfNeeded()
         var cleaned = CleanupResult()
 
+        let fast = Self.isFastMode
+        if fast, self.modelRepo.isEmpty {
+            throw NSError(domain: "TranscriptCleanupService", code: 2, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Fast cleanup mode is on but no fast model is configured. "
+                    + "Set Settings → Transcript Cleanup → \"Fast cleanup model\" to the "
+                    + "repo name you staged, e.g. superwhisper/s1-mini-4bit. StreamScribe "
+                    + "derives the R2 object from it by replacing \"/\" with \"--\", so that "
+                    + "example looks for llm/superwhisper--s1-mini-4bit.tar.gz",
+            ])
+        }
+        if fast {
+            print("[Cleanup] Fast mode: per-segment cleanup with \(self.modelRepo). Glossary and !REVIEW are unavailable in this mode.")
+        }
+
         for (i, batch) in batches.enumerated() {
             do {
-                let result = try await cleanBatch(batch, model: model, knownNames: knownNames)
+                let result = fast
+                    ? try await cleanBatchFast(batch, model: model)
+                    : try await cleanBatch(batch, model: model, knownNames: knownNames)
                 for (id, text) in result.corrections { cleaned.corrections[id] = text }
                 cleaned.needsReview.formUnion(result.needsReview)
             } catch {
@@ -224,10 +304,51 @@ final class TranscriptCleanupService {
                 NSLocalizedDescriptionKey: "Mirror tarball for \(modelRepo) extracted without a config.json — re-stage it with the model files at the archive ROOT (tar -czf … -C model-dir .)",
             ])
         }
+        Self.inlineChatTemplateIfNeeded(in: staging)
+
         try? fm.removeItem(at: dir)
         try fm.moveItem(at: staging, to: dir)
         print("[Cleanup] Model staged locally at \(dir.path).")
         return dir
+    }
+
+    /// Fold a sidecar `chat_template.jinja` into `tokenizer_config.json`.
+    ///
+    /// Shipping the chat template as its OWN file is a newer Hugging Face
+    /// convention. Python's `transformers` reads it, which is why model
+    /// cards say the template is picked up with no configuration — but
+    /// swift-transformers, underneath MLXLMCommon, looks for a
+    /// `chat_template` KEY inside `tokenizer_config.json` and never opens
+    /// the sidecar. When the key is absent it falls back to generic
+    /// "role: content" text, so the model never sees the prompt format it
+    /// was trained on.
+    ///
+    /// That is not a subtle degradation. On S1-mini it produced reasoning
+    /// blocks, stray "user" lines, an "assistant: " prefix on the reply,
+    /// and — because a normalizer handed an unrecognized format has no
+    /// reason to change anything — a single edit across an entire hearing
+    /// (2026-09-16). The template file was present the whole time; nothing
+    /// was reading it.
+    ///
+    /// Done at extract time so it covers any model with this layout, not
+    /// just the one that exposed it. Best-effort: a failure here leaves
+    /// the model exactly as it was.
+    private static func inlineChatTemplateIfNeeded(in directory: URL) {
+        let fm = FileManager.default
+        let sidecar = directory.appendingPathComponent("chat_template.jinja")
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        guard fm.fileExists(atPath: sidecar.path), fm.fileExists(atPath: configURL.path) else { return }
+        guard let template = try? String(contentsOf: sidecar, encoding: .utf8),
+              let data = try? Data(contentsOf: configURL),
+              var config = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        // An existing key wins — never overwrite a template the converter
+        // deliberately embedded.
+        guard config["chat_template"] == nil else { return }
+
+        config["chat_template"] = template
+        guard let merged = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted]),
+              (try? merged.write(to: configURL)) != nil else { return }
+        print("[Cleanup] Inlined chat_template.jinja into tokenizer_config.json — swift-transformers does not read the sidecar file.")
     }
 
     private func cleanBatch(
@@ -266,6 +387,221 @@ final class TranscriptCleanupService {
         }
 
         return try Self.parseAndValidate(output: output, batch: batch)
+    }
+
+    /// Prompt for the small dedicated cleanup model.
+    ///
+    /// ⚠️ VERIFY AGAINST THE MODEL CARD BEFORE TRUSTING OUTPUT. Models of
+    /// this class are NOT instruction-following chat models: they expect
+    /// one specific prompt shape, usually a short control line plus the raw
+    /// transcript, and they degrade badly (or emit nothing) when given a
+    /// conversational system prompt instead. This constant is isolated so
+    /// correcting it is a one-line change rather than a code hunt. Two
+    /// things to confirm: the exact control-line syntax, and whether the
+    /// chat template needs thinking disabled — omitting that flag is a
+    /// documented cause of blank output in this family.
+    /// EXACT system prompt required by S1-mini. Do not reword it.
+    ///
+    /// The model card is explicit: the system prompt and the control line
+    /// are the input format the model was TRAINED on, and changing the
+    /// wording, dropping either, or sending control values outside the
+    /// trained sets can make it hallucinate or emit garbled text. It is
+    /// not a chat model and will not follow general instructions — our
+    /// original hand-written "clean up the transcript…" instruction was
+    /// steering nothing, which is why output arrived full of reasoning
+    /// blocks and chat-turn fragments (2026-09-16).
+    static let fastSystemPrompt = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text."
+
+    /// Control line prepended to every transcript, per the documented
+    /// format: `[Styling: …] [Structure: …] [Context: …]` then a newline.
+    ///
+    /// Values chosen for hearing transcripts: `semi-formal` is the card's
+    /// recommended default and gives standard written English with
+    /// contractions kept; `prose` keeps everything in sentences, since a
+    /// model deciding to bullet-point a senator's remarks would be wrong
+    /// for a quotable record; `general` avoids the email greeting and
+    /// sign-off layout. All three are within the trained value sets.
+    static let fastControlLine = "[Styling: semi-formal] [Structure: prose] [Context: general]"
+
+    /// Per-segment cleanup for `.fast` mode.
+    ///
+    /// No line numbers and no DIFF: the model returns the whole cleaned
+    /// line, so EVERY return is a candidate rewrite and validation carries
+    /// more weight than in the batched path. It reuses the same guards —
+    /// non-empty, and a length ratio inside the accepted band — because a
+    /// small model handed one short line is exactly where a runaway
+    /// continuation or a dropped clause would otherwise slip through.
+    private func cleanBatchFast(
+        _ batch: [TranscriptSegment],
+        model: ModelContainer
+    ) async throws -> CleanupResult {
+        var result = CleanupResult()
+        for seg in batch {
+            if Task.isCancelled { break }
+            let original = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !original.isEmpty else { continue }
+
+            let output: String = try await model.perform { context in
+                // Control line, newline, then the raw transcript — the exact
+                // shape the model was trained on. `/no_think` rides at the
+                // end because Qwen3's chat template consumes that token and
+                // renders the empty `<think></think>` prefix S1-mini expects;
+                // it is the in-prompt equivalent of `enable_thinking=False`,
+                // which we cannot pass without chat-template kwargs. It goes
+                // HERE rather than in the system prompt because that string
+                // must stay verbatim. Without thinking disabled this model
+                // typically returns nothing usable at all.
+                let userContent = "\(Self.fastControlLine)\n\(original)\n/no_think"
+                let input = try await context.processor.prepare(
+                    input: UserInput(chat: [
+                        .system(Self.fastSystemPrompt),
+                        .user(userContent),
+                    ])
+                )
+                // Output length tracks input length; the model card's safe
+                // ceiling is 1.3 x input tokens + 32. At roughly 4 chars per
+                // token that is chars/3 + 32 — far cheaper than a flat cap,
+                // and it still stops a confused model running into invented
+                // dialogue.
+                let maxTokens = original.count / 3 + 32
+                let generated = try MLXLMCommon.generate(
+                    input: input,
+                    parameters: GenerateParameters(temperature: 0.0),
+                    context: context
+                ) { tokens in
+                    tokens.count >= maxTokens ? .stop : .more
+                }
+                return generated.output
+            }
+
+            // Order matters: both helpers rely on newlines still being
+            // present, so the collapse to spaces happens last.
+            let cleaned = Self.trimAtTurnBoundary(Self.stripReasoning(output))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\n", with: " ")
+            guard !cleaned.isEmpty else { continue }
+            let ratio = Double(cleaned.count) / Double(max(original.count, 1))
+            guard ratio >= 0.5 && ratio <= 1.35 else {
+                print(String(format: "[Cleanup/fast] length ratio %.2f outside [0.50, 1.35] — keeping verbatim.", ratio))
+                continue
+            }
+            if cleaned != original { result.corrections[seg.id] = cleaned }
+        }
+        return result
+    }
+
+    /// Remove a reasoning block from model output.
+    ///
+    /// Takes whatever follows the LAST `</think>`, because the answer is
+    /// what comes after the model stops reasoning. Two failure shapes are
+    /// handled deliberately:
+    ///
+    ///   - An UNCLOSED `<think>` (the model hit the token ceiling
+    ///     mid-thought) leaves no answer at all, so this returns empty
+    ///     and the caller keeps the segment verbatim. Returning the
+    ///     partial monologue would be far worse than changing nothing.
+    ///   - Output with no reasoning at all passes through untouched.
+    static func stripReasoning(_ output: String) -> String {
+        guard output.contains("<think>") || output.contains("</think>") else { return output }
+        if let closeRange = output.range(of: "</think>", options: .backwards) {
+            return String(output[closeRange.upperBound...])
+        }
+        // Opened but never closed — there is no answer in here.
+        if let openRange = output.range(of: "<think>") {
+            return String(output[..<openRange.lowerBound])
+        }
+        return output
+    }
+
+    /// Cut model output at the first CHAT-TURN BOUNDARY.
+    ///
+    /// A small model that doesn't stop cleanly at end-of-turn simply
+    /// keeps going and writes the NEXT turn itself — `<|im_end|>` then
+    /// `<|im_start|>user` and a fresh prompt. When the tokenizer strips
+    /// those special tokens during decoding, the bare role word survives,
+    /// which is how stray "user" lines ended up scattered through an
+    /// exported transcript (2026-09-16).
+    ///
+    /// Two detectors, because the special tokens may or may not survive
+    /// decoding: the literal markers, and a role word ALONE on its own
+    /// line. The aloneness test is the important guard — "user" is
+    /// ordinary English, and "the end user was never consulted" is real
+    /// hearing testimony that must pass through untouched.
+    static func trimAtTurnBoundary(_ output: String) -> String {
+        // Leading role label. When the tokenizer has no chat template,
+        // MLXLMCommon falls back to plain "role: content" text, and the
+        // model continues that pattern by labelling its own turn — so the
+        // reply arrives as "assistant: <text>" (2026-09-16 field report,
+        // where the single edit in a whole transcript was this prefix).
+        // Stripping it is a repair, not a fix: the real problem is the
+        // missing template, and a model that never sees its trained
+        // prefix also will not normalize well.
+        var output = output
+        for role in ["assistant:", "assistant :", "Assistant:"] {
+            let leading = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if leading.lowercased().hasPrefix(role.lowercased()) {
+                output = String(leading.dropFirst(role.count))
+                break
+            }
+        }
+
+        var cut = output.endIndex
+
+        for marker in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
+            if let range = output.range(of: marker), range.lowerBound < cut {
+                cut = range.lowerBound
+            }
+        }
+
+        var lineStart = output.startIndex
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let bare = line.trimmingCharacters(in: .whitespaces).lowercased()
+            if ["user", "assistant", "system"].contains(bare) {
+                if lineStart < cut { cut = lineStart }
+                break
+            }
+            // +1 for the newline that split() consumed.
+            let advance = line.count + 1
+            guard let next = output.index(lineStart, offsetBy: advance, limitedBy: output.endIndex) else { break }
+            lineStart = next
+        }
+
+        return String(output[..<cut])
+    }
+
+    /// Cheap text-only test for whether a line shows any evidence of the
+    /// error classes the cleanup prompt repairs.
+    ///
+    /// Deliberately biased toward SENDING: a false positive costs one
+    /// line of model time, while a false negative silently leaves a
+    /// defect in the transcript. Anything ambiguous goes to the model.
+    ///
+    /// **Known blind spot:** a misspelled proper noun in an otherwise
+    /// tidy sentence carries no textual signal, so it will be skipped.
+    /// That class needs acoustic evidence (confidence, N-best) or a
+    /// phonetic glossary match, neither of which exists yet — so this
+    /// filter trades a little proper-noun recall for a large speed win,
+    /// and should be revisited when confidence plumbing lands.
+    static func mayNeedCleanup(_ text: String) -> Bool {
+        let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return false }
+
+        // Filler and hedging — the most common repair.
+        if s.range(of: #"\b(um+|uh+|er+|ah+|you know|i mean|sort of|kind of|like)\b"#,
+                   options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        // Stutter / duplicated word, the false-start signature.
+        if s.range(of: #"\b(\w+)\s+\1\b"#,
+                   options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        // Numerals and number words — inverse text normalization.
+        if s.range(of: #"\b(\d|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|twenty|thirty|forty|fifty|hundred|thousand|million|billion|percent|dollars?)\b"#,
+                   options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        // No terminal punctuation — the chunk-seam artifact.
+        if s.range(of: #"[.!?\"')\]]$"#, options: .regularExpression) == nil { return true }
+        // Sentence starting lowercase — casing repair.
+        if let first = s.first, first.isLowercase { return true }
+        // Shouted text — the deshout path's territory.
+        if s.count > 12, s == s.uppercased(), s.rangeOfCharacter(from: .letters) != nil { return true }
+        return false
     }
 
     /// Parse "[N] text" lines under the DIFF protocol and validate

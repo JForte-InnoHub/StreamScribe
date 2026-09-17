@@ -2807,8 +2807,10 @@ final class TranscriptionEngine: ObservableObject {
             // B's text into A and dropping B. See the docstring for
             // the safety thresholds (word count, terminal punctuation,
             // time gap) that prevent folding real short utterances.
-            self.segments = self.fillSpeakerCoverageGaps(
-                self.reabsorbTinyTrailingFragments(splitOut)
+            self.segments = self.repairSeamPunctuation(
+                self.fillSpeakerCoverageGaps(
+                    self.reabsorbTinyTrailingFragments(splitOut)
+                )
             )
             // De-shout pass. Whisper occasionally emits long runs of
             // ALL-CAPS text — an artifact of its training on broadcast/
@@ -5488,6 +5490,76 @@ final class TranscriptionEngine: ObservableObject {
     /// should still read as unknown. Holes at the very start or end of
     /// a transcript have only one side and are left alone.
     @MainActor
+    /// Abbreviations whose trailing period is part of the word, not a
+    /// sentence end. Without this, "I spoke with Sen." + "warren said…"
+    /// would lose the period that belongs to the title.
+    private static let nonTerminalAbbreviations: Set<String> = [
+        "mr", "mrs", "ms", "dr", "sen", "rep", "gov", "prof", "st", "inc",
+        "corp", "co", "jr", "sr", "vs", "etc", "approx", "no", "dept",
+        "univ", "atty", "hon", "adm", "gen", "lt", "col", "sgt",
+    ]
+
+    /// Remove sentence-ending periods that Whisper inserted at a CHUNK
+    /// SEAM rather than at an actual sentence end.
+    ///
+    /// The cause is structural, not a model failing: static transcription
+    /// decodes in ~30s chunks, and Whisper terminates each chunk as if it
+    /// were the end of an utterance. A sentence spanning the boundary
+    /// therefore acquires a period partway through — the "periods
+    /// appearing mid-sentence" complaint, which is common precisely
+    /// because it happens at every seam, not at random.
+    ///
+    /// The signature is specific enough to repair deterministically: the
+    /// earlier segment ends in a period, the next begins with a LOWERCASE
+    /// letter (so it is continuing a sentence, not starting one), the two
+    /// are the same speaker, and they are separated by a gap too short to
+    /// be a real stop. Anything failing a test is left alone — the cost
+    /// of a missed repair is one stray period, while an over-eager one
+    /// destroys real punctuation in a quotable record.
+    @MainActor
+    private func repairSeamPunctuation(_ segs: [TranscriptSegment]) -> [TranscriptSegment] {
+        guard segs.count > 1 else { return segs }
+        var out = segs
+        var repaired = 0
+
+        for i in 0..<(out.count - 1) {
+            let a = out[i]
+            let b = out[i + 1]
+            // A human's edit is final, at both ends of the seam.
+            if a.userEdited == true || b.userEdited == true { continue }
+            guard let aSpeaker = a.speaker, let bSpeaker = b.speaker,
+                  aSpeaker == bSpeaker else { continue }
+
+            let aText = a.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bText = b.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard aText.hasSuffix("."), !aText.hasSuffix(".."), !bText.isEmpty else { continue }
+
+            // A genuine pause earns its full stop; only a near-contiguous
+            // boundary is suspect.
+            let gap = b.start - a.end
+            guard gap <= 0.45 else { continue }
+
+            // The continuation must look like mid-sentence text.
+            guard let firstChar = bText.first, firstChar.isLetter, firstChar.isLowercase else { continue }
+
+            // Don't strip a period that belongs to the word itself.
+            let stem = String(aText.dropLast())
+                .split(separator: " ").last
+                .map { String($0).lowercased().filter { $0.isLetter } } ?? ""
+            if stem.count <= 1 { continue }                                   // initial, e.g. "J."
+            if Self.nonTerminalAbbreviations.contains(stem) { continue }      // "Sen." / "Mr."
+
+            out[i].text = String(aText.dropLast())
+            out[i].rawText = out[i].rawText ?? a.text
+            repaired += 1
+        }
+
+        if repaired > 0 {
+            print("[Punctuation] Removed \(repaired) chunk-seam period(s) that split a sentence mid-flow; verbatim preserved in rawText.")
+        }
+        return out
+    }
+
     private func fillSpeakerCoverageGaps(_ segs: [TranscriptSegment]) -> [TranscriptSegment] {
         guard diarizationEngine != .off else { return segs }
         var out = segs
