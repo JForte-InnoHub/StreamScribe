@@ -256,7 +256,7 @@ struct SidebarView: View {
                         return nil
                     }()
                     if let reason = probeFailureReason,
-                       (liveDetectedSource.requiresYTDlp || liveDetectedSource == .criticalMention || liveDetectedSource == .granicus || liveDetectedSource == .iqMedia),
+                       (liveDetectedSource.requiresYTDlp || liveDetectedSource == .criticalMention || liveDetectedSource == .granicus || liveDetectedSource == .iqMedia || liveDetectedSource == .frameIO),
                        !urlInput.trimmingCharacters(in: .whitespaces).isEmpty {
                         Button {
                             engine.beginProbe(for: urlInput)
@@ -2445,6 +2445,7 @@ struct SidebarView: View {
         case .senateGov:    return "building.columns.fill"
         case .criticalMention: return "eye.fill"
         case .iqMedia:      return "waveform.badge.magnifyingglass"
+        case .frameIO:      return "film.stack"
         case .granicus:     return "building.2.fill"
         case .hls:          return "antenna.radiowaves.left.and.right"
         case .directAudio:  return "waveform"

@@ -698,7 +698,7 @@ final class TranscriptionEngine: ObservableObject {
             } catch {
                 print("[LivePreview] Senate.gov extractor failed: \(error.localizedDescription) — no live preview this session.")
             }
-        case .criticalMention, .granicus, .iqMedia:
+        case .criticalMention, .granicus, .iqMedia, .frameIO:
             // Critical Mention clips are static (finite duration), not
             // live — but they still benefit from the same "give the
             // miniplayer the resolved stream URL" wiring since AVPlayer
@@ -7125,6 +7125,147 @@ final class TranscriptionEngine: ObservableObject {
         await resolvePortalMedia(url: url)?.mediaURL
     }
 
+    /// Resolve a Frame.io share link to its media through Frame.io's own
+    /// GraphQL API.
+    ///
+    /// The WKWebView route could never work here: Frame.io's React app
+    /// does not render in our headless view at all (166 resources
+    /// fetched, correct asset title, but no <video>, no play control and
+    /// a 33-character body), so the player never requested a manifest
+    /// and there was nothing for the sniffer to observe.
+    ///
+    /// Every input this API needs is derivable from the pasted URL, which
+    /// is what makes it worth doing:
+    ///
+    ///   next.frame.io/share/{share_id}/view/{asset_id}
+    ///     x-frameio-share-authentication : base64(share_id)
+    ///     x-frameio-session-id           : a UUID WE generate
+    ///     variables.assetIds             : [asset_id]
+    ///
+    /// The session id looked like a server-issued credential and is not:
+    /// a randomly generated UUID was accepted and came back embedded as
+    /// `session_id` inside the signed playback token, proving the client
+    /// mints it purely for correlation. Without that observation this
+    /// would have needed a browser to bootstrap a session.
+    ///
+    /// Prefers the DIRECT MP4 (`media.original.inlineUrl`) over the HLS
+    /// manifest: it classifies `.directVideo`, skips yt-dlp and the
+    /// token-path entirely, and downloads cleanly. Falls back to
+    /// `hlsManifest` for assets without one.
+    ///
+    /// Signed URLs from this API last roughly 24 hours, so the resolve
+    /// must run per session — never cache the result across launches.
+    private static func resolveFrameIOShare(url: URL) async -> ResolvedMedia? {
+        guard let host = url.host?.lowercased(),
+              host == "f.io" || host.hasSuffix(".f.io")
+                || host == "frame.io" || host.hasSuffix(".frame.io") else { return nil }
+
+        // f.io short links redirect to the real share page; follow first.
+        let shareURL = await resolvedShareURL(from: url)
+        let parts = shareURL.pathComponents.filter { $0 != "/" }
+        guard let shareIndex = parts.firstIndex(of: "share"), shareIndex + 1 < parts.count,
+              let viewIndex = parts.firstIndex(of: "view"), viewIndex + 1 < parts.count else {
+            print("[Frame.io] \(shareURL.path) is not a /share/{id}/view/{id} URL — leaving it to the normal pipeline.")
+            return nil
+        }
+        let shareID = parts[shareIndex + 1]
+        let assetID = parts[viewIndex + 1]
+
+        guard let endpoint = URL(string: "https://api.frame.io/graphql"),
+              let shareAuth = shareID.data(using: .utf8)?.base64EncodedString() else { return nil }
+
+        // Our OWN minimal query rather than the app's: theirs pulls
+        // transcriptions, thumbnails, field values and content
+        // credentials across a stack of fragments, every one of which is
+        // a chance to break on a schema change. This asks for four fields.
+        let query = """
+        query SSResolve($assetIds: [ID!]!) @stewardship(stewards: [VIEWER]) {         assets(assetIds: $assetIds) { id name         ... on VideoAsset { media { duration hlsManifest original { inlineUrl } } }         ... on AudioAsset { media { duration hlsManifest original { inlineUrl } } } } }
+        """
+        let body: [String: Any] = [
+            "operationName": "SSResolve",
+            "variables": ["assetIds": [assetID]],
+            "query": query,
+        ]
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.httpBody = payload
+        for (field, value) in [
+            "content-type": "application/json",
+            "origin": "https://next.frame.io",
+            "referer": "https://next.frame.io/",
+            "x-frameio-share-authentication": shareAuth,
+            "x-frameio-session-id": UUID().uuidString.lowercased(),
+            "x-gql-op": "SSResolve",
+            "apollographql-client-name": "web-app",
+        ] {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+
+        let data: Data
+        do {
+            let (received, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                print("[Frame.io] GraphQL returned HTTP \(http.statusCode).")
+                return nil
+            }
+            data = received
+        } catch {
+            print("[Frame.io] GraphQL request failed: \(error.localizedDescription)")
+            return nil
+        }
+
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        if let errors = root["errors"] as? [[String: Any]], !errors.isEmpty {
+            let message = errors.compactMap { $0["message"] as? String }.joined(separator: "; ")
+            print("[Frame.io] GraphQL error: \(message.isEmpty ? "unspecified" : message) — the share may be private, expired, or password-protected.")
+            return nil
+        }
+        guard let payloadData = root["data"] as? [String: Any],
+              let assets = payloadData["assets"] as? [[String: Any]],
+              let asset = assets.first,
+              let media = asset["media"] as? [String: Any] else {
+            print("[Frame.io] GraphQL response carried no media for asset \(assetID).")
+            return nil
+        }
+
+        let title = asset["name"] as? String
+        if let original = media["original"] as? [String: Any],
+           let inline = original["inlineUrl"] as? String,
+           let direct = URL(string: inline) {
+            print("[Frame.io] Resolved \(title ?? assetID) to its direct file (no yt-dlp, no token path).")
+            return ResolvedMedia(mediaURL: direct, title: title)
+        }
+        if let manifest = media["hlsManifest"] as? String, let hls = URL(string: manifest) {
+            print("[Frame.io] Resolved \(title ?? assetID) to its HLS manifest.")
+            return ResolvedMedia(mediaURL: hls, title: title)
+        }
+        print("[Frame.io] Asset \(assetID) has neither an original file nor an HLS manifest — it may still be transcoding.")
+        return nil
+    }
+
+    /// Follow an `f.io` short link to the share page it points at.
+    /// Returns the original URL unchanged when it is already a share URL
+    /// or the redirect can't be followed — callers then fail the path
+    /// parse and fall through, which is the right outcome either way.
+    private static func resolvedShareURL(from url: URL) async -> URL {
+        guard (url.host?.lowercased() ?? "").hasSuffix("f.io"),
+              !url.path.contains("/share/") else { return url }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent")
+        guard let (_, response) = try? await URLSession.shared.data(for: request),
+              let final = response.url else { return url }
+        if final != url {
+            print("[Frame.io] Short link resolved to \(final.absoluteString)")
+        }
+        return final
+    }
+
     private static func resolvePortalMedia(url: URL) async -> ResolvedMedia? {
         guard !url.isFileURL else { return nil }
 
@@ -7133,7 +7274,11 @@ final class TranscriptionEngine: ObservableObject {
         if let civic = await resolveCivicClerkMedia(url: url) {
             return ResolvedMedia(mediaURL: civic.mediaURL, title: civic.title)
         }
-        // 2. Host-keyed per-state resolvers (Texas).
+        // 2. Frame.io share links — host-gated API resolve, no page fetch.
+        if let frame = await resolveFrameIOShare(url: url) {
+            return frame
+        }
+        // 3. Host-keyed per-state resolvers (Texas).
         if let statehouse = await resolveStatehousePlayer(url: url) {
             return statehouse
         }

@@ -354,6 +354,7 @@ enum StreamSource: String, CaseIterable {
     case criticalMention = "Critical Mention"
     case granicus = "Granicus"
     case iqMedia = "IQ Media"
+    case frameIO = "Frame.io"
     case hls = "HLS Stream"
     case directAudio = "Direct Audio"
     case directVideo = "Direct Video"
@@ -398,7 +399,7 @@ enum StreamSource: String, CaseIterable {
         switch self {
         case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
             return true
-        case .senateGov, .criticalMention, .granicus, .iqMedia, .hls, .directAudio, .directVideo, .localFile:
+        case .senateGov, .criticalMention, .granicus, .iqMedia, .frameIO, .hls, .directAudio, .directVideo, .localFile:
             return false
         }
     }
@@ -523,6 +524,45 @@ enum StreamSource: String, CaseIterable {
         // transcribes and (post-2026-07-29) downloads correctly.
         if host == "iqmediacorp.com" || host.hasSuffix(".iqmediacorp.com") {
             return .iqMedia
+        }
+        // Frame.io (2026-09-16): review-and-approval platform many clients
+        // use to host cuts. Three URL shapes reach us —
+        //   f.io/XXXXXXXX                       short link
+        //   next.frame.io/share/{share}/view/{asset}   share page
+        //   app.frame.io/…                      signed-in app
+        // — and all of them are JS players, so the WKWebView sniffer does
+        // the work. The manifest lives on a DIFFERENT host
+        // (sahls.frame.io/encode-hls/{asset}/token/{jwt}/main.m3u8), which
+        // puts this on the permissive third-party-CDN path alongside
+        // Granicus and IQ Media rather than Critical Mention's strict
+        // same-domain filter.
+        //
+        // The token is a signed JWT whose payload carries the share id,
+        // asset id, a session id and the S3 rendition paths, so it cannot
+        // be constructed — only observed while a real player fetches it.
+        //
+        // Same guard as IQ Media above, for the same reason: this branch
+        // runs BEFORE the `.hls` check, so a direct sahls.frame.io
+        // manifest must fall through to plain HLS. Handing a bare `.m3u8`
+        // to the sniffer gives it a URL with no page JS to watch, and it
+        // would time out where direct HLS already works.
+        // PAGE hosts only. Frame.io serves its media from sibling
+        // subdomains — assets.frame.io (direct MP4s and per-rendition
+        // playlists), sahls.frame.io (token-signed HLS),
+        // stream-download.frame.io — and every one of them ends in
+        // ".frame.io". An earlier version matched the whole domain and
+        // excluded only paths ending ".m3u8", so the resolver would
+        // correctly return a direct MP4 on assets.frame.io and detect()
+        // would immediately re-classify it as .frameIO and send it back
+        // to the browser extractor. The title appeared (the API call had
+        // worked) while the video never loaded.
+        //
+        // Same trap as kinetiq.tv, guarded properly this time: match the
+        // pages a user actually pastes, and let every media host fall
+        // through to .directVideo / .hls.
+        let frameIOPageHosts: Set<String> = ["f.io", "frame.io", "next.frame.io", "app.frame.io", "www.frame.io"]
+        if frameIOPageHosts.contains(host) {
+            return .frameIO
         }
         // Granicus: government meeting/stream platform used by many
         // city and county governments (e.g. dc.granicus.com). Player

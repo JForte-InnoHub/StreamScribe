@@ -157,14 +157,43 @@ final class CriticalMentionBrowserExtractor: NSObject {
                     Task { @MainActor [weak self] in await self?.selectAndFinish() }
                     return
                 }
-                print("[CriticalMentionBrowser] Timeout after \(Int(timeout))s waiting for stream URL — page may have failed to load or clip is private.")
-                self.finish(result: nil)
+                // Say WHAT the page looked like. A bare timeout can't
+                // distinguish "the page never loaded" from "it loaded but
+                // the player never started" from "it played and we missed
+                // the request" — three problems with three different
+                // fixes (2026-09-16, Frame.io timing out on both its
+                // short and long URL forms). Ask the page directly.
+                self.dumpPageDiagnostics { summary in
+                    print("[CriticalMentionBrowser] Timeout after \(Int(timeout))s with no stream URL. Page state: \(summary)")
+                    Task { @MainActor [weak self] in self?.finish(result: nil) }
+                }
+                return
             }
         }
 
         // Modern browser UA. Critical Mention's page occasionally
         // serves different bundles based on UA sniffing.
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        //
+        // NOT applied to every host (2026-09-22). This string pins
+        // Safari 17 / macOS 14, which is years stale, and a modern SPA
+        // that gates on browser version will serve an unsupported-browser
+        // bail instead of its app. That is exactly the shape of the
+        // Frame.io diagnostic: 165 resources fetched (bundles loaded),
+        // then a 33-character body, no player, no media element. Leaving
+        // customUserAgent nil makes WKWebView report the REAL Safari for
+        // this OS, which is both truthful and current.
+        //
+        // Critical Mention keeps the pinned string because its UA
+        // sniffing is the reason the override exists at all; changing it
+        // there would be an unrelated risk.
+        let host = (pageURL.host ?? "").lowercased()
+        let wantsPinnedUA = !(host == "f.io" || host.hasSuffix(".f.io")
+                              || host == "frame.io" || host.hasSuffix(".frame.io"))
+        if wantsPinnedUA {
+            webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        } else {
+            print("[CriticalMentionBrowser] Using the system Safari user agent for \(host) — a pinned stale UA can trigger unsupported-browser gates on modern SPAs.")
+        }
 
         print("[CriticalMentionBrowser] Loading \(pageURL.absoluteString) in headless WKWebView…")
         webView.load(URLRequest(url: pageURL))
@@ -299,6 +328,51 @@ final class CriticalMentionBrowserExtractor: NSObject {
         if text.contains("<MPD") || text.contains("<SmoothStreamingMedia") { return .master }
         if text.contains("#EXTINF") || text.contains("#EXTM3U") { return .mediaPlaylist }
         return .unreachable
+    }
+
+    /// Interrogate the loaded page about why nothing was captured.
+    ///
+    /// Reports where it ended up (redirects followed?), what it is
+    /// (title), how much it fetched (resource count), whether ANY media
+    /// URL appears in its network history, whether a media element was
+    /// ever created, and how many play controls our selectors can see.
+    /// Each answer points somewhere specific: zero resources means the
+    /// page never loaded; resources but no media and no `<video>` means
+    /// the player never started; a media URL present in the timeline but
+    /// not captured means our matcher missed its shape.
+    private func dumpPageDiagnostics(_ completion: @escaping (String) -> Void) {
+        let js = """
+        (function() {
+            var r = [];
+            try { r = performance.getEntriesByType('resource').map(function(e){ return e.name; }); } catch (e) {}
+            var media = r.filter(function(n){ return /\\.m3u8|\\.mpd|\\.mp4|\\.m4a/i.test(n); });
+            var vids = 0, playable = 0;
+            try { vids = document.querySelectorAll('video, audio').length; } catch (e) {}
+            try {
+                playable = document.querySelectorAll(
+                    '[class*="play"], [aria-label*="play" i], button[title*="play" i]'
+                ).length;
+            } catch (e) {}
+            return JSON.stringify({
+                url: location.href,
+                title: (document.title || '').slice(0, 80),
+                resources: r.length,
+                mediaUrls: media.length,
+                firstMedia: media.length ? media[0].slice(0, 120) : null,
+                mediaElements: vids,
+                playControls: playable,
+                bodyChars: (document.body ? document.body.innerText.length : 0)
+            });
+        })();
+        """
+        guard let webView else { completion("no web view"); return }
+        webView.evaluateJavaScript(js) { value, error in
+            if let json = value as? String {
+                completion(json)
+            } else {
+                completion("diagnostics unavailable (\(error?.localizedDescription ?? "no result"))")
+            }
+        }
     }
 
     private func finish(result: ExtractionResult?) {
@@ -450,17 +524,63 @@ final class CriticalMentionBrowserExtractor: NSObject {
                         // headers does not consume the body.
                         promise.then(function(response) {
                             try {
-                                reportWithContentType(
-                                    url,
-                                    response && response.headers &&
-                                        response.headers.get('content-type')
-                                );
+                                var ct = response && response.headers &&
+                                    response.headers.get('content-type');
+                                reportWithContentType(url, ct);
+                                // clone() so the page's own reader still
+                                // gets an unconsumed body.
+                                if (bodyLooksScannable(ct) && response.clone) {
+                                    response.clone().text().then(scanBodyForMedia, function() {});
+                                }
                             } catch (e) {}
                         }, function() {});
                     }
                 } catch (e) {}
                 return promise;
             };
+        }
+
+        // RESPONSE-BODY SCAN (2026-09-16). Everything above watches
+        // REQUEST urls, which only finds a manifest once the player has
+        // asked for it. On a Frame.io share page the player never
+        // rendered at all — 166 resources fetched, a correct asset title,
+        // but no <video>, no play control and an all-but-empty body — so
+        // there was no request to observe. The token was nonetheless
+        // already on the wire, sitting inside an API response.
+        //
+        // So: scan text response BODIES for a manifest URL. This finds
+        // the stream the moment the app learns about it, without waiting
+        // for playback, and it generalizes to any SPA whose API hands out
+        // media URLs in JSON.
+        //
+        // Guarded on size and type — bodies are cloned, never consumed,
+        // and anything large or binary is skipped so we don't stall the
+        // page we are observing.
+        var MAX_BODY_SCAN = 512 * 1024;
+
+        function scanBodyForMedia(text) {
+            if (typeof text !== 'string' || !text || text.length > MAX_BODY_SCAN) return;
+            // Unescape BEFORE matching, not after. JSON routinely writes
+            // slash characters in escaped form, and the URL pattern excludes
+            // backslashes from its character class, so an escaped body
+            // matched NOTHING and a post-match cleanup never ran. Caught
+            // by testing the scanner against a realistic Frame.io-shaped
+            // payload. Both escaping styles seen in the wild are handled
+            var body = text
+                .replace(/\\\\\\//g, '/')
+                .replace(/\\\\u002F/gi, '/');
+            var pattern = /https?:\\/\\/[^"'\\s\\\\]+?\\.(?:m3u8|mpd)(?:\\?[^"'\\s\\\\]*)?/gi;
+            var match;
+            var found = 0;
+            while ((match = pattern.exec(body)) !== null && found < 8) {
+                found++;
+                report(match[0]);
+            }
+        }
+
+        function bodyLooksScannable(contentType) {
+            if (!contentType) return false;
+            return /json|text|javascript|xml/i.test(contentType);
         }
 
         // Hook XMLHttpRequest.open
@@ -484,10 +604,14 @@ final class CriticalMentionBrowserExtractor: NSObject {
                     var xhr = this;
                     xhr.addEventListener('load', function() {
                         try {
-                            reportWithContentType(
-                                xhr.__ssRequestURL,
-                                xhr.getResponseHeader('content-type')
-                            );
+                            var ct = xhr.getResponseHeader('content-type');
+                            reportWithContentType(xhr.__ssRequestURL, ct);
+                            // responseText throws on binary responseTypes;
+                            // the guard keeps that from becoming noise.
+                            if (bodyLooksScannable(ct) &&
+                                (xhr.responseType === '' || xhr.responseType === 'text')) {
+                                scanBodyForMedia(xhr.responseText);
+                            }
                         } catch (e) {}
                     });
                 } catch (e) {}

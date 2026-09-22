@@ -38,6 +38,23 @@ private final class MutableByteBuffer {
 /// opening audio is downmixed correctly too — on an inverted source
 /// a provisional average would have silently destroyed exactly the
 /// window we were measuring.
+extension AudioStreamExtractor {
+    /// Page origin a signed-manifest CDN expects, or nil when we have no
+    /// basis to claim one.
+    ///
+    /// Frame.io's player fetches `sahls.frame.io` manifests from the
+    /// `next.frame.io` app, and the CDN sees both an Origin and a Referer
+    /// naming it. Reproducing that is the difference between a resolved
+    /// manifest playing and 403ing.
+    static func playerOriginForManifestHost(_ urlString: String) -> String? {
+        guard let host = URL(string: urlString)?.host?.lowercased() else { return nil }
+        if host == "sahls.frame.io" || host.hasSuffix(".frame.io") {
+            return "https://next.frame.io"
+        }
+        return nil
+    }
+}
+
 private final class StereoDownmixer {
     enum Mode: String {
         case average    // r ≈ +1 or uncorrelated — ordinary stereo
@@ -844,6 +861,23 @@ actor AudioStreamExtractor {
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "5",
+            ])
+        }
+        // Origin/Referer for signed CDN manifests (2026-09-22). Chrome's
+        // own request for a Frame.io manifest carries
+        // `origin: https://next.frame.io` and `referer: https://next.frame.io/`,
+        // and CDNs that mint per-session tokens commonly check them. We
+        // sent neither, so a manifest that resolves correctly could still
+        // 403 at the transcription step — the "ffmpeg handoff may not
+        // pass Referer/Origin" gap already flagged on the extractor list.
+        //
+        // Host-scoped on purpose: a wrong Referer is worse than none on
+        // sources that do not expect one, so this adds headers only where
+        // we know the page origin from the CDN host itself.
+        if isNetworkInput, !useStdin, let originForHost = Self.playerOriginForManifestHost(inputURL) {
+            args.append(contentsOf: [
+                "-headers",
+                "Referer: \(originForHost)/\r\nOrigin: \(originForHost)\r\n",
             ])
         }
         args.append(contentsOf: [
