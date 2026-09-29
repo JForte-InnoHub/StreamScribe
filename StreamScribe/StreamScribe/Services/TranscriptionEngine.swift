@@ -732,7 +732,12 @@ final class TranscriptionEngine: ObservableObject {
             guard self.state.isActive else { return }
             self.playbackMediaURL = url
             print("[LivePreview] Direct stream URL set: \(url.absoluteString)")
-        case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
+        case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .cspan, .unknown:
+            // `.cspan` reaching here means every resolver tier missed —
+            // a successful resolve rewrites the URL to its CDN manifest
+            // before `detectedSource` is computed, so the session sees
+            // `.hls` and takes the direct-stream branch above.
+            //
             // Sources that need `yt-dlp -g` to resolve an m3u8 URL. We
             // don't have that path plumbed in this basic version of live
             // preview. Transcription proceeds normally; just no in-session
@@ -1039,6 +1044,50 @@ final class TranscriptionEngine: ObservableObject {
     }
 
     @Published private(set) var probeStatus: ProbeStatus = .idle
+
+    /// Where a live session is in relation to the broadcast's live edge.
+    /// `nil` for anything that isn't a live session with the backlog
+    /// checkbox on — a live-edge session is always at the edge by
+    /// construction and has nothing to report.
+    ///
+    /// Derived from MEASURED delivery rate, not from metadata. A backlog
+    /// drain delivers audio far faster than realtime (8-10x through a
+    /// proxy, ~28x direct); once it reaches the edge, audio can only arrive
+    /// as fast as it is broadcast, so the rate settles to ~1.0x. Nothing
+    /// else needs to be known — no `release_timestamp`, no DVR-window
+    /// guess, no fragment arithmetic — and it cannot be fooled by a stream
+    /// whose backlog depth differs from its age.
+    enum LivePhase: Equatable {
+        /// Draining the backlog. Carries the measured multiple of realtime
+        /// so the UI can show progress rather than an indefinite spinner.
+        case catchingUp(rate: Double)
+        /// Caught up; audio now arrives as it is broadcast.
+        case atLiveEdge
+    }
+
+    @Published private(set) var livePhase: LivePhase?
+
+    /// Rolling window for the phase calculation: samples delivered and the
+    /// wall-clock instant the window opened. Reset at session start.
+    private var phaseWindowSamples: Int = 0
+    private var phaseWindowStart: Date?
+
+    /// Consecutive windows measured at or below `phaseEdgeRateCeiling`.
+    /// Two are required before declaring the edge reached, so one slow
+    /// window mid-drain — a stalled fragment, a retry — doesn't flip the
+    /// label prematurely.
+    private var phaseEdgeWindows: Int = 0
+
+    /// Window length. Long enough to average out per-fragment jitter,
+    /// short enough that the label lands within a few seconds of the real
+    /// transition.
+    private static let phaseWindowSeconds: TimeInterval = 4.0
+
+    /// At or below this multiple of realtime, a window counts as
+    /// "at the edge". 1.25x leaves headroom for the jitter visible in the
+    /// field logs (live-edge windows measure 0.93-1.02x) without being so
+    /// loose that a genuinely slow drain reads as caught up.
+    private static let phaseEdgeRateCeiling: Double = 1.25
 
     /// Most recent successfully-probed duration (seconds). Cached so
     /// `start()` doesn't re-probe what the sidebar already determined.
@@ -1375,6 +1424,13 @@ final class TranscriptionEngine: ObservableObject {
         totalSamplesProcessed = 0
         allSpeakerTurns = []
         elapsedSeconds = 0
+        // Live-phase tracking. `livePhase` stays nil until the first window
+        // closes, so the UI shows nothing for the second or two before we
+        // have a measurement rather than guessing.
+        livePhase = nil
+        phaseWindowSamples = 0
+        phaseWindowStart = nil
+        phaseEdgeWindows = 0
         detectedLanguage = nil
         processedDurationSeconds = 0
         speakerNames = [:]
@@ -2531,6 +2587,7 @@ final class TranscriptionEngine: ObservableObject {
             for await frames in audioStream {
                 if Task.isCancelled { break }
                 await MainActor.run {
+                    self.updateLivePhase(deliveredSamples: frames.count)
                     self.pcmBuffer.append(contentsOf: frames)
                     if self.useStaticDiarization || self.useLivePostFinishRediarize {
                         self.fullPcmBuffer?.append(contentsOf: frames)
@@ -7278,6 +7335,11 @@ final class TranscriptionEngine: ObservableObject {
         if let frame = await resolveFrameIOShare(url: url) {
             return frame
         }
+        // 2b. C-SPAN /program/ and /clip/ pages — host-gated; normally
+        //     resolves with zero page fetches (see `resolveCSpanMedia`).
+        if let cspan = await resolveCSpanMedia(url: url) {
+            return cspan
+        }
         // 3. Host-keyed per-state resolvers (Texas).
         if let statehouse = await resolveStatehousePlayer(url: url) {
             return statehouse
@@ -7295,6 +7357,290 @@ final class TranscriptionEngine: ObservableObject {
         // gives a better answer than scraping the page would.
         if let invintus = await resolveInvintusPlayer(url: url, html: html) { return invintus }
         return sniffEmbeddedHLS(url: url, html: html)
+    }
+
+    // MARK: - C-SPAN
+
+    /// What a C-SPAN page URL identifies.
+    private struct CSpanIdentity {
+        /// "program" or "clip" — matches the `html5=` parameter the
+        /// player API expects and the path segment in the CDN manifest.
+        let kind: String
+        let id: String
+        /// The URL slug, kept so we can name the session without fetching
+        /// the (heavy) page just for a `<title>`.
+        let slug: String?
+    }
+
+    /// C-SPAN (2026-09-29).
+    ///
+    /// **Why this exists.** C-SPAN's current site serves programs at
+    /// `c-span.org/program/<series>/<slug>/<id>` and clips at
+    /// `c-span.org/clip/<…>/<id>`. yt-dlp's `CSpanIE` only matches the
+    /// legacy player URL — `_VALID_URL = r'…c-span\.org/video/\?(?P<id>[0-9a-f]+)'`
+    /// — so neither of the modern shapes matches ANY extractor, yt-dlp
+    /// falls through to its generic scraper, and the page (a JS player)
+    /// yields nothing. That is the "Unsupported URL" the user hit. It is a
+    /// known, still-open gap upstream (yt-dlp issue #11839).
+    ///
+    /// **Three tiers, most-specific first, each failing open.**
+    ///
+    /// 1. *Deterministic manifest.* A program's HLS master lives at
+    ///    `https://m3u8-0.c-spanvideo.org/program/program.<id>.tsc.m3u8`,
+    ///    derivable entirely from the id in the page URL — the same shape
+    ///    of win as the Senate.gov ISVP extractor: zero page fetches, one
+    ///    64-byte ranged GET to confirm, sub-second. The CDN requires
+    ///    `Referer: https://www.c-span.org/`, which is why we verify with
+    ///    the header rather than trusting the pattern, and why
+    ///    `AudioStreamExtractor.playerOriginForManifestHost` now maps
+    ///    `c-spanvideo.org` → `https://www.c-span.org` so ffmpeg, the
+    ///    duration probe and the downloader all send it too.
+    ///
+    ///    Only programs get this tier. The clip equivalent is unverified,
+    ///    and guessing a URL shape we have never seen respond is how you
+    ///    get a resolver that reports failure instead of falling through.
+    ///
+    /// 2. *Player API.* `assets/player/ajax-player.php?os=android&html5=<kind>&id=<id>`
+    ///    is the endpoint yt-dlp's C-SPAN extractor has used for years and
+    ///    it is keyed on the same program/clip id, so it covers clips,
+    ///    which have no tier 1. Response shape is the XML-ish JSON C-SPAN
+    ///    has always returned: every leaf is either a bare string or
+    ///    `{"#text": …}`, hence `cspanText`.
+    ///
+    ///    Measured 2026-09-29: it is alive but fussy. Without a browser UA
+    ///    and Referer, CloudFront returns a "Request blocked" HTML page —
+    ///    which is why this sends both. With them it answers properly, but
+    ///    for a modern program id it answered
+    ///    `{"video":{"@status":"Failed","error":{"#text":"Video not
+    ///    available at this time"}}}`, so it looks like it only knows the
+    ///    legacy id space. Kept because it costs one fast request on a path
+    ///    that has already missed, and because it is the only tier clips
+    ///    have besides the page sniff. The `@status` guard below is what
+    ///    turns that answer into a clean fall-through.
+    ///
+    /// 3. *Page sniff.* Fetch the page and run the generic embedded-HLS
+    ///    scan, which also picks up a JW Player config if C-SPAN is still
+    ///    emitting one.
+    ///
+    /// Returning nil from all three leaves the URL untouched, so the
+    /// session falls back to exactly today's behaviour (yt-dlp generic).
+    /// Legacy `/video/?…` URLs are deliberately NOT intercepted: yt-dlp
+    /// already handles those, and there is no reason to put a new code
+    /// path in front of something that works.
+    private static func resolveCSpanMedia(url: URL) async -> ResolvedMedia? {
+        let host = url.host?.lowercased() ?? ""
+        guard host == "c-span.org" || host.hasSuffix(".c-span.org") else { return nil }
+        guard let identity = cspanIdentity(from: url) else { return nil }
+
+        let title = identity.slug.flatMap(cspanTitle(fromSlug:))
+
+        // Tier 1 — deterministic CDN manifest (programs only).
+        if identity.kind == "program",
+           let manifest = URL(string: "https://m3u8-0.c-spanvideo.org/program/program.\(identity.id).tsc.m3u8"),
+           await cspanManifestResponds(manifest) {
+            print("[C-SPAN] program \(identity.id) → \(manifest.absoluteString)")
+            return ResolvedMedia(mediaURL: manifest, title: title)
+        }
+
+        // Tier 2 — the player API.
+        if let viaAPI = await cspanPlayerAPI(identity: identity, pageURL: url, fallbackTitle: title) {
+            return viaAPI
+        }
+
+        // Tier 3 — page sniff.
+        print("[C-SPAN] \(identity.kind) \(identity.id): manifest and player API both missed — sniffing the page.")
+        guard let html = await fetchHTML(url) else { return nil }
+        guard let sniffed = sniffEmbeddedHLS(url: url, html: html) else {
+            print("[C-SPAN] No media found for \(identity.kind) \(identity.id) — falling through to yt-dlp.")
+            return nil
+        }
+        return ResolvedMedia(mediaURL: sniffed.mediaURL, title: sniffed.title ?? htmlTitle(from: html) ?? title)
+    }
+
+    /// Pull the program/clip kind and numeric id out of a C-SPAN page URL.
+    ///
+    /// Both modern shapes put the id last:
+    ///   /program/campaign-2026/nebraska-us-senate-debate/684726
+    ///   /clip/<series>/<slug>/5164839
+    /// so we take the last all-digits path component and read the kind off
+    /// the first. Anything else — including the legacy `/video/?…` player
+    /// URL yt-dlp already handles — returns nil and is left alone.
+    private static func cspanIdentity(from url: URL) -> CSpanIdentity? {
+        let parts = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        guard let first = parts.first?.lowercased() else { return nil }
+        let kind: String
+        switch first {
+        case "program": kind = "program"
+        case "clip":    kind = "clip"
+        default:        return nil
+        }
+        guard let id = parts.last(where: { !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else {
+            print("[C-SPAN] \(kind) page has no numeric id in its path — falling through.")
+            return nil
+        }
+        // The slug is the component before the id, when there is one that
+        // isn't just the kind again (`/program/684726` has no slug).
+        var slug: String?
+        if parts.count >= 2, parts[parts.count - 1] == id {
+            let candidate = parts[parts.count - 2]
+            if candidate.lowercased() != kind, candidate.contains(where: \.isLetter) {
+                slug = candidate
+            }
+        }
+        return CSpanIdentity(kind: kind, id: id, slug: slug)
+    }
+
+    /// Words that stay upper-case in a C-SPAN title, and words that stay
+    /// lower-case unless they lead. An explicit acronym list rather than a
+    /// "short words are acronyms" rule: the short-word heuristic looked
+    /// fine on `nebraska-us-senate-debate` and turned
+    /// `the-ai-mirror-how-to-reclaim-our-humanity-in-an-age-of-machine-thinking`
+    /// into "THE AI Mirror HOW to Reclaim OUR Humanity in an AGE of…".
+    /// The list leans toward the agencies this app sees most.
+    private static let cspanAcronyms: Set<String> = [
+        "us", "usa", "dc", "uk", "eu", "un", "gop", "pac", "nato", "nasa",
+        "fbi", "cia", "nsa", "doj", "dod", "dhs", "hhs", "epa", "gao", "omb", "cbo",
+        "sec", "occ", "fdic", "cfpb", "irs", "sba", "hud", "va", "fcc", "ftc", "fda",
+        "finra", "nih", "cdc", "dea", "atf", "tsa", "ssa", "usda", "usps",
+        "ceo", "cfo", "cto", "hr", "ai", "tv", "gdp", "ipo", "esg", "nyc",
+    ]
+    private static let cspanSmallWords: Set<String> = [
+        "a", "an", "and", "at", "for", "from", "in", "of", "on", "the", "to", "vs", "with",
+    ]
+
+    /// "nebraska-us-senate-debate" → "Nebraska US Senate Debate".
+    /// A cheap stand-in for the page `<title>` so tier 1 can stay at zero
+    /// page fetches; tiers 2 and 3 replace it with a real title when they
+    /// have one.
+    private static func cspanTitle(fromSlug slug: String) -> String? {
+        let words = slug.split(separator: "-").map(String.init).filter { !$0.isEmpty }
+        guard !words.isEmpty else { return nil }
+        return words.enumerated().map { index, word -> String in
+            let lower = word.lowercased()
+            if cspanAcronyms.contains(lower) { return lower.uppercased() }
+            if index > 0, cspanSmallWords.contains(lower) { return lower }
+            return lower.prefix(1).uppercased() + String(lower.dropFirst())
+        }.joined(separator: " ")
+    }
+
+    /// 64-byte ranged GET with the Referer the C-SPAN CDN requires,
+    /// checking that what comes back is actually an HLS playlist. A HEAD
+    /// would be cheaper but C-SPAN's CDN is not reliably HEAD-friendly,
+    /// and a 200 alone is not proof — a bad id can still return an error
+    /// document with a 200. `#EXTM3U` is.
+    private static func cspanManifestResponds(_ manifest: URL) async -> Bool {
+        var request = URLRequest(url: manifest)
+        request.timeoutInterval = 8
+        request.setValue("bytes=0-63", forHTTPHeaderField: "Range")
+        request.setValue("https://www.c-span.org/", forHTTPHeaderField: "Referer")
+        request.setValue("https://www.c-span.org", forHTTPHeaderField: "Origin")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent"
+        )
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse else {
+            print("[C-SPAN] Manifest probe failed (no response): \(manifest.absoluteString)")
+            return false
+        }
+        guard (200...299).contains(http.statusCode) else {
+            print("[C-SPAN] Manifest probe HTTP \(http.statusCode): \(manifest.absoluteString)")
+            return false
+        }
+        let head = String(decoding: data, as: UTF8.self)
+        guard head.hasPrefix("#EXTM3U") else {
+            print("[C-SPAN] Manifest probe returned non-HLS body (\(data.count) bytes): \(manifest.absoluteString)")
+            return false
+        }
+        return true
+    }
+
+    /// C-SPAN's long-standing player endpoint. Handles both programs and
+    /// clips; the `os=android&html5=<kind>` pair is what makes it hand
+    /// back plain HLS/MP4 rather than a Flash descriptor.
+    private static func cspanPlayerAPI(
+        identity: CSpanIdentity,
+        pageURL: URL,
+        fallbackTitle: String?
+    ) async -> ResolvedMedia? {
+        let endpoint = "https://www.c-span.org/assets/player/ajax-player.php?os=android&html5=\(identity.kind)&id=\(identity.id)"
+        guard let api = URL(string: endpoint) else { return nil }
+
+        var request = URLRequest(url: api)
+        request.timeoutInterval = 12
+        request.setValue(pageURL.absoluteString, forHTTPHeaderField: "Referer")
+        request.setValue("https://www.c-span.org", forHTTPHeaderField: "Origin")
+        request.setValue("application/json, text/javascript, */*; q=0.01", forHTTPHeaderField: "Accept")
+        request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent"
+        )
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            print("[C-SPAN] Player API request failed for \(identity.kind) \(identity.id).")
+            return nil
+        }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let video = root["video"] as? [String: Any] else {
+            print("[C-SPAN] Player API returned an unparseable body (\(data.count) bytes).")
+            return nil
+        }
+        if let status = video["@status"] as? String, status != "Success" {
+            print("[C-SPAN] Player API said \(status): \(cspanText(video, "error") ?? "no detail").")
+            return nil
+        }
+        guard let files = video["files"] as? [[String: Any]], !files.isEmpty else {
+            print("[C-SPAN] Player API returned no files for \(identity.kind) \(identity.id).")
+            return nil
+        }
+        if files.count > 1 {
+            // Multi-part programs exist (C-SPAN splits very long coverage).
+            // A session takes one URL, so we take part 1 and say so rather
+            // than silently transcribing a fraction of what was asked for.
+            print("[C-SPAN] \(identity.kind) \(identity.id) has \(files.count) parts — using part 1 only.")
+        }
+        let file = files[0]
+
+        // Prefer the HLS path (adaptive, and what the site itself plays);
+        // otherwise take the highest-bitrate progressive rendition.
+        var chosen: String?
+        if let path = cspanText(file, "path"), path.lowercased().contains(".m3u8") {
+            chosen = path
+        }
+        if chosen == nil, let qualities = file["qualities"] as? [[String: Any]] {
+            let best = qualities
+                .compactMap { quality -> (String, Int)? in
+                    guard let url = cspanText(quality, "file") else { return nil }
+                    return (url, Int(cspanText(quality, "bitrate") ?? "") ?? 0)
+                }
+                .max(by: { $0.1 < $1.1 })
+            chosen = best?.0
+        }
+        if chosen == nil { chosen = cspanText(file, "path") }
+
+        guard let chosen, let mediaURL = URL(string: chosen.replacingOccurrences(of: "&amp;", with: "&")) else {
+            print("[C-SPAN] Player API file entry carried no usable URL.")
+            return nil
+        }
+        let title = cspanText(video, "title") ?? fallbackTitle
+        print("[C-SPAN] Player API \(identity.kind) \(identity.id) → \(mediaURL.absoluteString)")
+        return ResolvedMedia(mediaURL: mediaURL, title: title)
+    }
+
+    /// C-SPAN's player JSON is a JSON rendering of its old XML payload, so
+    /// most leaves arrive as `{"#text": "…"}` rather than a bare string —
+    /// but not all of them, and not consistently across endpoints. Accept
+    /// either.
+    private static func cspanText(_ container: [String: Any], _ key: String) -> String? {
+        if let nested = container[key] as? [String: Any], let text = nested["#text"] as? String {
+            return text.isEmpty ? nil : text
+        }
+        if let direct = container[key] as? String {
+            return direct.isEmpty ? nil : direct
+        }
+        return nil
     }
 
     /// Invintus Media player (2026-07-29). Pages embed:
@@ -7703,7 +8049,63 @@ final class TranscriptionEngine: ObservableObject {
                     probeResult = .failed("yt-dlp probe failed — check URL, cookies, or network")
                 }
             } else {
-                let ff = await Self.probeRemoteDurationViaFFmpeg(url: url)
+                // Referer-gated CDNs (2026-09-29). Some manifest hosts 403
+                // a request with no Referer — C-SPAN's
+                // m3u8-*.c-spanvideo.org and Frame.io's sahls.frame.io
+                // both do. This probe previously sent none, so such a
+                // manifest failed the header read and fell into the silent
+                // `.live` fallback below, which misclassifies a finite
+                // program as a livestream and hides its duration. Reuse
+                // the same host→origin map the extractor uses for ffmpeg
+                // so all three paths (probe, transcribe, download) agree.
+                let hostReferer = AudioStreamExtractor
+                    .playerOriginForManifestHost(url.absoluteString)
+                    .flatMap { URL(string: $0) }
+                var ff = await Self.probeRemoteDurationViaFFmpeg(url: url, referer: hostReferer)
+
+                // ONE RETRY ON A REFERER-GATED HOST (2026-09-29). A host in
+                // that map got there because a resolver rewrote a portal
+                // page to its CDN manifest, so we already know this is a
+                // recording, not a live feed — and those CDNs abort reads
+                // intermittently (C-SPAN's did, once, then passed five
+                // consecutive reruns of the identical command). Falling
+                // straight through to `.live` on a transient abort is the
+                // worst possible answer: it hides the duration AND runs
+                // live-mode transcription over a finite program. Retry once
+                // before accepting that. Bounded at one extra attempt —
+                // `probeRemoteDurationViaFFmpeg` has its own 8 s ceiling,
+                // so the cost of being wrong is 8 s, and only on the
+                // handful of hosts in the map.
+                if case .failed = ff, hostReferer != nil {
+                    print("[Probe] \(url.host ?? "manifest") failed on first attempt — retrying once (referer-gated CDN, aborts here are usually transient).")
+                    ff = await Self.probeRemoteDurationViaFFmpeg(url: url, referer: hostReferer)
+                }
+
+                // ASK THE PLAYLIST (2026-09-29). ffmpeg reports
+                // `Duration: N/A` for a MASTER playlist carrying several
+                // variants, and C-SPAN's segments additionally start at an
+                // absolute PTS (`start: 45572.746222`), so it has nothing to
+                // derive a duration from. Both of those are properties of
+                // ffmpeg's demuxer, not of the content: the variant playlist
+                // right behind that master says
+                // `#EXT-X-PLAYLIST-TYPE:VOD`, `#EXT-X-MEDIA-SEQUENCE:0`,
+                // `#EXT-X-ENDLIST` and 583 × `#EXTINF:6.400`. A finished
+                // 62-minute program was being classified as a livestream
+                // while the manifest said otherwise in four separate ways.
+                //
+                // Only consulted when ffmpeg came back without a duration,
+                // so the common path costs nothing, and gated on the
+                // playlist declaring itself VOD — a real live stream has a
+                // sliding window with neither marker and stays `.live`.
+                switch ff {
+                case .finite:
+                    break
+                case .live, .failed:
+                    if let seconds = await Self.vodDurationFromHLSPlaylist(url: url, referer: hostReferer) {
+                        ff = .finite(seconds)
+                    }
+                }
+
                 probedTitle = nil  // HLS/direct audio: no title source
                 switch ff {
                 case .finite(let s): probeResult = .finite(s)
@@ -7743,6 +8145,163 @@ final class TranscriptionEngine: ObservableObject {
                     print("[Probe] \(source.rawValue): probe failed — \(reason)")
                 }
             }
+        }
+    }
+
+    // MARK: - HLS playlist duration
+
+    /// Duration of a VOD HLS stream, read from the playlist itself by
+    /// summing `#EXTINF` values. Returns nil for anything that is, or might
+    /// be, live — and for anything that isn't an m3u8.
+    ///
+    /// This exists because ffmpeg's answer is not always available even
+    /// when the manifest plainly knows: a master playlist with several
+    /// variants gets `Duration: N/A`, and so does any stream whose segments
+    /// start at a non-zero absolute PTS. Both describe C-SPAN. The playlist
+    /// behind that master is unambiguous, and summing it is exact rather
+    /// than an estimate — `#EXTINF` IS the segment duration.
+    ///
+    /// **The VOD guard is what makes this safe to apply generally.** A live
+    /// stream publishes a sliding window of the last handful of segments,
+    /// so summing it would return ~30 s and confidently misreport an
+    /// ongoing hearing as a half-minute recording — far worse than the
+    /// status quo. `#EXT-X-ENDLIST` means the publisher has declared the
+    /// stream complete and `#EXT-X-PLAYLIST-TYPE:VOD` means it promised
+    /// never to remove segments; a live window has neither, and returns nil
+    /// so the caller keeps `.live`. A genuinely finite stream that declares
+    /// neither also returns nil, which is exactly today's behaviour — this
+    /// can add a correct answer, never replace one.
+    ///
+    /// One master→variant hop, no deeper, so a malformed or self-referential
+    /// playlist can't recurse.
+    private static func vodDurationFromHLSPlaylist(
+        url: URL,
+        referer: URL?,
+        allowMasterHop: Bool = true
+    ) async -> TimeInterval? {
+        let path = url.path.lowercased()
+        guard path.hasSuffix(".m3u8") || path.hasSuffix(".m3u") else { return nil }
+        guard let text = await fetchPlaylistText(url, referer: referer), text.hasPrefix("#EXTM3U") else {
+            return nil
+        }
+
+        if text.contains("#EXT-X-STREAM-INF") {
+            guard allowMasterHop, let variant = firstVariantURL(in: text, base: url) else { return nil }
+            return await vodDurationFromHLSPlaylist(url: variant, referer: referer, allowMasterHop: false)
+        }
+
+        guard text.contains("#EXT-X-ENDLIST") || text.contains("#EXT-X-PLAYLIST-TYPE:VOD") else {
+            print("[Probe] HLS playlist has no ENDLIST or PLAYLIST-TYPE:VOD — treating as live, not summing.")
+            return nil
+        }
+
+        var total: TimeInterval = 0
+        var segments = 0
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("#EXTINF:") else { continue }
+            // "#EXTINF:6.400," and "#EXTINF:6," are both legal; take the
+            // leading numeric run and ignore the title after the comma.
+            let numeric = line.dropFirst("#EXTINF:".count).prefix { $0.isNumber || $0 == "." }
+            guard let seconds = Double(numeric), seconds > 0 else { continue }
+            total += seconds
+            segments += 1
+        }
+        guard segments > 0, total > 0 else {
+            print("[Probe] HLS playlist declared VOD but carried no usable #EXTINF lines.")
+            return nil
+        }
+        print("[Probe] HLS playlist is VOD: \(segments) segment(s), \(String(format: "%.1f", total))s summed from #EXTINF.")
+        return total
+    }
+
+    /// First variant URI in a master playlist, resolved against the master's
+    /// own URL. Any variant will do — they describe the same content at
+    /// different bitrates, so their segment durations match.
+    private static func firstVariantURL(in playlist: String, base: URL) -> URL? {
+        var sawStreamInf = false
+        for rawLine in playlist.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.hasPrefix("#EXT-X-STREAM-INF") {
+                sawStreamInf = true
+                continue
+            }
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            guard sawStreamInf else { continue }
+            return URL(string: line, relativeTo: base)?.absoluteURL
+        }
+        return nil
+    }
+
+    /// Plain text fetch for a playlist, carrying the same UA and Referer the
+    /// ffmpeg paths send so a referer-gated CDN answers this the way it
+    /// answers them.
+    private static func fetchPlaylistText(_ url: URL, referer: URL?) async -> String? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.setValue(AudioStreamExtractor.manifestUserAgent, forHTTPHeaderField: "User-Agent")
+        if let referer, let scheme = referer.scheme, let host = referer.host {
+            // A bare origin ("https://www.c-span.org") is not a well-formed
+            // Referer; CDNs that check it want a path.
+            let value = referer.path.isEmpty ? referer.absoluteString + "/" : referer.absoluteString
+            request.setValue(value, forHTTPHeaderField: "Referer")
+            request.setValue("\(scheme)://\(host)", forHTTPHeaderField: "Origin")
+        }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode) else {
+            print("[Probe] Playlist fetch failed: \(url.absoluteString)")
+            return nil
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    // MARK: - Live phase (backlog vs live edge)
+
+    /// Accumulate delivered audio and, once a window closes, classify the
+    /// session as still catching up or caught up. Called on the MainActor
+    /// from the audio-consumption loop, once per delivered frame batch.
+    ///
+    /// `atLiveEdge` LATCHES. Reaching the edge is a one-way transition for
+    /// the purposes of the label: once there, a slow patch means the network
+    /// is struggling, not that a backlog reappeared, and a label that
+    /// flickered back to "catching up" every time a fragment stalled would
+    /// be actively misleading.
+    @MainActor
+    private func updateLivePhase(deliveredSamples: Int) {
+        // Only meaningful while draining a backlog we asked for. A
+        // live-edge session is at the edge from its first sample.
+        guard livePhase != .atLiveEdge else { return }
+        guard sessionMode != .static,
+              AudioStreamExtractor.liveFromStartEnabled else {
+            if livePhase != nil { livePhase = nil }
+            return
+        }
+
+        guard let windowStart = phaseWindowStart else {
+            phaseWindowStart = Date()
+            phaseWindowSamples = deliveredSamples
+            return
+        }
+
+        phaseWindowSamples += deliveredSamples
+        let wall = Date().timeIntervalSince(windowStart)
+        guard wall >= Self.phaseWindowSeconds else { return }
+
+        let audioSeconds = Double(phaseWindowSamples) / sampleRate
+        let rate = audioSeconds / wall
+        phaseWindowSamples = 0
+        phaseWindowStart = Date()
+
+        if rate <= Self.phaseEdgeRateCeiling {
+            phaseEdgeWindows += 1
+            if phaseEdgeWindows >= 2 {
+                livePhase = .atLiveEdge
+                print(String(format: "[LivePhase] Caught up to the live edge (delivery settled to %.2fx realtime).", rate))
+            }
+        } else {
+            phaseEdgeWindows = 0
+            livePhase = .catchingUp(rate: rate)
         }
     }
 
@@ -7848,6 +8407,15 @@ final class TranscriptionEngine: ObservableObject {
                     "Referer: \(referer.absoluteString)\r\nOrigin: \(scheme)://\(host)\r\n",
                 ])
             }
+            // Retry options (2026-09-29). This probe had none, and that is
+            // how a transient CDN abort turned a 63-minute C-SPAN program
+            // into a "livestream": the read failed, the switch below fell
+            // silently through to `.live`, and the session ran in live mode.
+            // They matter here even though this is a `-t 0` header read —
+            // ffmpeg's HLS demuxer opens the first segment during
+            // stream-info probing, which is exactly where the abort landed.
+            // Always a remote URL in this function, so they always apply.
+            args.append(contentsOf: AudioStreamExtractor.networkRetryArguments)
             args.append(contentsOf: [
                 "-i", url.absoluteString,
                 "-t", "0",

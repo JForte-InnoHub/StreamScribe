@@ -12,11 +12,89 @@ import MLXAudioSTT
 ///   • Returns `STTOutput` with `text: String`, `language: String?`, and
 ///     `segments: [[String: Any]]?` where each dict has keys `"text"`, `"start"`, `"end"`
 ///     (per-sentence timing extracted from Parakeet's alignment output).
+/// Watches macOS memory pressure and releases MLX's buffer cache when the
+/// system starts to squeeze.
+///
+/// **Why (2026-09-29).** `prepare()`'s cache-limit comment below already
+/// records this failure mode — "a single 5s chunk's inference took 82s by
+/// chunk #176 as macOS started paging Metal memory" — and it reappeared in
+/// the field. On a 16 GB machine with Firefox open (23.7 GB swapped, 58 MB
+/// free) 10-second chunks took 9.4-28.5s each, a 0.36x transcription rate.
+/// Same build, same model, same live stream, on the same machine with the
+/// browser closed: 0.40-0.47s per chunk, 21-25x realtime. Static mode
+/// measured identically in both states (RTF 0.04x when healthy), so this is
+/// not a live-path problem — MLX simply falls off a cliff rather than
+/// degrading once its Metal buffers start paging.
+///
+/// Both existing mitigations are open-loop: a ceiling set once in
+/// `prepare()`, and a periodic clear on a fixed cadence. Neither notices
+/// that the machine is in trouble. This closes the loop — when the OS says
+/// it is short of memory, hand back every buffer we are not using, which is
+/// the one response that reliably helps and costs only a re-allocation.
+///
+/// Process-lifetime singleton rather than per-session: pressure is a
+/// system-wide condition, the dispatch source must stay retained to keep
+/// firing, and arming it twice would release the cache twice per event.
+private final class MLXMemoryPressureMonitor: @unchecked Sendable {
+    static let shared = MLXMemoryPressureMonitor()
+
+    private let lock = NSLock()
+    private var source: DispatchSourceMemoryPressure?
+    private var releaseCount = 0
+
+    /// Idempotent — safe to call from every `prepare()`.
+    func startIfNeeded() {
+        lock.lock()
+        let alreadyRunning = source != nil
+        lock.unlock()
+        guard !alreadyRunning else { return }
+
+        let newSource = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: DispatchQueue.global(qos: .utility)
+        )
+        // The handler reads the event back through `self` rather than
+        // capturing `newSource` strongly inside its own event handler,
+        // which would be a retain cycle.
+        newSource.setEventHandler { [weak self] in
+            self?.handlePressureEvent()
+        }
+        lock.lock()
+        source = newSource
+        lock.unlock()
+        newSource.activate()
+        print("[Parakeet] Memory-pressure monitor armed — the MLX buffer cache will be released if the system runs short.")
+    }
+
+    private func handlePressureEvent() {
+        lock.lock()
+        let event = source?.data
+        releaseCount += 1
+        let count = releaseCount
+        lock.unlock()
+
+        let severity = (event?.contains(.critical) ?? false) ? "CRITICAL" : "warning"
+
+        // Safe while an inference is in flight: this releases only buffers
+        // MLX is not currently holding live.
+        MLX.GPU.clearCache()
+
+        print("[Parakeet] Memory pressure \(severity) — released the MLX buffer cache (release #\(count)). "
+            + "Transcription may run well below realtime until the system recovers, and closing other "
+            + "memory-heavy apps is the fastest remedy. This line in a log means slow inference is "
+            + "environmental, not a model or pipeline problem.")
+    }
+}
+
 actor ParakeetBackend: TranscriptionBackend {
 
     private var model: ParakeetModel?
     private let modelRepo: String
     private let chunkDuration: TimeInterval
+
+    /// Audio processed since the last periodic MLX cache release. Drives the
+    /// clear cadence in `transcribe()`; see `cacheReleaseIntervalAudioSeconds`.
+    private var audioSecondsSinceCacheRelease: TimeInterval = 0
 
     /// Rolling cache of the last ~80 tokens we emitted, used to catch boundary
     /// duplication where Parakeet re-transcribes the overlap region of consecutive
@@ -57,6 +135,10 @@ actor ParakeetBackend: TranscriptionBackend {
         // to the Settings slider take effect on the next session start
         // without an app restart.
         applyMLXCacheLimit()
+
+        // Closed-loop companion to the ceiling above — see
+        // `MLXMemoryPressureMonitor`. Idempotent; armed once per process.
+        MLXMemoryPressureMonitor.shared.startIfNeeded()
 
         // Check for a sideloaded copy in ~/Documents and migrate it into
         // the library's cache location if needed. Lets users on networks
@@ -110,22 +192,44 @@ actor ParakeetBackend: TranscriptionBackend {
         let rtf = audioSeconds > 0 ? inferElapsed / audioSeconds : 0
         let textLen = output.text.count
         let rawSegCount = output.segments?.count ?? 0
-        print(String(format: "[Parakeet] #%d inference complete in %.2fs (RTF=%.2fx, %dx realtime), raw text=%d chars, raw segments=%d",
-                     callNum, inferElapsed, rtf, rtf > 0 ? Int((1.0 / rtf).rounded()) : 0, textLen, rawSegCount))
 
-        // Periodic explicit cache clear. The cache-limit cap (set in
-        // prepare()) is the first line of defense; this is belt-and-
-        // suspenders for long sessions where even bounded growth can
-        // fragment Metal memory. 30 chunks ≈ 2.5 minutes of audio at 5s
-        // chunks — long enough to avoid clearing useful intermediates
-        // every call, short enough that even sessions running for hours
-        // get periodic cleanup. Hard-coded rather than user-configurable
-        // because it shouldn't need tuning unless something's wrong with
-        // the cache-limit ceiling, in which case the user wants the
-        // slider, not a second knob.
-        if callNum % 30 == 0 {
+        // The speed multiplier was `Int((1.0 / rtf).rounded())`, which
+        // TRUNCATES TO ZERO for every RTF above 1.5 — exactly the range
+        // where something is wrong and you most need the number. A field
+        // session running at a third of realtime logged "RTF=3.16x, 0x
+        // realtime" on every line; the one figure a reader scans to judge
+        // health read as a meaningless 0. Sub-realtime now shows a decimal,
+        // which is also the honest way to say "we are falling behind."
+        let speedupText: String = {
+            guard rtf > 0 else { return "n/a" }
+            let speedup = 1.0 / rtf
+            return speedup >= 10
+                ? String(format: "%.0fx", speedup)
+                : String(format: "%.2fx", speedup)
+        }()
+        print("[Parakeet] #\(callNum) inference complete in \(String(format: "%.2f", inferElapsed))s "
+            + "(RTF=\(String(format: "%.2f", rtf))x, \(speedupText) realtime), "
+            + "raw text=\(textLen) chars, raw segments=\(rawSegCount)")
+
+        // Periodic explicit cache release. The ceiling set in prepare() is
+        // the first line of defence and the pressure monitor is the third;
+        // this is the steady-state sweep for long sessions where even
+        // bounded growth fragments Metal memory.
+        //
+        // Now keyed to AUDIO PROCESSED rather than call count (2026-09-29).
+        // `callNum % 30` meant wildly different cadences per mode — every
+        // 5 minutes of audio at 10s live chunks, but every 15 minutes at
+        // 30s static chunks, and every 2.5 minutes at 5s. The pressure this
+        // relieves accumulates with audio volume, not with how many calls
+        // it was split across, so the trigger should too. Hard-coded rather
+        // than user-configurable: if this needs tuning, the ceiling slider
+        // is the knob to reach for, not a second one.
+        audioSecondsSinceCacheRelease += audioSeconds
+        if audioSecondsSinceCacheRelease >= Self.cacheReleaseIntervalAudioSeconds {
+            audioSecondsSinceCacheRelease = 0
             MLX.GPU.clearCache()
-            print("[Parakeet] Periodic MLX cache clear at chunk #\(callNum).")
+            print("[Parakeet] Periodic MLX cache release at chunk #\(callNum) "
+                + "(every \(Int(Self.cacheReleaseIntervalAudioSeconds))s of audio).")
         }
 
         if !loggedLanguage, let lang = output.language, !lang.isEmpty {
@@ -240,10 +344,17 @@ actor ParakeetBackend: TranscriptionBackend {
         )
     }
 
+    /// Audio processed between periodic MLX cache releases. Five minutes is
+    /// the cadence the previous call-count rule produced at the live chunk
+    /// size, which had not misbehaved — this keeps that and applies it
+    /// evenly to the other chunk sizes.
+    private static let cacheReleaseIntervalAudioSeconds: TimeInterval = 300
+
     func reset() async {
         recentTailText = ""
         transcribeCallCount = 0
         loggedLanguage = false
+        audioSecondsSinceCacheRelease = 0
         print("[Parakeet] reset.")
     }
 
@@ -261,6 +372,7 @@ actor ParakeetBackend: TranscriptionBackend {
         recentTailText = ""
         transcribeCallCount = 0
         loggedLanguage = false
+        audioSecondsSinceCacheRelease = 0
         print("[Parakeet] unloaded model.")
     }
 

@@ -517,6 +517,23 @@ final class MiniplayerController: ObservableObject {
             fragmentedAsset = fragged
             fragmentMinder = AVFragmentedAssetMinder(asset: fragged, mindingInterval: 2.0)
             item = AVPlayerItem(asset: fragged)
+        } else if !url.isFileURL,
+                  let origin = AudioStreamExtractor.playerOriginForManifestHost(url.absoluteString) {
+            // Referer-gated CDNs (2026-09-29). C-SPAN's c-spanvideo.org
+            // and Frame.io's sahls.frame.io 403 a manifest request with
+            // no Referer, and AVFoundation sends none by default — the
+            // preview would stay black while the same URL transcribed
+            // and downloaded fine, because those two paths go through
+            // ffmpeg with `-headers`. Same host→origin map so all four
+            // paths agree.
+            let asset = AVURLAsset(url: url, options: [
+                "AVURLAssetHTTPHeaderFieldsKey": [
+                    "Referer": "\(origin)/",
+                    "Origin": origin,
+                    "User-Agent": AudioStreamExtractor.manifestUserAgent,
+                ],
+            ])
+            item = AVPlayerItem(asset: asset)
         } else {
             item = AVPlayerItem(url: url)
         }

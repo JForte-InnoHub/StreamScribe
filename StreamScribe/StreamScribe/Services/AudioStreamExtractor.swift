@@ -38,6 +38,15 @@ private final class MutableByteBuffer {
 /// opening audio is downmixed correctly too — on an inverted source
 /// a provisional average would have silently destroyed exactly the
 /// window we were measuring.
+/// UserDefaults key for the "transcribe the backlog first" checkbox, and
+/// its unset-value default. Global constants rather than statics so
+/// `SidebarView`'s `@AppStorage` and `AudioStreamExtractor`'s reader agree
+/// on both the key and the fallback — the same convention
+/// `mlxCacheLimitMBKey` and `mediaCacheIncludeVideoKey` follow. Both sides
+/// MUST use these; a hardcoded string on either side drifts silently.
+let liveFromStartDefaultsKey = "live.transcribeBacklogFromStart"
+let liveFromStartDefaultValue = false
+
 extension AudioStreamExtractor {
     /// Page origin a signed-manifest CDN expects, or nil when we have no
     /// basis to claim one.
@@ -46,12 +55,227 @@ extension AudioStreamExtractor {
     /// `next.frame.io` app, and the CDN sees both an Origin and a Referer
     /// naming it. Reproducing that is the difference between a resolved
     /// manifest playing and 403ing.
+    /// C-SPAN's video CDN (`m3u8-0.c-spanvideo.org`, and the numbered
+    /// siblings it load-balances across) 403s a manifest request that
+    /// arrives without a `c-span.org` Referer, so the same header the
+    /// resolver used to verify the manifest has to follow it into ffmpeg,
+    /// the duration probe and the downloader.
     static func playerOriginForManifestHost(_ urlString: String) -> String? {
         guard let host = URL(string: urlString)?.host?.lowercased() else { return nil }
         if host == "sahls.frame.io" || host.hasSuffix(".frame.io") {
             return "https://next.frame.io"
         }
+        if host == "c-spanvideo.org" || host.hasSuffix(".c-spanvideo.org") {
+            return "https://www.c-span.org"
+        }
         return nil
+    }
+
+    /// Whether a live session should ask yt-dlp for the stream's DVR
+    /// backlog (`--live-from-start`) instead of joining at the live edge.
+    /// Backed by the sidebar checkbox that appears once the probe reports a
+    /// livestream. Read at spawn time, which is session start — the only
+    /// spawn that consults it is the first one; retries and every
+    /// escalation rung rejoin at the edge by construction.
+    ///
+    /// **Default OFF, deliberately.** `--live-from-start` requires
+    /// fragment 1 of the stream to still be retrievable, and YouTube's DVR
+    /// window does not reach back indefinitely — on a stream that has been
+    /// live for hours the beginning has expired and yt-dlp fails with
+    /// "fragment 1 not found, unable to continue" having written nothing.
+    /// Defaulting it on meant every live session took that risk
+    /// unasked. With it off, a live session starts immediately; with it on,
+    /// the request is made and a refusal falls back to the edge through
+    /// `liveExtractionFailurePatterns`, so the worst case is a slower start
+    /// rather than a dead session.
+    static var liveFromStartEnabled: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: liveFromStartDefaultsKey) != nil else {
+            return liveFromStartDefaultValue
+        }
+        return defaults.bool(forKey: liveFromStartDefaultsKey)
+    }
+
+    /// Browser UA sent alongside the Referer on referer-gated CDNs, so the
+    /// ffmpeg request looks like the one the resolver already made through
+    /// URLSession. Kept identical to the resolver's string on purpose: a
+    /// CDN that fingerprints the pair should see one client, not two.
+    static let manifestUserAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+    /// Retry options for any ffmpeg **network** input, shared by the three
+    /// paths that open one: the transcription pipe, the duration probe and
+    /// the HLS downloader. Only the first had them before 2026-09-29, and
+    /// only three of the four.
+    ///
+    /// Must be appended BEFORE `-i`: these are input options, and ffmpeg
+    /// applies them to the output if they come after the URL.
+    ///
+    /// NEVER pass these for a `file://` input. They are http protocol
+    /// options; ffmpeg's CLI calls `assert_avoptions` after
+    /// `avformat_open_input` and treats an input option that no demuxer or
+    /// protocol claimed as FATAL, so on a local file they would kill the
+    /// process before a byte is read. Every caller gates on the input being
+    /// remote.
+    ///
+    /// **What this is for, and what was ruled out (2026-09-29).** A C-SPAN
+    /// session died with Secure Transport `-9806` (`errSSLClosedAbort` —
+    /// the peer tore the connection down) on the FIRST segment, after the
+    /// master playlist had loaded fine. Three candidates: ffmpeg's TLS
+    /// backend, HLS keep-alive, and a UA-based WAF.
+    ///
+    /// Measurement killed all three. A browser UA fixed it; so did
+    /// `-http_persistent 0`, independently — and each of those still
+    /// carries the other's supposed defect (`-http_persistent 0` sends
+    /// `Lavf/…`; a browser UA still reuses the connection), so neither can
+    /// be the gate. Re-running the UNMODIFIED command five times then came
+    /// back 5/5 clean. The abort is intermittent, which fits C-SPAN sitting
+    /// behind CloudFront — its player API returns a CloudFront "Request
+    /// blocked" page to an unadorned client and a `"@status":"Failed"` to a
+    /// browser-shaped one.
+    ///
+    /// So the fix is retry, and ONLY retry: turn an aborted read into a
+    /// reconnect instead of a dead input. That matters far more than it
+    /// sounds, because the abort that reached the log was on segment 1 of a
+    /// 63-minute program — the same event at segment 400 kills a
+    /// transcription that is 40 minutes in.
+    ///
+    /// Deliberately NOT included: `-http_persistent 0` / `-http_multiple 0`.
+    /// They "fixed" a run that was going to pass anyway, they would force a
+    /// fresh TLS handshake for every segment (~1,200 of them on a program
+    /// this length), and they are hls-demuxer options — ffmpeg's CLI calls
+    /// `assert_avoptions` after `avformat_open_input` and treats an input
+    /// option that no demuxer or protocol claimed as FATAL, so on Frame.io's
+    /// primary path (a direct signed MP4 on assets.frame.io, same host map,
+    /// no hls demuxer) they would have killed a source that works today.
+    ///
+    /// `-reconnect_on_network_error` is the one genuinely new flag; the
+    /// other three were already on the transcription pipe and are now
+    /// shared by all three ffmpeg paths rather than living in one of them.
+    static let networkRetryArguments = [
+        "-reconnect", "1",
+        // The flag that makes retry apply to a non-seekable read at all,
+        // which is every HLS session and every piped download.
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_delay_max", "5",
+    ]
+
+    /// The Referer/Origin/UA a referer-gated CDN needs, for the same three
+    /// ffmpeg paths plus — as a header dictionary — the miniplayer's
+    /// `AVURLAsset`, so none of the four can drift. Returns an empty array
+    /// for hosts with no entry in `playerOriginForManifestHost`, which is
+    /// every ordinary source. Retry options are deliberately separate, since
+    /// those apply to ALL network inputs; callers append both.
+    ///
+    /// Host-scoped on purpose: a wrong Referer is worse than none on
+    /// sources that do not expect one, so this claims an origin only where
+    /// the CDN host itself tells us what it is.
+    static func refererHardenedInputArguments(for urlString: String) -> [String] {
+        guard let origin = playerOriginForManifestHost(urlString) else { return [] }
+        return [
+            "-user_agent", manifestUserAgent,
+            "-headers", "Referer: \(origin)/\r\nOrigin: \(origin)\r\n",
+        ]
+    }
+}
+
+/// Line-buffers ffmpeg's stderr and collapses consecutive repeats.
+///
+/// ffmpeg already does this itself — "Last message repeated N times" — but
+/// its check is on the exact message text, and most decoder/encoder warnings
+/// embed the component's instance pointer. Two instances emitting the
+/// identical warning produce two different strings, so the dedup never
+/// fires. That is how one benign VideoToolbox SEI warning put 980 lines into
+/// a 33-second field log (six encoder instances × ~5/sec), and it would have
+/// been ~18,000 lines over a full 62-minute program.
+///
+/// So we normalize `0x…` runs out of the comparison key before comparing.
+/// The emitted text is still the real line, verbatim — only the *decision*
+/// about whether it is a repeat ignores the pointer.
+///
+/// Repeats are reported when the run ends (a different line, or process
+/// exit) rather than on a timer, so a long run stays one line and the count
+/// is unambiguous. `@unchecked Sendable` with an explicit lock, matching
+/// `TimeoutFlag` and `RunningProcessBox`: `readabilityHandler` and
+/// `terminationHandler` are different queues.
+private final class FFmpegStderrCollapser: @unchecked Sendable {
+    private let lock = NSLock()
+    private var partial = ""
+    private var lastKey = ""
+    private var repeats = 0
+
+    /// Replace every `0x…` hex run with a placeholder so per-instance
+    /// pointers don't make identical warnings look distinct.
+    private static func comparisonKey(_ line: String) -> String {
+        var out = ""
+        var i = line.startIndex
+        while i < line.endIndex {
+            let next = line.index(after: i)
+            if line[i] == "0", next < line.endIndex, line[next] == "x" {
+                out += "0xADDR"
+                i = line.index(i, offsetBy: 2)
+                while i < line.endIndex, line[i].isHexDigit { i = line.index(after: i) }
+                continue
+            }
+            out.append(line[i])
+            i = next
+        }
+        return out
+    }
+
+    /// Feed a raw stderr chunk (NOT line-aligned — a read can split a line,
+    /// and did, which is why this buffers). Returns the text to write, or ""
+    /// when everything in the chunk was a repeat.
+    func ingest(_ chunk: String) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        partial += chunk
+        var out = ""
+        while let newline = partial.firstIndex(of: "\n") {
+            let line = String(partial[partial.startIndex..<newline])
+            partial = String(partial[partial.index(after: newline)...])
+            out += consume(line)
+        }
+        return out
+    }
+
+    /// Flush the trailing partial line and any open repeat run. Called from
+    /// the termination handler so a run that lasted until exit isn't lost.
+    func finish() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var out = ""
+        if !partial.isEmpty {
+            let line = partial
+            partial = ""
+            out += consume(line)
+        }
+        out += flushRepeats()
+        return out
+    }
+
+    // Both helpers assume the caller holds the lock.
+
+    private func consume(_ line: String) -> String {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let key = Self.comparisonKey(trimmed)
+        if key == lastKey {
+            repeats += 1
+            return ""
+        }
+        var out = flushRepeats()
+        lastKey = key
+        out += "[ffmpeg] " + trimmed + "\n"
+        return out
+    }
+
+    private func flushRepeats() -> String {
+        guard repeats > 0 else { return "" }
+        let count = repeats
+        repeats = 0
+        return "[ffmpeg] ↑ previous line repeated \(count) more time(s)\n"
     }
 }
 
@@ -722,20 +946,36 @@ actor AudioStreamExtractor {
         await escalateLivePipe(measuredRatio: 0)
     }
 
-    /// The escalation ladder. Step 1 keeps the configured client but
-    /// drops cookies (account-level flags survive client rotation, so
-    /// shedding the account is the cheapest first move). Steps 2-3
-    /// rotate to clients this session hasn't burned. Rejoin is at the
-    /// live edge (no --live-from-start): the starved gap is already
-    /// lost either way, and the transcript timeline simply continues —
-    /// the discontinuity is logged for the record.
+    /// The escalation ladder. Rejoin is always at the live edge (no
+    /// --live-from-start): the starved gap is already lost either way, and
+    /// the transcript timeline simply continues — the discontinuity is
+    /// logged for the record.
+    ///
+    /// RUNG 1 NOW KEEPS COOKIES (2026-09-29). It used to drop the account
+    /// and the `--live-from-start` flag in the same step, which conflated
+    /// two unrelated remedies and broke the recovery path on the axis that
+    /// wasn't the problem. Field sequence:
+    ///
+    ///   * first attempt, WITH cookies → `web_safari` + PO token →
+    ///     format 140 (m4a, audio-only) available, starved only because
+    ///     `--live-from-start` could not fetch fragment 1
+    ///   * rung 1, cookies dropped → client fell back to `visionos` → a
+    ///     different, HLS-only format list → "Requested format is not
+    ///     available", session dead
+    ///
+    /// Dropping `--live-from-start` alone would have fixed it. So rung 1 is
+    /// now the minimal change — same client, same cookies, just rejoin at
+    /// the edge — and shedding the account moves to rung 2, where it
+    /// belongs as a remedy for account-level rate flags rather than a
+    /// side effect. Rungs 3-4 rotate clients as before.
     private func escalateLivePipe(measuredRatio: Double) async {
         guard !botWallDetected else { return }
         guard let ctx = liveEscalationContext, let continuation = continuation else { return }
-        let ladder: [(client: String?, label: String)] = [
-            (nil, "configured client, cookies dropped"),
-            ("web_embedded", "web_embedded, cookies dropped"),
-            ("default", "yt-dlp default clients, cookies dropped"),
+        let ladder: [(client: String?, cookies: Bool, label: String)] = [
+            (nil, true, "configured client, cookies kept, rejoin at live edge"),
+            (nil, false, "configured client, cookies dropped"),
+            ("web_embedded", false, "web_embedded, cookies dropped"),
+            ("default", false, "yt-dlp default clients, cookies dropped"),
         ]
         escalationAttempt += 1
         guard escalationAttempt <= ladder.count else {
@@ -770,7 +1010,7 @@ actor AudioStreamExtractor {
                 tools: tools,
                 isStaticSession: false,
                 useLiveFromStart: false,
-                useCookies: false,
+                useCookies: step.cookies,
                 playerClientOverride: step.client
             )
             try spawnFFmpeg(
@@ -857,11 +1097,7 @@ actor AudioStreamExtractor {
             args.append(contentsOf: ["-loglevel", "warning"])
         }
         if isNetworkInput && !useStdin {
-            args.append(contentsOf: [
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-            ])
+            args.append(contentsOf: Self.networkRetryArguments)
         }
         // Origin/Referer for signed CDN manifests (2026-09-22). Chrome's
         // own request for a Frame.io manifest carries
@@ -874,11 +1110,8 @@ actor AudioStreamExtractor {
         // Host-scoped on purpose: a wrong Referer is worse than none on
         // sources that do not expect one, so this adds headers only where
         // we know the page origin from the CDN host itself.
-        if isNetworkInput, !useStdin, let originForHost = Self.playerOriginForManifestHost(inputURL) {
-            args.append(contentsOf: [
-                "-headers",
-                "Referer: \(originForHost)/\r\nOrigin: \(originForHost)\r\n",
-            ])
+        if isNetworkInput, !useStdin {
+            args.append(contentsOf: Self.refererHardenedInputArguments(for: inputURL))
         }
         args.append(contentsOf: [
             "-i", useStdin ? "-" : inputURL,
@@ -976,7 +1209,35 @@ actor AudioStreamExtractor {
                 // excluding attached pictures; audio-only sources with
                 // artwork degrade to an audio-only cache exactly as
                 // sources with no video stream always have.
-                cacheArgs.append(contentsOf: ["-map", "0:V?"])
+                //
+                // `:0` added 2026-09-29, and it is not cosmetic. `0:V?`
+                // matches EVERY real video stream, and a multi-variant HLS
+                // master exposes one per rendition: C-SPAN's publishes six
+                // (three bitrates × two program groups). ffmpeg therefore
+                // mapped all six into the cache mp4 and started six
+                // separate `h264_videotoolbox` encoders — confirmed in the
+                // field log, six distinct encoder instances — which:
+                //
+                //   * collapsed throughput to 0.95x realtime (the same
+                //     source ran 100x+ before, and a 62-minute program
+                //     cannot be transcribed at 0.95x),
+                //   * pulled all three renditions' segments instead of one,
+                //     roughly tripling bandwidth and producing the
+                //     "Empty segment" churn and the eventual exit 255,
+                //   * wrote an mp4 with six video tracks, which is not what
+                //     AVPlayer wants from a playback cache,
+                //   * emitted 980 lines of "Unexpected end of SEI NAL Unit
+                //     parsing type" in 33 seconds. That warning comes from
+                //     `find_sei_end()` in libavcodec/videotoolboxenc.c and
+                //     is benign in itself, but six encoder instances meant
+                //     six DIFFERENT pointer values in the message text,
+                //     which defeated ffmpeg's own "Last message repeated N
+                //     times" dedup and let every single one through.
+                //
+                // `0:V:0?` keeps both guarantees that matter — real video
+                // only (not attached-picture artwork), optional so
+                // audio-only sources still work — and takes exactly one.
+                cacheArgs.append(contentsOf: ["-map", "0:V:0?"])
             }
             cacheArgs.append(contentsOf: [
                 "-map", "0:a:0",
@@ -1126,14 +1387,30 @@ actor AudioStreamExtractor {
         }
 
         // Drain stderr so the buffer doesn't fill up; useful for debugging.
+        // Routed through the collapser so one repetitive warning can't bury
+        // the lines that matter — see `FFmpegStderrCollapser`.
+        //
+        // Lossy UTF-8 decode, deliberately: a read can land mid-codepoint,
+        // and `String(data:encoding:)` returns nil for the whole chunk when
+        // that happens, silently dropping stderr exactly when something is
+        // going wrong. Same lesson as `fetchHTML`.
+        let stderrCollapser = FFmpegStderrCollapser()
         errPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            if !data.isEmpty, let line = String(data: data, encoding: .utf8) {
-                FileHandle.standardError.write(("[ffmpeg] " + line).data(using: .utf8) ?? Data())
+            guard !data.isEmpty else { return }
+            let text = stderrCollapser.ingest(String(decoding: data, as: UTF8.self))
+            if !text.isEmpty {
+                FileHandle.standardError.write(Data(text.utf8))
             }
         }
 
         process.terminationHandler = { proc in
+            // Flush before the exit line so a repeat run that lasted until
+            // exit is attributed to the run, not lost.
+            let stderrTail = stderrCollapser.finish()
+            if !stderrTail.isEmpty {
+                FileHandle.standardError.write(Data(stderrTail.utf8))
+            }
             print("[Extractor] ffmpeg exited with code \(proc.terminationStatus)")
 
             // Drain any remaining buffered stdout before tearing down the readability
@@ -1683,7 +1960,15 @@ actor AudioStreamExtractor {
             ffmpegPath: ffmpegPath,
             tools: tools,
             isStaticSession: isStaticSession,
-            useLiveFromStart: !isStaticSession,
+            // USER CHOICE (2026-09-29), and the default flipped. This used
+            // to be an unconditional `!isStaticSession`, so every live
+            // session asked for the whole DVR backlog whether or not the
+            // user wanted it — and on any stream older than YouTube's
+            // retention window that fails outright, starving the pipe for
+            // 30 s before the watchdog escalated its way to the live edge.
+            // Joining the edge is now the default and the backlog is
+            // opt-in; see `liveFromStartEnabled`.
+            useLiveFromStart: !isStaticSession && Self.liveFromStartEnabled,
             useCookies: true
         )
 
@@ -1705,9 +1990,23 @@ actor AudioStreamExtractor {
         // player_client args are youtube-namespaced (other extractors
         // ignore them), and cookie-dropping is fine for public
         // broadcasts.
+        // The from-start attempt gets one extra failure pattern — see
+        // `liveFromStartOnlyFailurePatterns` for why it must NOT be in the
+        // shared list.
+        //
+        // It does NOT get a longer progress-confirmation window any more. A
+        // previous revision gave it 12 s, to let a stall's read timeout
+        // arrive before we declared success. That was for a world where
+        // from-start always stalled; now that it works, those 12 s are dead
+        // time on every successful backlog drain, delaying the ffmpeg spawn
+        // for no benefit. A drain announces itself immediately — bytes at
+        // ~10x realtime — and the stalling case is caught by the watchdog.
+        let usedLiveFromStart = !isStaticSession && Self.liveFromStartEnabled
         let failedWithKnownBug = await waitForEarlyFailure(
             timeout: 20.0,
-            errorPatterns: Self.liveExtractionFailurePatterns
+            errorPatterns: usedLiveFromStart
+                ? Self.liveExtractionFailurePatterns + Self.liveFromStartOnlyFailurePatterns
+                : Self.liveExtractionFailurePatterns
         )
 
         if failedWithKnownBug {
@@ -1820,7 +2119,30 @@ actor AudioStreamExtractor {
         // Instagram). See download-path comment for why this is gated
         // — YouTube specifically fails harder WITH impersonation than
         // without.
-        if source.benefitsFromImpersonation {
+        //
+        // NARROW YOUTUBE EXCEPTION (2026-09-29): the from-start attempt,
+        // and only that attempt. `--live-from-start` has to enumerate the
+        // backlog's fragment list, and through a TLS-intercepting proxy
+        // (Netskope, on this fleet) that enumeration never completes —
+        // yt-dlp prints `Total fragments: unknown (live)` and then blocks
+        // on a fragment read until something kills it. Measured on one
+        // stream, three ways, same minute:
+        //
+        //   corporate Wi-Fi, stock stack   → 0 bytes, stalls indefinitely
+        //   VPN (Netskope bypassed)        → 6512 fragments, ~28x realtime
+        //   corporate Wi-Fi, --impersonate → 6512 fragments, ~10x realtime
+        //
+        // `--impersonate chrome` routes yt-dlp through curl_cffi instead of
+        // Python's urllib, and that stack survives the interception. Scoped
+        // to this one attempt so the documented "YouTube fails harder with
+        // impersonation" finding above still governs normal extraction,
+        // live-edge spawns and static downloads — none of which need
+        // enumeration and none of which were broken. If impersonation does
+        // trip the bot wall here, `handleBotWall()` catches it and the
+        // fallback rejoins the live edge WITHOUT impersonation, so the
+        // downside is a slower start rather than a lost session.
+        if source.benefitsFromImpersonation
+            || (useLiveFromStart && source == .youtube) {
             args.append(contentsOf: ["--impersonate", "chrome"])
         }
         if let denoPath = tools.denoPath {
@@ -1895,13 +2217,57 @@ actor AudioStreamExtractor {
         // HLS muxed formats remain broadly available, and a live
         // session can't wait for a file download to finish.
         let audioFirstSelector = "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/best[vcodec!*=unknown]/best"
+
+        // LIVE + AUDIO-ONLY (2026-09-29). This branch used
+        // `audioFirstSelector` verbatim, and on a YouTube livestream that
+        // was a 35x bandwidth multiplier.
+        //
+        // In yt-dlp, `bestaudio` means AUDIO-ONLY (`bestaudio*` is the form
+        // that also matches muxed). YouTube live HLS publishes no
+        // audio-only rendition whatsoever — only muxed variants 91-96 — so
+        // all three `bestaudio[…]` clauses miss and selection falls through
+        // to `best[vcodec!*=unknown]`: format 96, 1920x1080 at 4561 kbps,
+        // pulled in full to keep ~128 kbps of audio out of it.
+        //
+        // Measured in this project's own field logs: VOD sessions select
+        // format 140 (m4a, 128 kbps); live sessions select 94 or 96. That
+        // asymmetry is the whole of what read as "YouTube throttles
+        // livestreams" — and the reason it only hurts live is that a live
+        // stream must sustain its bitrate in REAL TIME. There is no backlog
+        // to catch up from, so a link that cannot hold ~4.6 Mbps falls
+        // behind permanently and starves the pipe. The same link on a VOD
+        // just takes longer and finishes. (It is emphatically not IP
+        // reputation or nsig descrambling: both of those would hit VOD
+        // identically, and VOD runs at 100x+.)
+        //
+        // `best[height<=360]` lands on format 93 — 962 kbps, a 4.7x
+        // reduction, and the cheapest variant still carrying LC-AAC
+        // (`mp4a.40.2`). Formats 91 and 92 drop to HE-AACv2 parametric
+        // stereo, which is measurably worse for ASR and not worth the
+        // remaining ~700 kbps given this app's accuracy-first priority.
+        //
+        // The audio-only clauses stay FIRST and unchanged, so any source
+        // that does publish audio-only — every VOD — selects exactly what
+        // it selected before. The height caps are reached only when
+        // audio-only genuinely does not exist.
+        let liveAudioOnlySelector =
+            "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]"
+            + "/best[height<=360]/best[height<=480]/best[vcodec!*=unknown]/best"
+
         let liveFormatSelector: String
         if isStaticSession {
             liveFormatSelector = audioFirstSelector
         } else {
+            // Video-cache ON already capped at 480p (format 94, 1283 kbps),
+            // which is why that configuration was ~3.6x CHEAPER on a
+            // livestream than turning the cache off — an inversion worth
+            // remembering if live throughput ever looks inconsistent
+            // between users again. Left at 480p deliberately: that video is
+            // actually played back in the miniplayer, so the bitrate buys
+            // something there, unlike in the audio-only case.
             liveFormatSelector = wantsVideoInCacheFlag
                 ? "best[height<=480][vcodec*=avc]/best[height<=480][ext=mp4]/best[height<=480][vcodec!*=unknown]/bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/best"
-                : audioFirstSelector
+                : liveAudioOnlySelector
         }
         // HLS / fragmented-stream staging directory. yt-dlp's HLS
         // native downloader writes each fragment to disk before
@@ -1926,13 +2292,31 @@ actor AudioStreamExtractor {
         try? FileManager.default.createDirectory(atPath: fragmentScratchDir, withIntermediateDirectories: true)
         args.append(contentsOf: [
             "-f", liveFormatSelector,
-            "--http-chunk-size", "10M",
             "--no-part",
             "--no-warnings",
             "--ffmpeg-location", ffmpegPath,
             "--hls-use-mpegts",
             "--paths", "temp:\(fragmentScratchDir)",
         ])
+
+        // `--http-chunk-size 10M` USED TO BE UNCONDITIONAL HERE, and it is
+        // what broke `--live-from-start` (2026-09-29). It makes yt-dlp issue
+        // 10 MB HTTP Range requests, and a TLS-intercepting proxy buffers
+        // the whole response before forwarding any of it — which blows past
+        // the socket timeout, so the read never returns and the pipe stays
+        // empty. Isolated by adding it to a known-good from-start command:
+        // 436 fragments without it, ZERO BYTES in 45 s with it, file output
+        // both times so nothing else was in the way.
+        //
+        // Restored only for the live EDGE, where it is harmless (fragments
+        // arrive whole via dashsegments/hlsnative, so the chunking never
+        // engages) and where the comment on the static path claims it works
+        // around a per-request throttle. Not worth removing from a path that
+        // demonstrably works; very much worth removing from the one it
+        // kills.
+        if !useLiveFromStart {
+            args.append(contentsOf: ["--http-chunk-size", "10M"])
+        }
         if isStaticSession {
             // Static/VOD over the pipe path. REGRESSION GUARD: the
             // live-edge hardening below must NOT apply here. When it
@@ -1984,12 +2368,56 @@ actor AudioStreamExtractor {
                 // LIVE-ONLY: see the static branch above for why these
                 // must never leak into VOD sessions.
                 "--socket-timeout", "30",
-                "--retries", "infinite",
-                "--fragment-retries", "infinite",
+                "--fragment-retries", "10",
                 "--retry-sleep", "1",
                 "--force-ipv4",
             ])
         }
+
+        // FROM-START PROBE TIMINGS (2026-09-29). When `--live-from-start`
+        // is on, the timings above are actively harmful and these override
+        // them. They are appended AFTER, so they win — later occurrences of
+        // the same option take precedence in yt-dlp.
+        //
+        // **What actually happens.** `--live-from-start` makes yt-dlp
+        // request old sequence numbers (`sq=` near 0). YouTube does not
+        // refuse those — it accepts the connection and then never responds:
+        //
+        //     [download] Got error: HTTPSConnectionPool(
+        //       host='rr4---sn-ajab55-5a.googlevideo.com', port=443):
+        //       Read timed out. (read timeout=30.0). Retrying (1/inf)...
+        //
+        // Measured on a stream live for ~3 h: four retries across 150 s,
+        // every one burning the full 30 s timeout, across TWO different
+        // CDN hosts, zero bytes delivered. The same client, PO token and
+        // session fetch LIVE-EDGE fragments at 0.95x without trouble, so
+        // this is specific to old sequence numbers — not retention, not the
+        // node, not the network, and not our flags.
+        //
+        // An earlier revision of this comment blamed a 404 on an expired
+        // DVR window and bounded `--fragment-retries` to surface it. That
+        // was wrong: nothing 404s, so retries are never exhausted and no
+        // error is ever printed. `--socket-timeout` is the only knob that
+        // decides how long we wait to learn this, and at 30 s with infinite
+        // retries the answer is "never".
+        //
+        // **NO TIMING OVERRIDE HERE, deliberately.** A previous revision made
+        // the from-start attempt a fast probe — `--socket-timeout 6
+        // --retries 1 --fragment-retries 1` — so the stall would surface in
+        // ~14 s instead of never. That was built on the belief that
+        // from-start could not work at all, and it can: with
+        // `--impersonate chrome` (see the impersonation gate above) the
+        // backlog drains at ~10x realtime through the same proxy. A 6 s
+        // socket timeout would abandon that working drain on any fragment
+        // that took a moment, which is a far worse outcome than a slow
+        // failure.
+        //
+        // The stalling case is already handled without any of it: from-start
+        // that cannot enumerate delivers zero bytes, the watchdog's 30 s
+        // starvation check fires, and escalation rung 1 rejoins at the live
+        // edge — which is exactly where a fast probe would have landed, just
+        // 16 s later. Paying 16 s in the failure case to avoid breaking the
+        // success case is the right trade.
         if useLiveFromStart {
             args.append("--live-from-start")
         }
@@ -2136,19 +2564,79 @@ actor AudioStreamExtractor {
     /// The third entry was added 2026-09-15: a YouTube escalation rung
     /// died with "Requested format is not available" and nothing matched
     /// it, so the ladder stopped at rung 1.
+    ///
+    /// The last two were added 2026-09-29, and they are the most common
+    /// `--live-from-start` failure of all on YouTube. `--live-from-start`
+    /// requires fragment 1 of the stream to still be retrievable, and
+    /// YouTube's DVR window does not extend indefinitely — on a stream that
+    /// has been live for hours the beginning has simply expired. yt-dlp then
+    /// emits, in this order:
+    ///
+    ///     [dashsegments] Total fragments: unknown (live)
+    ///     [download] Destination: -
+    ///     ERROR: Did not get any data blocks
+    ///     ERROR: fragment 1 not found, unable to continue
+    ///
+    /// and exits in ~6 s having written zero bytes. Field case: a stream
+    /// 7 h 6 min old (`release_timestamp` 25,546 s before session start).
+    /// Neither phrasing matched, so the retry-without-`--live-from-start`
+    /// path never fired; instead the watchdog waited out its full 30 s
+    /// grace for audio that was never coming, declared starvation, and
+    /// began escalating — and rung 1 drops cookies as well as the flag,
+    /// which changed the client fallback and produced "Requested format is
+    /// not available" on an unrelated axis. A 6-second detectable failure
+    /// became a dead session.
     static let liveExtractionFailurePatterns = [
         "No video formats found",
         "no formats that can be downloaded from the start",
         "Requested format is not available",
+        "Did not get any data blocks",
+        "fragment 1 not found",
+    ]
+
+    /// Extra failure phrasings consulted ONLY for the `--live-from-start`
+    /// probe, never for a live-edge spawn.
+    ///
+    /// A read timeout against googlevideo means two completely different
+    /// things depending on which request stalled. At the live edge it is
+    /// ordinary CDN turbulence and the correct response is to keep waiting —
+    /// that is precisely what `--socket-timeout 30 --retries infinite` on
+    /// that branch is tuned for, and a field session measured 0.33x when an
+    /// earlier build gave up too eagerly. On an old-sequence request it is
+    /// terminal: YouTube stalls those rather than refusing them, so the
+    /// timeout IS the refusal and retrying can only produce another one.
+    ///
+    /// Same words, opposite meanings, so the pattern cannot live in the
+    /// shared list — putting it there would resurrect the 0.33x bug.
+    static let liveFromStartOnlyFailurePatterns = [
+        "Read timed out",
     ]
 
     private func waitForEarlyFailure(timeout: TimeInterval, errorPatterns: [String]) async -> Bool {
         func matchesAny(_ stderr: String) -> Bool {
             errorPatterns.contains { stderr.contains($0) }
         }
-        // STRONG signals mean BYTES ARE MOVING — the HLS downloader engaged
-        // or a destination was opened. Only these end the wait outright.
-        let successPatterns = ["[hlsnative]", "[download] Destination:"]
+        // STRONG signals mean BYTES ARE MOVING. Only these end the wait
+        // outright.
+        //
+        // `[download] Destination:` was demoted out of this list on
+        // 2026-09-29 — it is the SAME RACE documented just below for
+        // "Downloading m3u8", and leaving it here cost us a session.
+        // yt-dlp prints it when it OPENS the output, which for
+        // `dashsegments` happens before it enumerates fragments, so the
+        // fatal `--live-from-start` check runs after it. Field log, to the
+        // millisecond:
+        //
+        //   16:09:17.989  [download] Destination: -
+        //   16:09:18.013  [Extractor] yt-dlp emitted success signal
+        //                 '[download] Destination:' — proceeding to ffmpeg
+        //   ...           ERROR: fragment 1 not found, unable to continue
+        //
+        // We returned "success" on a process that had already been told it
+        // could not continue, so the retry we have for exactly this never
+        // ran. `[hlsnative]` stays strong: it is printed by the downloader
+        // as it fetches segments, which genuinely is bytes moving.
+        let successPatterns = ["[hlsnative]"]
 
         // "Downloading m3u8" used to sit in the list above, and that was a
         // race (2026-09-15). It reports that yt-dlp FETCHED PLAYLIST INFO —
@@ -2165,7 +2653,17 @@ actor AudioStreamExtractor {
         // process is still alive after it. That bounds the added latency
         // (~1.5s, versus the full timeout) while letting a fast failure
         // arriving milliseconds later be caught and retried.
-        let progressPatterns = ["Downloading m3u8"]
+        // `[download] Destination:` joins it here rather than being dropped:
+        // it IS a useful hint that extraction succeeded and a download is
+        // starting, and on the paths where nothing fails it costs only the
+        // confirmation window. `[dashsegments] Total fragments` is listed for
+        // the same reason — it is the DASH analogue of "Downloading m3u8",
+        // printed before fragment enumeration can fail.
+        let progressPatterns = [
+            "Downloading m3u8",
+            "[dashsegments] Total fragments",
+            "[download] Destination:",
+        ]
         let confirmationWindow: TimeInterval = 1.5
         var progressDeadline: Date?
 
@@ -2184,12 +2682,12 @@ actor AudioStreamExtractor {
             }
 
             if progressDeadline == nil,
-               progressPatterns.contains(where: { stderr.contains($0) }) {
+               let hint = progressPatterns.first(where: { stderr.contains($0) }) {
                 progressDeadline = Date().addingTimeInterval(confirmationWindow)
-                print("[Extractor] yt-dlp fetched m3u8 info — not yet streaming; watching \(confirmationWindow)s for a late failure.")
+                print("[Extractor] yt-dlp progress hint '\(hint)' — not yet streaming; watching \(confirmationWindow)s for a late failure.")
             }
             if let progressDeadline, Date() >= progressDeadline {
-                print("[Extractor] yt-dlp still alive after m3u8 info — proceeding to ffmpeg.")
+                print("[Extractor] yt-dlp still alive after progress hint — proceeding to ffmpeg.")
                 return false
             }
 

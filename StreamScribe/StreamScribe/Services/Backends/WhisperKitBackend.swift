@@ -111,17 +111,20 @@ actor WhisperKitBackend: TranscriptionBackend {
             dict[path] = FileManager.default.fileExists(atPath: path)
         }
 
-        // Phase 7: optional compute unit override. `.auto` skips
-        // `computeOptions` entirely (WhisperKit's defaults apply) — that's
-        // the no-op shipping default. Non-auto values map to MLComputeUnits
-        // and we pass the same selection to both encoder and decoder. We
-        // never apply non-auto to the prefill/melSpectrogram components
-        // because those are tiny and rarely the bottleneck; keeping their
-        // routing on library defaults reduces the surface area of "did our
-        // override break something."
-        let computeOptions: ModelComputeOptions? = {
-            guard let mlUnits = self.mlComputeUnits else { return nil }
+        // Phase 7: optional compute unit override. `.auto` keeps
+        // WhisperKit's own encoder/decoder routing; non-auto values map
+        // to MLComputeUnits and are applied to both. Either way we now
+        // pin `melCompute` ourselves — see `melComputeUnits` below.
+        let computeOptions: ModelComputeOptions = {
+            guard let mlUnits = self.mlComputeUnits else {
+                // `.auto`: leave audioEncoder/textDecoder nil-defaulted so
+                // WhisperKit's own choices apply verbatim (encoder
+                // `.cpuAndNeuralEngine` on macOS 14+, decoder
+                // `.cpuAndNeuralEngine`). Only mel is overridden.
+                return ModelComputeOptions(melCompute: Self.melComputeUnits)
+            }
             return ModelComputeOptions(
+                melCompute: Self.melComputeUnits,
                 audioEncoderCompute: mlUnits,
                 textDecoderCompute: mlUnits
             )
@@ -191,11 +194,11 @@ actor WhisperKitBackend: TranscriptionBackend {
 
     // MARK: - Resolution diagnostics
 
-    /// Whether a downloaded copy of `modelName` exists in any of the cache
-    /// locations WhisperKit is known to use. Returns true if any candidate
-    /// path exists as a directory containing at least one file (an empty
-    /// directory left behind by a failed earlier download shouldn't count
-    /// as "cached"). Used by `ModelDownloadManager` to drive the sidebar's
+    /// Whether a COMPLETE downloaded copy of `modelName` exists in any of
+    /// the cache locations WhisperKit is known to use (see
+    /// `isCompleteModelFolder` — an empty or half-pulled directory left
+    /// behind by a failed earlier download doesn't count as "cached").
+    /// Used by `ModelDownloadManager` to drive the sidebar's
     /// "Downloaded" / "Not downloaded" indicator without instantiating a
     /// full backend just to check.
     ///
@@ -208,16 +211,13 @@ actor WhisperKitBackend: TranscriptionBackend {
         if Bundle.main.path(forResource: modelName, ofType: nil, inDirectory: "WhisperModels") != nil {
             return true
         }
-        let fm = FileManager.default
-        for path in cacheCandidatePaths(modelName: modelName) {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
-            // Non-empty check — empty cache dirs do exist after failed pulls.
-            if let contents = try? fm.contentsOfDirectory(atPath: path), !contents.isEmpty {
-                return true
-            }
-        }
-        return false
+        // Same completeness test the loader uses (2026-09-29). Previously
+        // this was a non-empty-directory check, which reported "Downloaded"
+        // for a half-pulled tree the loader would then reject — the sidebar
+        // said the model was ready while every session failed to start.
+        // Agreeing with `resolvedLocalModelFolder` means a partial tree now
+        // reads as "Not downloaded" and the re-download actually resolves it.
+        return cacheCandidatePaths(modelName: modelName).contains(where: isCompleteModelFolder)
     }
 
     /// Possible disk locations where WhisperKit might have placed a downloaded
@@ -228,35 +228,110 @@ actor WhisperKitBackend: TranscriptionBackend {
     /// Visibility note: was `private` originally — kept internal now so the
     /// `ModelDownloadManager`'s `isModelCached` helper above can reuse the
     /// same path list. No callers outside this module.
-    /// First cache location that holds a USABLE copy of `modelName`,
-    /// or nil if none does.
+    /// First cache location that holds a COMPLETE copy of `modelName`,
+    /// or nil if none does. The result suppresses the download path, so
+    /// a half-pulled folder that merely exists must NOT convince us to
+    /// load offline.
+    /// COMPLETENESS (2026-09-29). The old test — "contains at least one
+    /// `.mlmodelc`" — was not strict enough, and on a fleet machine it
+    /// produced an unbreakable download loop:
     ///
-    /// "Usable" means the folder contains at least one `.mlmodelc`
-    /// package — the check is deliberately stricter than the
-    /// non-empty test used for cache *reporting*, because this result
-    /// suppresses the download path. A half-pulled folder that merely
-    /// exists must NOT convince us to load offline; better to let
-    /// WhisperKit fetch the remainder than to hand CoreML a directory
-    /// missing its encoder.
+    ///   1. The R2 mirror downloads and extracts a COMPLETE copy into the
+    ///      unified models root under Application Support.
+    ///   2. That directory was not in `cacheCandidatePaths` at all, so
+    ///      this returned nil, `modelFolder` stayed nil, `download` stayed
+    ///      true, and WhisperKit went to HuggingFace anyway.
+    ///   3. On a Netskope fleet machine the Hub pull times out after 300 s
+    ///      — but not before writing a PARTIAL tree into
+    ///      `~/Documents/huggingface/...`, with one or two `.mlmodelc`
+    ///      folders in it.
+    ///   4. Every subsequent attempt matched that partial tree here, handed
+    ///      it to WhisperKit as `modelFolder`, and got back "Model file not
+    ///      found" — for a model whose complete copy was already on disk a
+    ///      few directories away.
+    ///
+    /// The user in the report downloaded 477 MB twice inside 90 seconds and
+    /// loaded neither copy. Both halves are fixed: the mirror's extraction
+    /// directory now leads `cacheCandidatePaths`, and a candidate must now
+    /// carry the full model — every required `.mlmodelc` package, each with
+    /// its `coremldata.bin` and `weights/weight.bin` — before it can
+    /// suppress the download. We also keep scanning after a rejection
+    /// instead of failing the whole lookup, so one bad candidate can no
+    /// longer shadow a good one.
     static func resolvedLocalModelFolder(modelName: String) -> String? {
-        let fm = FileManager.default
         for path in cacheCandidatePaths(modelName: modelName) {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
-            guard let contents = try? fm.contentsOfDirectory(atPath: path) else { continue }
-            if contents.contains(where: { $0.hasSuffix(".mlmodelc") }) {
-                return path
-            }
+            if isCompleteModelFolder(path) { return path }
         }
         return nil
+    }
+
+    /// Required `.mlmodelc` packages for a WhisperKit model folder.
+    /// `TextDecoderContextPrefill.mlmodelc` is deliberately NOT required —
+    /// it is absent from several published variants and WhisperKit treats
+    /// it as optional.
+    private static let requiredModelPackages = [
+        "MelSpectrogram.mlmodelc",
+        "AudioEncoder.mlmodelc",
+        "TextDecoder.mlmodelc",
+    ]
+
+    /// True when `path` holds a complete, loadable WhisperKit model.
+    /// Checks package presence AND the two files inside each package that
+    /// an interrupted download leaves missing, which is what distinguishes
+    /// a half-pulled tree from a good one.
+    static func isCompleteModelFolder(_ path: String) -> Bool {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return false }
+
+        for package in requiredModelPackages {
+            let packagePath = (path as NSString).appendingPathComponent(package)
+            var packageIsDir: ObjCBool = false
+            guard fm.fileExists(atPath: packagePath, isDirectory: &packageIsDir),
+                  packageIsDir.boolValue else {
+                print("[Whisper] Cache candidate rejected (missing \(package)): \(path)")
+                return false
+            }
+            for required in ["coremldata.bin", "weights/weight.bin"] {
+                let filePath = (packagePath as NSString).appendingPathComponent(required)
+                guard fm.fileExists(atPath: filePath) else {
+                    print("[Whisper] Cache candidate rejected (\(package) missing \(required)): \(path)")
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     static func cacheCandidatePaths(modelName: String) -> [String] {
         let fm = FileManager.default
         var paths: [String] = []
 
+        // ~/Library/Application Support/StreamScribe/Models/huggingface/...
+        // FIRST, and this is the important one: it is where
+        // `ModelDownloadManager.mirror(for:)` extracts the R2 tarball for
+        // `.whisper(modelName)`. It was missing from this list entirely,
+        // which meant the mirror — the ONLY download route that works on a
+        // fleet machine with no HuggingFace access — wrote a complete model
+        // that the loader then refused to look at. Must stay in sync with
+        // `ModelDownloadManager.streamScribeModelsRoot()` +
+        // `StreamScribeApp.setupUnifiedModelsRoot()`.
+        if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            paths.append(appSupport
+                .appendingPathComponent("StreamScribe")
+                .appendingPathComponent("Models")
+                .appendingPathComponent("huggingface")
+                .appendingPathComponent("models")
+                .appendingPathComponent("argmaxinc")
+                .appendingPathComponent("whisperkit-coreml")
+                .appendingPathComponent(modelName)
+                .path)
+        }
+
         // ~/Documents/huggingface/... — observed location for argmax-oss-swift v0.18.0
         // (matches what the user saw in their cache after the test download).
+        // This is also WhisperKit's own `downloadBase`, so it is where a
+        // Hub pull lands — complete or partial.
         if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
             paths.append(docs
                 .appendingPathComponent("huggingface")
@@ -552,10 +627,54 @@ actor WhisperKitBackend: TranscriptionBackend {
 
     // MARK: - Helpers
 
+    /// Compute units for WhisperKit's MelSpectrogram model.
+    ///
+    /// CRASH FIX (2026-09-29). WhisperKit's `ModelComputeOptions` defaults
+    /// `melCompute` to `.cpuAndGPU`, and it is the ONLY component of the
+    /// Whisper pipeline with the GPU in its compute mask — the audio
+    /// encoder and text decoder both default to `.cpuAndNeuralEngine`.
+    /// That makes MelSpectrogram the single path from this app into
+    /// MetalPerformanceShadersGraph, and on macOS 15.7.9 (Mac16,8,
+    /// AGXMetalG16X, MPSGraph 5.6.2) the mel filterbank matmul trips a
+    /// Metal assertion while MPSGraph specializes the graph:
+    ///
+    ///     __assert_rtn → MTLReportFailure
+    ///     → GPU::MatMulOpHandler::getQuantizationParameters(...)
+    ///     → GPU::MatMulOpHandler::postInitializeHook()
+    ///     → GPURegionRuntime::initializeOps()
+    ///     → -[MPSGraphExecutable specializeWithDevice:...]
+    ///     → E5RT::Ops::MpsGraphInferenceOperation::...SubmitWorkToMpsGraph
+    ///     → -[MLE5Engine _predictionFromFeatures:options:completionHandler:]
+    ///
+    /// on `com.apple.coreml.DefaultAsyncPredictionQueue`. It is an abort
+    /// inside Apple's stack, not a Swift error, so there is nothing to
+    /// catch — the process dies on the first mel prediction of the first
+    /// session. Observed on a fleet machine (1.1.5 build 58); not
+    /// reproducible on macOS 26.x, which is why it never showed up in
+    /// development.
+    ///
+    /// `.cpuOnly` removes the GPU from the mask and takes MPSGraph out of
+    /// the pipeline entirely. The cost is negligible: MelSpectrogram is a
+    /// single 373 KB filterbank matmul against the STFT magnitudes, low
+    /// single-digit milliseconds per 30 s window on CPU, against an
+    /// encoder+decoder that are three orders of magnitude larger and stay
+    /// on the ANE. Argmax's own benchmarks put mel at ~1–3% of pipeline
+    /// time even on the GPU.
+    ///
+    /// Applied unconditionally rather than gated on `ProcessInfo`'s OS
+    /// version: we know the GPU path aborts on at least one shipping
+    /// macOS, we have no way to enumerate which GPU/OS pairs are
+    /// affected, and the thing we would be buying back is a couple of
+    /// milliseconds. If mel ever becomes a measured bottleneck, gate it
+    /// on `if #available(macOS 26, *)` and keep `.cpuOnly` below that.
+    private static let melComputeUnits: MLComputeUnits = .cpuOnly
+
     /// Maps our `ComputeUnits` hint to `MLComputeUnits`. Returns nil for
-    /// `.auto` — caller should NOT pass `computeOptions` in that case
-    /// (`WhisperKitConfig` treats nil as "use the library defaults," which
-    /// is what `.auto` means semantically).
+    /// `.auto`, meaning "leave WhisperKit's own encoder/decoder routing
+    /// alone." (Note this no longer means "pass no `computeOptions`" —
+    /// we always pass one now in order to pin `melCompute`; the nil case
+    /// just omits the encoder/decoder overrides, which restores the
+    /// library defaults for those two exactly.)
     private var mlComputeUnits: MLComputeUnits? {
         switch computeUnits {
         case .auto:                return nil

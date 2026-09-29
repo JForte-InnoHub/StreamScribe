@@ -417,7 +417,18 @@ final class VideoDownloadService: ObservableObject {
             //                     (would interleave with -progress output)
             //   -loglevel warning  quiet the info-level chatter but keep
             //                     warnings + errors
-            process.arguments = [
+            //
+            // The hardening block goes BEFORE `-i` because every option in
+            // it is an input option: placed after the URL, ffmpeg applies
+            // them to the output and the request goes out bare. Referer-
+            // gated CDNs (C-SPAN's c-spanvideo.org, Frame.io's
+            // sahls.frame.io) reject or abort without them, so a manifest
+            // that transcribed fine would fail to download — the transcribe
+            // path has sent headers since Frame.io support landed, this one
+            // had not. Shared helper, so the two paths cannot drift.
+            var arguments = AudioStreamExtractor.networkRetryArguments
+            arguments.append(contentsOf: AudioStreamExtractor.refererHardenedInputArguments(for: streamURL.absoluteString))
+            arguments.append(contentsOf: [
                 "-i", streamURL.absoluteString,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
@@ -426,7 +437,8 @@ final class VideoDownloadService: ObservableObject {
                 "-nostats",
                 "-loglevel", "warning",
                 outputPath
-            ]
+            ])
+            process.arguments = arguments
 
             process.standardOutput = FileHandle.nullDevice
             process.standardError = errPipe

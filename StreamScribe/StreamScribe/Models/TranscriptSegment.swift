@@ -351,6 +351,7 @@ enum StreamSource: String, CaseIterable {
     case applePodcast = "Apple Podcasts"
     case soundcloud = "SoundCloud"
     case senateGov = "U.S. Senate"
+    case cspan = "C-SPAN"
     case criticalMention = "Critical Mention"
     case granicus = "Granicus"
     case iqMedia = "IQ Media"
@@ -395,9 +396,18 @@ enum StreamSource: String, CaseIterable {
     /// fallback path. Routing senate.gov through our own extractor avoids
     /// every yt-dlp quirk (auth, format selection, fragment write paths)
     /// for the long-form government hearings this app sees most often.
+    /// `.cspan` IS in the yt-dlp camp, deliberately. `resolveCSpanMedia`
+    /// rewrites a C-SPAN page URL to its CDN manifest before anything
+    /// downstream sees it, so in the normal case this value is never
+    /// consulted — by the time `detect` runs again the URL is an `.hls`
+    /// manifest. It only matters when every resolver tier missed, and
+    /// there the honest answer is "hand the page to yt-dlp," which is
+    /// exactly what happened before C-SPAN had a resolver and still works
+    /// for the legacy `/video/?…` URL shape. Claiming `false` here would
+    /// throw an HTML page at ffmpeg instead.
     var requiresYTDlp: Bool {
         switch self {
-        case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .unknown:
+        case .youtube, .twitter, .facebook, .instagram, .threads, .applePodcast, .soundcloud, .cspan, .unknown:
             return true
         case .senateGov, .criticalMention, .granicus, .iqMedia, .frameIO, .hls, .directAudio, .directVideo, .localFile:
             return false
@@ -577,6 +587,23 @@ enum StreamSource: String, CaseIterable {
         // detects as `.hls` below and skips the browser entirely.)
         if host == "granicus.com" || host.hasSuffix(".granicus.com") {
             return .granicus
+        }
+        // C-SPAN (2026-09-29): PAGE host only. C-SPAN serves its media
+        // from a separate domain — `m3u8-0.c-spanvideo.org` for HLS,
+        // `ximage.c-spanvideo.org` for stills — so nothing under
+        // `c-spanvideo.org` reaches this branch and the manifest
+        // `resolveCSpanMedia` returns falls through to `.hls` as it
+        // should. (That is the kinetiq.tv / assets.frame.io trap; it
+        // doesn't apply here because the two domains differ, but it's
+        // worth saying out loud so nobody "helpfully" widens this to
+        // `contains("c-span")` later.)
+        //
+        // This case is about labelling and about keeping the generic
+        // page sniffer off a host that has a dedicated resolver — see
+        // `requiresYTDlp` for why it still routes to yt-dlp when every
+        // resolver tier misses.
+        if host == "c-span.org" || host.hasSuffix(".c-span.org") {
+            return .cspan
         }
         // Apple Podcasts: host is always podcasts.apple.com. yt-dlp's extractor
         // requires URLs of the shape /<lang>/podcast/<name>/idNNN?i=NNN — i.e.

@@ -64,6 +64,14 @@ struct SidebarView: View {
     @AppStorage("sidebar.expanded.status") private var statusExpanded: Bool = true
     @AppStorage("sidebar.expanded.tools") private var toolsExpanded: Bool = true
 
+    /// Backlog-vs-live-edge choice for livestreams, surfaced as a checkbox
+    /// in `modeSection` once the probe confirms a live source. Key and
+    /// default come from `AudioStreamExtractor.swift`, which is what reads
+    /// the value at spawn time — both sides must use the same constants or
+    /// the checkbox and the behaviour drift apart silently.
+    @AppStorage(liveFromStartDefaultsKey)
+    private var transcribeBacklogFromStart: Bool = liveFromStartDefaultValue
+
     /// Debug-only toggle (Debug menu): when on, the Retry probe
     /// button surfaces regardless of probe state. Used for verifying
     /// the button's visual appearance and tap behavior without
@@ -495,7 +503,46 @@ struct SidebarView: View {
                         .foregroundStyle(.orange.opacity(0.85))
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                // BACKLOG CHOICE (2026-09-29). Only shown once the probe has
+                // confirmed a livestream, because it is meaningless anywhere
+                // else — a VOD has no live edge to join and a failed probe
+                // hasn't told us whether there is one. Disabled during a
+                // session for the same reason the mode picker is: the value
+                // is read when the pipe spawns, at session start, so
+                // toggling mid-stream would do nothing and shouldn't look
+                // like it does.
+                if showBacklogChoice {
+                    Divider()
+                        .padding(.vertical, 2)
+                    Toggle(isOn: $transcribeBacklogFromStart) {
+                        Text("Transcribe backlog before going live")
+                            .font(.system(size: 11))
+                    }
+                    .toggleStyle(.checkbox)
+                    .disabled(engine.state.isActive)
+
+                    Text(transcribeBacklogFromStart
+                         ? "Starts from the beginning of the stream's saved window and catches up to the live edge. If the stream has been running for hours, the earliest part may no longer be available — the session then joins at the live edge instead."
+                         : "Starts at the live edge. Anything broadcast before you clicked Start is not transcribed.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
+        }
+    }
+
+    /// Whether to offer the backlog checkbox. Requires BOTH that the probe
+    /// concluded the source is live, and that the session is actually going
+    /// to run in Live mode — a user who forced Static on a livestream is
+    /// taking the download path, where `--live-from-start` has no meaning.
+    private var showBacklogChoice: Bool {
+        guard engine.probeStatus == .live else { return false }
+        switch engine.sessionMode {
+        case .live:   return true
+        case .static: return false
+        case .auto:   return previewAutoMode() == .live
         }
     }
 
@@ -1995,6 +2042,40 @@ struct SidebarView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            // Backlog-vs-live-edge indicator. Only present for a live
+            // session that was asked to start from the backlog, and only
+            // once a delivery window has closed — `engine.livePhase` stays
+            // nil for the first couple of seconds rather than guessing.
+            if let phase = engine.livePhase {
+                HStack(spacing: 6) {
+                    switch phase {
+                    case .catchingUp(let rate):
+                        Image(systemName: "backward.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                        Text("Catching up on backlog")
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer()
+                        Text(String(format: "%.1f×", rate))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    case .atLiveEdge:
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.green)
+                        Text("Live — caught up")
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer()
+                    }
+                }
+                if case .catchingUp = phase {
+                    Text("Transcribing from the start of the stream. It will switch to live once it reaches the current broadcast.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             if engine.elapsedSeconds > 0 {
                 statRow(label: "Elapsed", value: formatDuration(engine.elapsedSeconds))
             }
@@ -2443,6 +2524,7 @@ struct SidebarView: View {
         case .applePodcast: return "mic.fill"
         case .soundcloud:   return "waveform.circle.fill"
         case .senateGov:    return "building.columns.fill"
+        case .cspan:        return "tv.fill"
         case .criticalMention: return "eye.fill"
         case .iqMedia:      return "waveform.badge.magnifyingglass"
         case .frameIO:      return "film.stack"
