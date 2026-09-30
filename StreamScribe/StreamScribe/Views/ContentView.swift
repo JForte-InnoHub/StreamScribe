@@ -162,6 +162,15 @@ struct ContentView: View {
                 showExportSheet = true
             }
         }
+        // Web portal: show the job it is starting in the URL field, so the
+        // field always matches what the engine probed and is running. The
+        // sidebar's onChange(of: urlInput) kicks the probe, exactly as if
+        // the link had been pasted here.
+        .onReceive(PortalJobQueue.shared.$macURLMirror) { value in
+            if let value, value != urlInput {
+                urlInput = value
+            }
+        }
     }
 
     /// Visual feedback while a drag is hovering. Shows a tinted border with a friendly hint.
@@ -213,7 +222,7 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 // If we're not already running, populate the input. If we are, ignore the
                 // drop — drops mid-stream would be confusing.
-                if !engine.state.isActive {
+                if !engine.state.isActive && !PortalJobQueue.shared.isDispatching {
                     urlInput = url.path
                 }
             }

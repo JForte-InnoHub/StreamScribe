@@ -455,6 +455,8 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            PortalSettingsSection()
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 600)

@@ -137,7 +137,7 @@ final class TranscriptionEngine: ObservableObject {
     /// sessions whose probe never resolved — idempotent, so double
     /// application is a no-op.
     func applyPerModeEngineDefault(isStatic: Bool) {
-        guard !userPinnedTranscriptionEngine else { return }
+        guard !userPinnedTranscriptionEngine, !portalEngineChoiceActive else { return }
         let auto: TranscriptionEngineKind = isStatic ? .whisperKit : .parakeet
         guard transcriptionEngine != auto else { return }
         engineAutoChangedTranscription = true
@@ -156,6 +156,42 @@ final class TranscriptionEngine: ObservableObject {
         if !wasAuto { userPinnedTranscriptionEngine = true }
         return wasAuto
     }
+
+    // MARK: - Web portal hooks
+
+    /// Set the transcription engine on behalf of a web-portal job. Goes
+    /// through the same auto-change flag as `applyPerModeEngineDefault`, so
+    /// the sidebar's onChange neither pins the choice for the rest of the
+    /// launch nor fires the Parakeet→Sortformer autopair (which would
+    /// silently override the job's own speaker-engine choice). Same guard
+    /// too: setting an unchanged value fires no onChange, so the flag must
+    /// not be left set.
+    func setTranscriptionEngineFromPortal(_ kind: TranscriptionEngineKind) {
+        guard transcriptionEngine != kind else { return }
+        engineAutoChangedTranscription = true
+        transcriptionEngine = kind
+        print("[Engine] Web portal selected \(kind.rawValue) for the next session.")
+    }
+
+    /// True while a web-portal job's engine choice is in force. Blocks the
+    /// per-mode default — including the fallback application in
+    /// `rebuildBackends()` at Start, which would otherwise quietly swap a
+    /// job's explicit "Parakeet on a recording" back to WhisperKit. The
+    /// portal clears it when it restores the Mac's settings after the job.
+    var portalEngineChoiceActive = false
+
+    /// Incremented at the top of every `start()` that actually proceeds.
+    /// A stable per-session identity for the web portal: `sessionStartedAt`
+    /// can't serve, because `setState` clears it on every terminal state
+    /// (and a slow-unwinding previous pipeline can clear it after the next
+    /// session has already set it).
+    private(set) var sessionGeneration: Int = 0
+
+    /// Incremented on every `beginProbe` call. With `lastProbeInput`, lets the
+    /// web portal tell whether the sidebar has already kicked off the probe
+    /// for the input it is about to start (avoids a duplicate yt-dlp probe).
+    private(set) var probeGeneration: Int = 0
+    private(set) var lastProbeInput: String = ""
 
     /// **Default: FluidAudio.** Offline pyannote-community-1 pipeline (static)
     /// + LS-EEND streaming (live) — superior speaker accuracy to SpeakerKit
@@ -1313,6 +1349,7 @@ final class TranscriptionEngine: ObservableObject {
     @MainActor
     func start(urlString: String) async {
         guard !state.isActive else { return }
+        sessionGeneration += 1
 
         // Capture session start wall-clock immediately. The miniplayer
         // uses this to map AVPlayer's `currentDate()` (HLS wall-clock)
@@ -7807,6 +7844,8 @@ final class TranscriptionEngine: ObservableObject {
         probeTask?.cancel()
         probeTask = nil
         probedDuration = nil
+        probeGeneration += 1
+        lastProbeInput = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         // Clear the previously-displayed title too — it belonged to the
         // prior URL. The new probe (or local-file fallback) will populate
         // it again before the user hits Start.

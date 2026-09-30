@@ -94,6 +94,11 @@ struct SidebarView: View {
     /// mid-session if they toggled the flag.
     @AppStorage("models.showAllModels") private var showAllModels: Bool = false
 
+    /// Web portal queue — observed so Start is disabled while the portal is
+    /// between "picked a job" and "engine confirmed it started" (a local
+    /// Start in that window would race the portal for the engine).
+    @ObservedObject private var portal = PortalJobQueue.shared
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
@@ -141,9 +146,11 @@ struct SidebarView: View {
                 TextField("URL, YouTube link, or file path", text: $urlInput)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12, design: .monospaced))
-                    .disabled(engine.state.isActive)
+                    // Also locked while the web portal is starting a job: an
+                    // edit here would re-probe a different input mid-dispatch.
+                    .disabled(engine.state.isActive || portal.isDispatching)
                     .onSubmit {
-                        if !engine.state.isActive { onStart() }
+                        if !engine.state.isActive && !portal.isDispatching { onStart() }
                     }
                     // Eager-probe (Phase 8): kick off a duration probe whenever
                     // the URL changes. The engine's `beginProbe` cancels any
@@ -166,7 +173,7 @@ struct SidebarView: View {
                             .font(.system(size: 11))
                     }
                     .controlSize(.small)
-                    .disabled(engine.state.isActive)
+                    .disabled(engine.state.isActive || portal.isDispatching)
 
                     // Download Video button. Visible when the probe
                     // has classified the URL as static (a finite-
@@ -2144,7 +2151,9 @@ struct SidebarView: View {
             } else {
                 primaryButton(action: onStart, label: "Start",
                               systemImage: "play.fill", tint: nil)
-                    .disabled(urlInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(urlInput.trimmingCharacters(in: .whitespaces).isEmpty
+                              || portal.isDispatching)
+                    .help(portal.isDispatching ? "The web portal is starting a queued job" : "")
             }
 
             Button(action: onExport) {

@@ -334,6 +334,12 @@ struct StreamScribeApp: App {
                 .environmentObject(notificationService)
                 .frame(minWidth: 900, minHeight: 600)
                 .task {
+                    // Web portal: hand it the one engine. Starts the local
+                    // HTTP server only if Settings → Web Portal is on.
+                    // Idempotent, so a reopened window is harmless.
+                    PortalJobQueue.shared.attach(engine: transcriptionEngine)
+                }
+                .task {
                     // Fire-and-forget launch-time update check — runs
                     // on EVERY launch (no throttle) so users hear
                     // about new versions at the earliest opportunity.

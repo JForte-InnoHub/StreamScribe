@@ -1,0 +1,1164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>StreamScribe</title>
+<style>
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #f1f3f6;
+  --text: #16181d;
+  --muted: #5d6470;
+  --faint: #8a909b;
+  --line: #e2e5ea;
+  --accent: #2f5bea;
+  --accent-ink: #ffffff;
+  --accent-soft: #e8eefe;
+  --ok: #1f8a4c;
+  --ok-soft: #e3f4ea;
+  --warn: #a15c00;
+  --warn-soft: #fdf0dc;
+  --bad: #c0352b;
+  --bad-soft: #fbe6e4;
+  --pin: #fff4c2;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317;
+    --panel: #1a1d23;
+    --panel-2: #22262d;
+    --text: #e8eaee;
+    --muted: #a3a9b4;
+    --faint: #767d89;
+    --line: #2c3139;
+    --accent: #6f93ff;
+    --accent-ink: #0d1020;
+    --accent-soft: #1e2a4a;
+    --ok: #4cc27f;
+    --ok-soft: #173325;
+    --warn: #f0a44a;
+    --warn-soft: #3a2b16;
+    --bad: #ff7a6e;
+    --bad-soft: #3d1d1a;
+    --pin: #3d3614;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select { font: inherit; color: inherit; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+header.top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.brand { font-weight: 700; letter-spacing: -.01em; font-size: 17px; cursor: pointer; }
+.brand small { font-weight: 500; color: var(--muted); font-size: 13px; margin-left: 6px; }
+.top .spacer { flex: 1; }
+.who { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 32vw; }
+
+.pill {
+  min-width: 0;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 12.5px; font-weight: 600; white-space: nowrap;
+  background: var(--panel-2); color: var(--muted);
+  max-width: 46vw; overflow: hidden; text-overflow: ellipsis;
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.busy { background: var(--accent-soft); color: var(--accent); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+
+main { max-width: 1180px; margin: 0 auto; padding: 20px; }
+.banner {
+  margin: 0 0 16px; padding: 10px 14px; border-radius: var(--radius);
+  background: var(--bad-soft); color: var(--bad); font-weight: 500;
+}
+.banner.info { background: var(--accent-soft); color: var(--accent); }
+
+.grid-home { display: grid; grid-template-columns: minmax(0, 420px) minmax(0, 1fr); gap: 20px; align-items: start; }
+.grid-job { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.card > .hd { padding: 14px 16px 0; display: flex; align-items: center; gap: 10px; }
+.card > .hd h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.card > .bd { padding: 14px 16px 16px; }
+.sticky { position: sticky; top: 70px; }
+
+.tabs { display: flex; gap: 4px; background: var(--panel-2); padding: 3px; border-radius: 8px; }
+.tabs button {
+  flex: 1; border: 0; background: transparent; padding: 6px 10px; border-radius: 6px;
+  font-weight: 600; font-size: 13.5px; color: var(--muted); cursor: pointer;
+}
+.tabs button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+
+label.f { display: block; font-size: 12.5px; font-weight: 600; color: var(--muted); margin: 12px 0 5px; }
+input[type=text], input[type=url], input[type=number], select {
+  width: 100%; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel);
+}
+input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+details.opts { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+details.opts summary { cursor: pointer; font-weight: 600; font-size: 13.5px; color: var(--muted); list-style: none; }
+details.opts summary::before { content: "▸ "; }
+details.opts[open] summary::before { content: "▾ "; }
+.hint { font-size: 12.5px; color: var(--faint); margin-top: 4px; }
+
+.drop {
+  margin-top: 12px; border: 1.5px dashed var(--line); border-radius: var(--radius);
+  padding: 22px 14px; text-align: center; color: var(--muted); cursor: pointer;
+  background: var(--panel-2);
+}
+.drop.over { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.drop strong { color: var(--text); }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  padding: 8px 14px; border-radius: 8px; font-weight: 600; font-size: 14px; cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--panel-2); }
+.btn:disabled { opacity: .5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.danger { color: var(--bad); }
+.btn.sm { padding: 5px 10px; font-size: 13px; }
+.btn.block { width: 100%; margin-top: 16px; padding: 10px 14px; }
+
+.progress { height: 6px; background: var(--panel-2); border-radius: 99px; overflow: hidden; }
+.progress > div { height: 100%; background: var(--accent); width: 0; transition: width .3s ease; }
+.progress.ind > div { width: 30%; animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+
+.jobs-filter { margin-left: auto; }
+.jobs-filter .tabs button { padding: 3px 10px; font-size: 12.5px; }
+.job-list { list-style: none; margin: 0; padding: 0; }
+.job-item {
+  display: block; padding: 12px 16px; border-top: 1px solid var(--line); cursor: pointer; color: inherit;
+}
+.job-item:first-child { border-top: 0; }
+.job-item:hover { background: var(--panel-2); text-decoration: none; }
+.job-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-meta { font-size: 12.5px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 3px; }
+.job-item .progress { margin-top: 8px; }
+.empty { padding: 26px 16px; color: var(--faint); text-align: center; }
+
+.chip { font-size: 11.5px; font-weight: 700; padding: 1px 8px; border-radius: 99px; text-transform: uppercase; letter-spacing: .03em; }
+.chip.queued { background: var(--panel-2); color: var(--muted); }
+.chip.preparing, .chip.running, .chip.finishing { background: var(--accent-soft); color: var(--accent); }
+.chip.completed { background: var(--ok-soft); color: var(--ok); }
+.chip.failed, .chip.interrupted { background: var(--bad-soft); color: var(--bad); }
+.chip.cancelled { background: var(--panel-2); color: var(--faint); }
+
+.job-head { margin-bottom: 16px; }
+.back { font-size: 13.5px; font-weight: 600; display: inline-block; margin-bottom: 8px; cursor: pointer; }
+.job-head h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -.01em; line-height: 1.25; word-break: break-word; }
+.job-head .job-meta { font-size: 13px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+.actions select { width: auto; padding: 7px 10px; }
+.msg { margin-top: 10px; font-size: 13.5px; color: var(--muted); }
+.msg.bad { color: var(--bad); }
+
+.transcript { padding: 6px 18px 18px; }
+.block { padding: 12px 0 4px; border-top: 1px solid var(--line); }
+.block:first-child { border-top: 0; }
+.block .who2 { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.block .name { font-weight: 700; font-size: 14px; }
+.block .time { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.block p { margin: 0; line-height: 1.65; }
+.seg { border-radius: 3px; cursor: pointer; }
+.seg:hover { background: var(--panel-2); }
+.seg.pinned { background: var(--pin); }
+.seg.sel { background: var(--accent-soft); outline: 1px solid var(--accent); }
+.seg.review { text-decoration: underline dotted var(--warn); text-underline-offset: 3px; }
+.follow { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin-left: auto; }
+
+.side h3 { margin: 0; font-size: 14px; font-weight: 650; }
+.spk { display: grid; grid-template-columns: 10px 1fr auto; gap: 8px; align-items: center; margin-top: 8px; }
+.spk .sw { width: 10px; height: 10px; border-radius: 50%; }
+.spk input { padding: 6px 9px; font-size: 14px; }
+.spk .cnt { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.spk .src { grid-column: 2 / 4; font-size: 11.5px; color: var(--faint); margin-top: -4px; }
+.pinrow { padding: 10px 0; border-top: 1px solid var(--line); }
+.pinrow:first-of-type { border-top: 0; }
+.pinrow .pm { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+.pinrow .pm .x { margin-left: auto; border: 0; background: none; cursor: pointer; color: var(--faint); font-size: 16px; line-height: 1; }
+.pinrow .pt { font-size: 14px; margin-top: 3px; cursor: pointer; }
+
+.actionbar {
+  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+  background: var(--text); color: var(--bg); border-radius: 12px; padding: 8px 8px 8px 14px;
+  display: flex; gap: 10px; align-items: center; box-shadow: 0 8px 24px rgba(0,0,0,.25); z-index: 30;
+  max-width: calc(100vw - 24px);
+}
+.actionbar span { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.actionbar .btn { background: var(--bg); color: var(--text); border-color: transparent; }
+.toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 40;
+  background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 10px;
+  font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,.25); max-width: calc(100vw - 36px);
+}
+.hidden { display: none !important; }
+
+/* Speaker colours: same palette order and hash as the Mac app's SpeakerPanel,
+   so a speaker is the same colour on the Mac and on the web. */
+.c0 { --spk: #007aff; } .c1 { --spk: #9a3fcb; } .c2 { --spk: #c45f00; } .c3 { --spk: #d6204a; }
+.c4 { --spk: #1e8a9e; } .c5 { --spk: #1e9a33; } .c6 { --spk: #5856d6; } .c7 { --spk: #d70015; }
+.c8 { --spk: #00897f; } .c9 { --spk: #8a6a45; } .cx { --spk: var(--muted); }
+@media (prefers-color-scheme: dark) {
+  .c0 { --spk: #0a84ff; } .c1 { --spk: #bf5af2; } .c2 { --spk: #ff9f0a; } .c3 { --spk: #ff375f; }
+  .c4 { --spk: #40c8e0; } .c5 { --spk: #32d74b; } .c6 { --spk: #7d7aff; } .c7 { --spk: #ff453a; }
+  .c8 { --spk: #63e6e2; } .c9 { --spk: #ac8e68; }
+}
+.block .name, .pinrow .pn { color: var(--spk); }
+.spk .sw { background: var(--spk); }
+
+@media (max-width: 900px) {
+  .grid-home, .grid-job { grid-template-columns: minmax(0, 1fr); }
+  .sticky { position: static; }
+  main { padding: 14px; }
+  .who { display: none; }
+}
+@media (max-width: 520px) {
+  header.top { padding: 10px 14px; gap: 8px; }
+  .pill { max-width: none; flex: 1 1 auto; }
+  .top .spacer { display: none; }
+  .wide { display: none; }
+  .brand small { display: none; }
+  .row2 { grid-template-columns: 1fr; }
+  .transcript { padding: 4px 12px 14px; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand" id="brand">StreamScribe<small>Transcription portal</small></div>
+  <div class="spacer"></div>
+  <span class="pill" id="enginePill"><span class="dot"></span><span id="engineText">Connecting…</span></span>
+  <button class="btn sm hidden" id="pauseBtn"></button>
+  <span class="who" id="who"></span>
+</header>
+<main id="main">
+  <div class="banner hidden" id="banner"></div>
+  <div id="view"></div>
+</main>
+<div class="actionbar hidden" id="actionbar">
+  <span id="actionText">1 segment selected</span>
+  <button class="btn sm" id="pinSelBtn">Pin quote</button>
+  <button class="btn sm" id="clearSelBtn">Cancel</button>
+</div>
+<div class="toast hidden" id="toast"></div>
+<script>
+"use strict";
+
+const S = {
+  status: null,
+  jobs: [],
+  jobFilter: "all",
+  mode: "url",
+  file: null,
+  uploading: false,
+  view: null,
+  jobId: null,
+  job: null,
+  epoch: "",
+  rev: 0,
+  segs: new Map(),
+  order: [],
+  speakers: [],
+  pins: [],
+  follow: true,
+  selected: null,
+  pollTimer: null,
+  jobTimer: null,
+  lastRenderKey: "",
+  formDraft: null
+};
+
+// ---------- helpers ----------
+function $(id) { return document.getElementById(id); }
+
+function h(tag, attrs, children) {
+  const el = document.createElement(tag);
+  if (attrs) {
+    for (const k of Object.keys(attrs)) {
+      const v = attrs[k];
+      if (v === null || v === undefined || v === false) continue;
+      if (k === "class") el.className = v;
+      else if (k === "text") el.textContent = v;
+      else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+      else if (k === "style") el.setAttribute("style", v);
+      else if (v === true) el.setAttribute(k, "");
+      else el.setAttribute(k, String(v));
+    }
+  }
+  if (children !== undefined && children !== null) {
+    const list = Array.isArray(children) ? children : [children];
+    for (const c of list) {
+      if (c === null || c === undefined || c === false) continue;
+      el.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+  }
+  return el;
+}
+
+async function api(path, opts) {
+  const o = opts || {};
+  const init = { method: o.method || "GET", headers: {}, credentials: "same-origin", cache: "no-store" };
+  if (init.method !== "GET") init.headers["X-StreamScribe-Portal"] = "1";
+  if (o.json !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(o.json);
+  } else if (o.body !== undefined) {
+    init.headers["Content-Type"] = "application/octet-stream";
+    init.body = o.body;
+  }
+  let res;
+  try {
+    res = await fetch(path, init);
+  } catch (e) {
+    const err = new Error("Can't reach the Mac Mini. If this keeps happening, reload the page (your sign-in may have expired).");
+    err.network = true;
+    throw err;
+  }
+  const type = res.headers.get("content-type") || "";
+  if (!type.includes("application/json")) {
+    if (!res.ok) throw Object.assign(new Error("Request failed (" + res.status + ")"), { status: res.status });
+    // An HTML page where JSON was expected = Cloudflare Access login page.
+    throw Object.assign(new Error("Your sign-in has expired. Reload the page to sign in again."), { network: true });
+  }
+  const data = await res.json();
+  if (!res.ok) {
+    throw Object.assign(new Error(data.error || ("Request failed (" + res.status + ")")), { status: res.status, data: data });
+  }
+  return data;
+}
+
+function fmtTime(sec) {
+  if (sec === null || sec === undefined || !isFinite(sec)) return "";
+  sec = Math.max(0, Math.floor(sec));
+  const hh = Math.floor(sec / 3600), mm = Math.floor((sec % 3600) / 60), ss = sec % 60;
+  const p = function (n) { return n < 10 ? "0" + n : String(n); };
+  return hh > 0 ? hh + ":" + p(mm) + ":" + p(ss) : mm + ":" + p(ss);
+}
+
+function fmtBytes(n) {
+  if (!isFinite(n)) return "";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + " " + u[i];
+}
+
+function relTime(iso) {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  if (!isFinite(t)) return "";
+  const d = (Date.now() - t) / 1000;
+  if (d < 45) return "just now";
+  if (d < 3600) return Math.round(d / 60) + " min ago";
+  if (d < 86400) return Math.round(d / 3600) + " h ago";
+  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+// Port of SpeakerPanel.speakerColor: 64-bit wrapping `hash &* 31 &+ scalar`
+// over unicode scalars, then abs(hash) % 10 into the same 10-colour palette.
+function speakerClass(label) {
+  if (!label) return "cx";
+  let hsh = 0n;
+  for (const ch of String(label)) {
+    hsh = BigInt.asIntN(64, hsh * 31n + BigInt(ch.codePointAt(0)));
+  }
+  if (hsh < 0n) hsh = -hsh;
+  return "c" + Number(hsh % 10n);
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.classList.add("hidden"); }, 3800);
+}
+
+function banner(msg, info) {
+  const b = $("banner");
+  if (!msg) { b.classList.add("hidden"); return; }
+  b.textContent = msg;
+  b.className = "banner" + (info ? " info" : "");
+}
+
+const STATUS_LABEL = {
+  queued: "Queued", preparing: "Starting", running: "Transcribing", finishing: "Finishing",
+  completed: "Done", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted"
+};
+function isTerminal(st) { return st === "completed" || st === "failed" || st === "cancelled" || st === "interrupted"; }
+function isOnEngine(st) { return st === "preparing" || st === "running" || st === "finishing"; }
+
+function jobProgress(j) {
+  if (j.status === "running" && j.mode === "static" && j.durationSeconds > 0 && j.processedSeconds >= 0) {
+    return Math.min(100, (j.processedSeconds / j.durationSeconds) * 100);
+  }
+  return null;
+}
+
+// ---------- status / header ----------
+async function refreshStatus() {
+  try {
+    const st = await api("/api/status");
+    S.status = st;
+    banner(null);
+    renderHeader();
+  } catch (e) {
+    if (e.network) banner(e.message);
+  }
+}
+
+function renderHeader() {
+  const st = S.status;
+  if (!st) return;
+  $("who").textContent = st.me.isLocal ? "On the Mac Mini" : st.me.email;
+  const pill = $("enginePill");
+  let cls = "pill ok", text = "Ready";
+  if (st.engine.busyWithMacSession) {
+    cls = "pill warn";
+    text = "Busy with a session started on the Mac";
+  } else if (st.engine.active) {
+    cls = "pill busy";
+    text = (st.engine.label || "Working") + (st.engine.title ? " · " + st.engine.title : "");
+  }
+  if (st.queue.paused) { cls = "pill warn"; text = "Queue paused" + (st.engine.active ? " · finishing current job" : ""); }
+  if (st.queue.queued > 0) text += " · " + st.queue.queued + " waiting";
+  pill.className = cls;
+  $("engineText").textContent = text;
+  const pb = $("pauseBtn");
+  if (st.me.isAdmin) {
+    pb.classList.remove("hidden");
+    pb.textContent = "";
+    pb.appendChild(document.createTextNode(st.queue.paused ? "Resume" : "Pause"));
+    pb.appendChild(h("span", { class: "wide", text: "queue" }));
+  } else {
+    pb.classList.add("hidden");
+  }
+}
+
+$("pauseBtn").addEventListener("click", async function () {
+  if (!S.status) return;
+  try {
+    S.status = await api("/api/queue/pause", { method: "POST", json: { paused: !S.status.queue.paused } });
+    renderHeader();
+  } catch (e) { toast(e.message); }
+});
+
+// ---------- routing ----------
+function route() {
+  const m = location.hash.match(/^#\/job\/([0-9A-Fa-f-]{36})$/);
+  stopJobPolling();
+  S.selected = null;
+  updateActionbar();
+  if (m) {
+    S.view = "job";
+    S.jobId = m[1].toUpperCase();
+    S.job = null; S.epoch = ""; S.rev = 0; S.segs = new Map(); S.order = []; S.speakers = []; S.pins = [];
+    S.follow = true; S.lastRenderKey = "";
+    renderJobShell();
+    pollJob();
+  } else {
+    S.view = "home";
+    S.jobId = null;
+    renderHome();
+    refreshJobs();
+  }
+  window.scrollTo(0, 0);
+}
+window.addEventListener("hashchange", route);
+$("brand").addEventListener("click", function () { location.hash = "#/"; });
+
+// ---------- home ----------
+function optionSelect(id, options, value) {
+  const sel = h("select", { id: id });
+  for (const o of options) {
+    const opt = h("option", { value: o.id, text: o.label });
+    if (o.id === value) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  return sel;
+}
+
+function labelFor(list, id) {
+  const f = (list || []).find(function (o) { return o.id === id; });
+  return f ? f.label : id;
+}
+
+function buildOptions() {
+  const st = S.status;
+  const o = st ? st.options : { modes: [], engines: [], diarizers: [], languages: [] };
+  const d = st ? st.defaults : null;
+  const dflt = function (txt) { return { id: "default", label: "Mac Mini default" + (txt ? " (" + txt + ")" : "") }; };
+  const yn = function (b) { return b ? "on" : "off"; };
+
+  const modeSel = optionSelect("o-mode", [dflt(d ? labelFor(o.modes, d.mode) : "")].concat(o.modes), "default");
+  const engineSel = optionSelect("o-engine", o.engines, "auto");
+  const diarSel = optionSelect("o-diar", [dflt(d ? labelFor(o.diarizers, d.diarization) : "")].concat(o.diarizers), "default");
+  const langSel = optionSelect("o-lang", [dflt(d ? labelFor(o.languages, d.language) : "")].concat(o.languages), "default");
+  const spk = h("input", { id: "o-spk", type: "number", min: "0", max: "60", placeholder: d ? (d.expectedSpeakers > 0 ? "Mac Mini default (" + d.expectedSpeakers + ")" : "Mac Mini default (any)") : "" });
+  const backlog = optionSelect("o-backlog", [dflt(d ? yn(d.liveFromStart) : ""), { id: "yes", label: "Yes — from the start of the broadcast" }, { id: "no", label: "No — join at the live edge" }], "default");
+  const cleanup = optionSelect("o-clean", [dflt(d ? yn(d.cleanup) : ""), { id: "yes", label: "On" }, { id: "no", label: "Off" }], "default");
+
+  return h("details", { class: "opts", id: "opts" }, [
+    h("summary", { text: "Options" }),
+    h("label", { class: "f", for: "o-mode", text: "Source type" }), modeSel,
+    h("label", { class: "f", for: "o-engine", text: "Transcription engine" }), engineSel,
+    h("div", { class: "row2" }, [
+      h("div", null, [h("label", { class: "f", for: "o-diar", text: "Speaker labels" }), diarSel]),
+      h("div", null, [h("label", { class: "f", for: "o-spk", text: "Expected speakers" }), spk])
+    ]),
+    h("div", { class: "hint", text: "Knowing how many people speak (e.g. a hearing roster) is the biggest single boost to speaker accuracy." }),
+    h("label", { class: "f", for: "o-lang", text: "Language (WhisperKit)" }), langSel,
+    h("label", { class: "f", for: "o-backlog", text: "Live streams: transcribe from the beginning?" }), backlog,
+    h("label", { class: "f", for: "o-clean", text: "AI cleanup pass" }), cleanup
+  ]);
+}
+
+function readSettings() {
+  const val = function (id) { const el = $(id); return el ? el.value : "default"; };
+  const tri = function (id) { const v = val(id); return v === "yes" ? true : (v === "no" ? false : null); };
+  const s = {
+    mode: val("o-mode"),
+    engine: val("o-engine") || "auto",
+    diarization: val("o-diar"),
+    language: val("o-lang")
+  };
+  const spk = $("o-spk") ? $("o-spk").value.trim() : "";
+  if (spk !== "") s.expectedSpeakers = Math.max(0, Math.min(60, parseInt(spk, 10) || 0));
+  const b = tri("o-backlog"); if (b !== null) s.liveFromStart = b;
+  const c = tri("o-clean"); if (c !== null) s.cleanup = c;
+  return s;
+}
+
+function renderHome() {
+  const view = $("view");
+  view.textContent = "";
+
+  const urlPane = h("div", { id: "pane-url", class: S.mode === "url" ? "" : "hidden" }, [
+    h("label", { class: "f", for: "url", text: "Link" }),
+    h("input", { id: "url", type: "url", placeholder: "https://www.youtube.com/watch?v=…", autocomplete: "off", onkeydown: function (e) { if (e.key === "Enter") submit(); } }),
+    h("div", { class: "hint", text: "YouTube, House/Senate hearings, state legislatures, X, podcasts, direct audio/video links…" })
+  ]);
+
+  const fileInput = h("input", { id: "file", type: "file", class: "hidden", onchange: function (e) { pickFile(e.target.files[0]); } });
+  const drop = h("div", {
+    class: "drop", id: "drop",
+    onclick: function () { if (!S.uploading) fileInput.click(); },
+    ondragover: function (e) { e.preventDefault(); drop.classList.add("over"); },
+    ondragleave: function () { drop.classList.remove("over"); },
+    ondrop: function (e) { e.preventDefault(); drop.classList.remove("over"); if (e.dataTransfer.files.length) pickFile(e.dataTransfer.files[0]); }
+  }, [h("div", { id: "dropText" }, dropContent())]);
+  const upPane = h("div", { id: "pane-file", class: S.mode === "file" ? "" : "hidden" }, [
+    fileInput, drop,
+    h("div", { id: "upProg", class: "hidden", style: "margin-top:12px" }, [
+      h("div", { class: "progress" }, h("div", { id: "upBar" })),
+      h("div", { class: "hint", id: "upText" })
+    ])
+  ]);
+
+  const tabs = h("div", { class: "tabs" }, [
+    h("button", { class: S.mode === "url" ? "on" : "", text: "Link", onclick: function () { setMode("url"); } }),
+    h("button", { class: S.mode === "file" ? "on" : "", text: "Upload a file", onclick: function () { setMode("file"); } })
+  ]);
+
+  const newCard = h("section", { class: "card sticky" }, [
+    h("div", { class: "hd" }, h("h2", { text: "New transcript" })),
+    h("div", { class: "bd" }, [
+      tabs, urlPane, upPane, buildOptions(),
+      h("button", { class: "btn primary block", id: "submitBtn", text: "Transcribe", onclick: submit }),
+      h("div", { class: "hint", id: "submitHint", style: "text-align:center" })
+    ])
+  ]);
+
+  const filter = h("div", { class: "jobs-filter" }, h("div", { class: "tabs" }, [
+    h("button", { class: S.jobFilter === "all" ? "on" : "", text: "Everyone", onclick: function () { S.jobFilter = "all"; renderJobs(); } }),
+    h("button", { class: S.jobFilter === "mine" ? "on" : "", text: "Mine", onclick: function () { S.jobFilter = "mine"; renderJobs(); } })
+  ]));
+  const listCard = h("section", { class: "card" }, [
+    h("div", { class: "hd", style: "padding-bottom:12px" }, [h("h2", { text: "Transcripts" }), filter]),
+    h("ul", { class: "job-list", id: "jobList" }, h("li", { class: "empty", text: "Loading…" }))
+  ]);
+
+  view.appendChild(h("div", { class: "grid-home" }, [newCard, listCard]));
+  if (S.formDraft) restoreDraft();
+  renderJobs();
+}
+
+function dropContent() {
+  if (S.file) {
+    return [h("strong", { text: S.file.name }), h("div", { class: "hint", text: fmtBytes(S.file.size) + " · click to choose a different file" })];
+  }
+  return [h("strong", { text: "Choose an audio or video file" }), h("div", { class: "hint", text: "or drag it here · up to 10 GB" })];
+}
+
+function saveDraft() {
+  const ids = ["url", "o-mode", "o-engine", "o-diar", "o-lang", "o-spk", "o-backlog", "o-clean"];
+  const d = {};
+  for (const id of ids) { const el = $(id); if (el) d[id] = el.value; }
+  d.open = $("opts") ? $("opts").open : false;
+  S.formDraft = d;
+}
+function restoreDraft() {
+  const d = S.formDraft;
+  for (const id of Object.keys(d)) { const el = $(id); if (el && id !== "open") el.value = d[id]; }
+  if (d.open && $("opts")) $("opts").open = true;
+}
+
+function setMode(m) {
+  saveDraft();
+  S.mode = m;
+  renderHome();
+}
+
+function pickFile(f) {
+  if (!f) return;
+  const ext = (f.name.split(".").pop() || "").toLowerCase();
+  const allowed = S.status ? S.status.options.uploadExtensions : [];
+  if (allowed.length && allowed.indexOf(ext) < 0) { toast("That doesn't look like an audio or video file (." + ext + ")."); return; }
+  if (S.status && f.size > S.status.options.maxUploadBytes) { toast("Files up to " + fmtBytes(S.status.options.maxUploadBytes) + " are supported."); return; }
+  S.file = f;
+  const dt = $("dropText");
+  dt.textContent = "";
+  for (const n of dropContent()) dt.appendChild(n);
+}
+
+async function submit() {
+  const btn = $("submitBtn");
+  if (!btn || btn.disabled) return;
+  const settings = readSettings();
+  btn.disabled = true;
+  try {
+    if (S.mode === "url") {
+      const url = $("url").value.trim();
+      if (!url) { toast("Paste a link first."); return; }
+      const job = await api("/api/jobs", { method: "POST", json: { url: url, settings: settings } });
+      S.formDraft = null;
+      location.hash = "#/job/" + job.id;
+    } else {
+      if (!S.file) { toast("Choose a file first."); return; }
+      const job = await upload(S.file, settings);
+      S.file = null;
+      S.formDraft = null;
+      location.hash = "#/job/" + job.id;
+    }
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    if ($("submitBtn")) $("submitBtn").disabled = false;
+  }
+}
+
+async function upload(file, settings) {
+  S.uploading = true;
+  const prog = $("upProg"), bar = $("upBar"), txt = $("upText");
+  prog.classList.remove("hidden");
+  const started = Date.now();
+  const setP = function (sent) {
+    const pct = file.size ? (sent / file.size) * 100 : 100;
+    bar.style.width = pct.toFixed(1) + "%";
+    const secs = (Date.now() - started) / 1000;
+    const rate = secs > 1 ? sent / secs : 0;
+    let eta = "";
+    if (rate > 0 && sent < file.size) eta = " · about " + fmtTime((file.size - sent) / rate) + " left";
+    txt.textContent = "Uploading " + fmtBytes(sent) + " of " + fmtBytes(file.size) + (rate > 0 ? " · " + fmtBytes(rate) + "/s" : "") + eta;
+  };
+  let uploadId = null;
+  try {
+    const created = await api("/api/uploads", { method: "POST", json: { filename: file.name, size: file.size } });
+    uploadId = created.uploadId;
+    const chunk = parseInt(created.chunkBytes, 10) || (16 * 1024 * 1024);
+    let offset = 0;
+    setP(0);
+    while (offset < file.size) {
+      const end = Math.min(file.size, offset + chunk);
+      let attempt = 0;
+      for (;;) {
+        try {
+          const r = await api("/api/uploads/" + uploadId + "/chunk?offset=" + offset, { method: "POST", body: file.slice(offset, end) });
+          offset = parseInt(r.received, 10);
+          break;
+        } catch (e) {
+          if (e.status === 409 && e.data && e.data.received !== undefined) { offset = parseInt(e.data.received, 10); break; }
+          attempt++;
+          if (attempt > 5 || (e.status && e.status < 500 && e.status !== 408 && e.status !== 429)) throw e;
+          txt.textContent = "Connection hiccup — retrying (" + attempt + "/5)…";
+          await new Promise(function (r) { setTimeout(r, 1000 * Math.pow(2, attempt)); });
+        }
+      }
+      setP(offset);
+    }
+    txt.textContent = "Upload complete — adding to the queue…";
+    const job = await api("/api/uploads/" + uploadId + "/finish", { method: "POST", json: { settings: settings } });
+    return job;
+  } catch (e) {
+    if (uploadId) { api("/api/uploads/" + uploadId + "/abort", { method: "POST", json: {} }).catch(function () {}); }
+    prog.classList.add("hidden");
+    throw e;
+  } finally {
+    S.uploading = false;
+  }
+}
+
+async function refreshJobs() {
+  try {
+    S.jobs = await api("/api/jobs");
+    if (S.view === "home") renderJobs();
+  } catch (e) {
+    if (e.network) banner(e.message);
+  }
+}
+
+function renderJobs() {
+  const ul = $("jobList");
+  if (!ul) return;
+  // Re-sync the filter tab highlight.
+  const tabs = document.querySelectorAll(".jobs-filter .tabs button");
+  if (tabs.length === 2) {
+    tabs[0].className = S.jobFilter === "all" ? "on" : "";
+    tabs[1].className = S.jobFilter === "mine" ? "on" : "";
+  }
+  const me = S.status ? S.status.me.email : "";
+  const list = S.jobs.filter(function (j) { return S.jobFilter === "all" || j.submittedBy === me; });
+  ul.textContent = "";
+  if (!list.length) {
+    ul.appendChild(h("li", { class: "empty", text: S.jobFilter === "mine" ? "You haven't submitted anything yet." : "No transcripts yet. Paste a link to get started." }));
+    return;
+  }
+  for (const j of list) {
+    const pct = jobProgress(j);
+    const meta = [
+      h("span", { class: "chip " + j.status, text: STATUS_LABEL[j.status] || j.status }),
+      j.queuePosition ? h("span", { text: "#" + j.queuePosition + " in line" }) : null,
+      h("span", { text: (j.submittedBy === "local" ? "Mac Mini" : j.submittedBy) }),
+      h("span", { text: relTime(j.createdAt) }),
+      j.durationSeconds ? h("span", { text: fmtTime(j.durationSeconds) }) : null
+    ];
+    const li = h("li", null, h("a", { class: "job-item", href: "#/job/" + j.id }, [
+      h("div", { class: "job-title", text: j.title || j.source }),
+      h("div", { class: "job-meta" }, meta),
+      isOnEngine(j.status) ? h("div", { class: "progress" + (pct === null ? " ind" : "") }, h("div", { style: pct === null ? "" : "width:" + pct.toFixed(1) + "%" })) : null
+    ]));
+    ul.appendChild(li);
+  }
+}
+
+// ---------- job view ----------
+function renderJobShell() {
+  const view = $("view");
+  view.textContent = "";
+  const head = h("div", { class: "job-head", id: "jobHead" }, [
+    h("a", { class: "back", href: "#/", text: "← All transcripts" }),
+    h("h1", { id: "jobTitle", text: "Loading…" }),
+    h("div", { class: "job-meta", id: "jobMeta" }),
+    h("div", { id: "jobProg" }),
+    h("div", { class: "actions", id: "jobActions" }),
+    h("div", { class: "msg", id: "jobMsg" })
+  ]);
+  const transcriptCard = h("section", { class: "card" }, [
+    h("div", { class: "hd" }, [
+      h("h2", { text: "Transcript" }),
+      h("label", { class: "follow", id: "followWrap" }, [
+        h("input", { type: "checkbox", id: "follow", checked: S.follow, onchange: function (e) { S.follow = e.target.checked; if (S.follow) scrollToEnd(); } }),
+        "Follow live"
+      ])
+    ]),
+    h("div", { class: "transcript", id: "transcript" }, h("div", { class: "empty", text: "Waiting for the transcript…" }))
+  ]);
+  const side = h("aside", { class: "side" }, [
+    h("section", { class: "card", style: "margin-bottom:20px" }, [
+      h("div", { class: "hd" }, h("h3", { text: "Speakers" })),
+      h("div", { class: "bd", id: "speakers" }, h("div", { class: "hint", text: "Speakers appear as they're detected." }))
+    ]),
+    h("section", { class: "card" }, [
+      h("div", { class: "hd" }, h("h3", { text: "Pinned quotes" })),
+      h("div", { class: "bd", id: "pins" }, h("div", { class: "hint", text: "Tap any sentence in the transcript to pin it." }))
+    ])
+  ]);
+  view.appendChild(head);
+  view.appendChild(h("div", { class: "grid-job" }, [transcriptCard, h("div", { class: "sticky" }, side)]));
+}
+
+function stopJobPolling() {
+  if (S.jobTimer) { clearTimeout(S.jobTimer); S.jobTimer = null; }
+}
+
+async function pollJob() {
+  if (S.view !== "job") return;
+  const id = S.jobId;
+  let delay = 1500;
+  try {
+    const r = await api("/api/jobs/" + id + "/transcript?since=" + S.rev + "&epoch=" + encodeURIComponent(S.epoch));
+    if (S.view !== "job" || S.jobId !== id) return;
+    applyTranscript(r);
+    banner(null);
+    delay = (r.job.live || !isTerminal(r.job.status)) ? 1500 : 10000;
+  } catch (e) {
+    if (e.status === 404) { renderMissing(); return; }
+    if (e.network) banner(e.message);
+    delay = 5000;
+  }
+  if (S.view === "job" && S.jobId === id) S.jobTimer = setTimeout(pollJob, delay);
+}
+
+function renderMissing() {
+  const view = $("view");
+  view.textContent = "";
+  view.appendChild(h("div", { class: "card" }, h("div", { class: "empty" }, [
+    "This transcript no longer exists. ", h("a", { href: "#/", text: "Back to all transcripts" })
+  ])));
+}
+
+function applyTranscript(r) {
+  if (r.full) { S.segs = new Map(); }
+  for (const s of r.segments) S.segs.set(s.id, s);
+  if (r.order) {
+    S.order = r.order;
+    const keep = new Set(r.order);
+    for (const k of Array.from(S.segs.keys())) if (!keep.has(k)) S.segs.delete(k);
+  }
+  const metaChanged = !!(r.speakers || r.pins);
+  if (r.speakers) S.speakers = r.speakers;
+  if (r.pins) S.pins = r.pins;
+  const transcriptChanged = r.full || r.segments.length > 0 || !!r.order || metaChanged;
+  S.epoch = r.epoch;
+  S.rev = r.rev;
+  S.job = r.job;
+  renderJobHead();
+  if (metaChanged || r.full) { renderSpeakers(); renderPins(); }
+  if (transcriptChanged) renderTranscript(r.full);
+}
+
+function nameFor(label) {
+  if (!label) return "Unknown Speaker";
+  const s = S.speakers.find(function (x) { return x.label === label; });
+  return s ? s.name : label;
+}
+
+function renderJobHead() {
+  const j = S.job;
+  if (!j) return;
+  $("jobTitle").textContent = j.title || j.source;
+  document.title = (j.title || "Transcript") + " · StreamScribe";
+  const meta = $("jobMeta");
+  meta.textContent = "";
+  const srcNode = j.isUpload ? h("span", { text: "File: " + j.source })
+    : h("a", { href: j.source, target: "_blank", rel: "noopener noreferrer", text: shortURL(j.source) });
+  const bits = [
+    h("span", { class: "chip " + j.status, text: STATUS_LABEL[j.status] || j.status }),
+    j.queuePosition ? h("span", { text: "#" + j.queuePosition + " in line" }) : null,
+    srcNode,
+    h("span", { text: "by " + (j.submittedBy === "local" ? "Mac Mini" : j.submittedBy) }),
+    h("span", { text: relTime(j.createdAt) }),
+    j.mode ? h("span", { text: j.mode === "static" ? "Recording" : "Live" }) : null,
+    j.durationSeconds ? h("span", { text: fmtTime(j.durationSeconds) }) : null,
+    h("span", { text: S.order.length + " segments" })
+  ];
+  for (const b of bits) if (b) meta.appendChild(b);
+
+  const prog = $("jobProg");
+  prog.textContent = "";
+  if (isOnEngine(j.status)) {
+    const pct = jobProgress(j);
+    prog.appendChild(h("div", { class: "progress" + (pct === null ? " ind" : ""), style: "margin-top:10px" },
+      h("div", { style: pct === null ? "" : "width:" + pct.toFixed(1) + "%" })));
+  }
+
+  // Rebuilt only when something it shows changes — rebuilding every poll
+  // would snap shut a format dropdown someone has open.
+  const actKey = [j.id, j.status, j.canManage, S.order.length > 0].join("|");
+  const act = $("jobActions");
+  if (act.getAttribute("data-key") !== actKey) {
+  act.setAttribute("data-key", actKey);
+  act.textContent = "";
+  if (j.canManage && (j.status === "queued" || isOnEngine(j.status))) {
+    act.appendChild(h("button", { class: "btn danger", text: j.status === "queued" ? "Cancel" : "Stop", onclick: stopJob }));
+  }
+  if (S.order.length) {
+    const formats = S.status ? S.status.options.exportFormats : [{ id: "docx", label: "Word Document (.docx)" }];
+    const sel = optionSelect("fmt", formats, localStorage.getItem("ss.fmt") || "docx");
+    act.appendChild(sel);
+    act.appendChild(h("button", { class: "btn primary", text: "Download", onclick: function () {
+      const f = $("fmt").value;
+      try { localStorage.setItem("ss.fmt", f); } catch (e) {}
+      window.location.href = "/api/jobs/" + j.id + "/export?format=" + encodeURIComponent(f);
+    } }));
+  }
+  if (isTerminal(j.status)) {
+    act.appendChild(h("button", { class: "btn", text: "Run again", onclick: retryJob }));
+    if (j.canManage) act.appendChild(h("button", { class: "btn danger", text: "Delete", onclick: deleteJob }));
+  }
+  }
+
+  const msg = $("jobMsg");
+  let m = j.message || "";
+  if (j.status === "queued" && !m) m = "Waiting for the Mac Mini to finish the job ahead of this one.";
+  if (j.live && isTerminal(j.status)) m = (m ? m + " · " : "") + "Still open on the Mac Mini — edits there show up here.";
+  msg.textContent = m;
+  msg.className = "msg" + (j.status === "failed" || j.status === "interrupted" ? " bad" : "");
+  $("followWrap").classList.toggle("hidden", !isOnEngine(j.status));
+}
+
+function shortURL(u) {
+  try {
+    const x = new URL(u);
+    const p = x.pathname.length > 24 ? x.pathname.slice(0, 24) + "…" : x.pathname;
+    return x.host + p;
+  } catch (e) { return u; }
+}
+
+function renderTranscript(firstLoad) {
+  const box = $("transcript");
+  if (!box) return;
+  const nearEnd = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 160);
+  const pinned = new Set(S.pins.map(function (p) { return p.segmentId; }));
+  box.textContent = "";
+  if (!S.order.length) {
+    const j = S.job;
+    let t = "Waiting for the transcript…";
+    if (j && j.status === "queued") t = "This job is in the queue. The transcript will appear here once it starts.";
+    if (j && isTerminal(j.status)) t = "No transcript was produced.";
+    box.appendChild(h("div", { class: "empty", text: t }));
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  let block = null, para = null, current;
+  for (const id of S.order) {
+    const s = S.segs.get(id);
+    if (!s) continue;
+    const spk = s.speaker || "";
+    if (block === null || spk !== current) {
+      current = spk;
+      para = h("p");
+      block = h("div", { class: "block" }, [
+        h("div", { class: "who2" }, [
+          h("span", { class: "name " + speakerClass(s.speaker), text: nameFor(s.speaker) }),
+          h("span", { class: "time", text: fmtTime(s.start) })
+        ]),
+        para
+      ]);
+      frag.appendChild(block);
+    } else {
+      para.appendChild(document.createTextNode(" "));
+    }
+    let cls = "seg";
+    if (pinned.has(s.id)) cls += " pinned";
+    if (S.selected === s.id) cls += " sel";
+    if (s.review) cls += " review";
+    para.appendChild(h("span", {
+      class: cls, "data-id": s.id,
+      title: fmtTime(s.start) + (s.review ? " · flagged for review (too garbled to clean up)" : ""),
+      text: s.text
+    }));
+  }
+  box.appendChild(frag);
+  // Opening a live job lands at the live edge; after that, follow only while
+  // the reader is already near the bottom (don't yank someone reading back).
+  if (S.follow && S.job && isOnEngine(S.job.status) && (nearEnd || firstLoad)) scrollToEnd();
+}
+
+function scrollToEnd() { window.scrollTo(0, document.body.scrollHeight); }
+
+document.addEventListener("click", function (e) {
+  const seg = e.target.closest ? e.target.closest(".seg") : null;
+  if (!seg || S.view !== "job") return;
+  const id = seg.getAttribute("data-id");
+  S.selected = (S.selected === id) ? null : id;
+  document.querySelectorAll(".seg.sel").forEach(function (n) { n.classList.remove("sel"); });
+  if (S.selected) seg.classList.add("sel");
+  updateActionbar();
+});
+
+function updateActionbar() {
+  const bar = $("actionbar");
+  if (!S.selected || S.view !== "job") { bar.classList.add("hidden"); return; }
+  const s = S.segs.get(S.selected);
+  const isPinned = S.pins.some(function (p) { return p.segmentId === S.selected; });
+  $("actionText").textContent = s ? (nameFor(s.speaker) + " · " + fmtTime(s.start)) : "Selected";
+  $("pinSelBtn").textContent = isPinned ? "Unpin" : "Pin quote";
+  bar.classList.remove("hidden");
+}
+
+$("clearSelBtn").addEventListener("click", function () {
+  S.selected = null;
+  document.querySelectorAll(".seg.sel").forEach(function (n) { n.classList.remove("sel"); });
+  updateActionbar();
+});
+
+$("pinSelBtn").addEventListener("click", async function () {
+  const id = S.selected;
+  if (!id || !S.jobId) return;
+  const existing = S.pins.find(function (p) { return p.segmentId === id; });
+  try {
+    if (existing) {
+      await api("/api/jobs/" + S.jobId + "/pins/" + existing.id + "/delete", { method: "POST", json: {} });
+    } else {
+      await api("/api/jobs/" + S.jobId + "/pins", { method: "POST", json: { segmentId: id } });
+      toast("Pinned.");
+    }
+    S.selected = null;
+    updateActionbar();
+    refreshNow();
+  } catch (e) { toast(e.message); }
+});
+
+function refreshNow() {
+  stopJobPolling();
+  pollJob();
+}
+
+function renderSpeakers() {
+  const box = $("speakers");
+  if (!box) return;
+  const active = document.activeElement;
+  // Don't clobber a name someone is typing.
+  if (active && active.getAttribute && active.getAttribute("data-label") && box.contains(active)) return;
+  box.textContent = "";
+  if (!S.speakers.length) {
+    box.appendChild(h("div", { class: "hint", text: "Speakers appear as they're detected." }));
+    return;
+  }
+  for (const sp of S.speakers) {
+    const input = h("input", {
+      type: "text", value: sp.source === "rename" ? sp.name : "", placeholder: sp.source === "voiceprint" ? sp.name : sp.label,
+      "data-label": sp.label, "aria-label": "Name for " + sp.label,
+      onkeydown: function (e) { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") { e.target.value = sp.source === "rename" ? sp.name : ""; e.target.blur(); } },
+      onchange: function (e) { renameSpeaker(sp.label, e.target.value); }
+    });
+    let src = sp.label;
+    if (sp.source === "voiceprint") src = sp.label + " · identified by voiceprint";
+    if (sp.source === "rename") src = sp.label + " · renamed";
+    box.appendChild(h("div", { class: "spk" }, [
+      h("span", { class: "sw " + speakerClass(sp.label) }),
+      input,
+      h("span", { class: "cnt", text: String(sp.count) }),
+      h("span", { class: "src", text: src })
+    ]));
+  }
+}
+
+async function renameSpeaker(label, name) {
+  try {
+    await api("/api/jobs/" + S.jobId + "/speakers", { method: "POST", json: { label: label, name: name } });
+    refreshNow();
+  } catch (e) { toast(e.message); }
+}
+
+function renderPins() {
+  const box = $("pins");
+  if (!box) return;
+  box.textContent = "";
+  if (!S.pins.length) {
+    box.appendChild(h("div", { class: "hint", text: "Tap any sentence in the transcript to pin it." }));
+    return;
+  }
+  const sorted = S.pins.slice().sort(function (a, b) { return a.start - b.start; });
+  for (const p of sorted) {
+    box.appendChild(h("div", { class: "pinrow" }, [
+      h("div", { class: "pm" }, [
+        h("span", { class: "pn " + speakerClass(p.speaker), style: "font-weight:600", text: nameFor(p.speaker) }),
+        h("span", { text: fmtTime(p.start) }),
+        p.keyword ? h("span", { text: "· keyword: " + p.keyword }) : null,
+        h("button", { class: "x", title: "Remove pin", text: "×", onclick: function () { unpin(p.id); } })
+      ]),
+      h("div", { class: "pt", text: p.text, onclick: function () { jumpTo(p.segmentId); } })
+    ]));
+  }
+}
+
+async function unpin(pinId) {
+  try {
+    await api("/api/jobs/" + S.jobId + "/pins/" + pinId + "/delete", { method: "POST", json: {} });
+    refreshNow();
+  } catch (e) { toast(e.message); }
+}
+
+function jumpTo(segId) {
+  if (!segId) return;
+  const el = document.querySelector('.seg[data-id="' + segId + '"]');
+  if (!el) return;
+  S.follow = false;
+  if ($("follow")) $("follow").checked = false;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("sel");
+  setTimeout(function () { if (S.selected !== segId) el.classList.remove("sel"); }, 1600);
+}
+
+async function stopJob() {
+  const j = S.job;
+  if (!j) return;
+  const verb = j.status === "queued" ? "Cancel" : "Stop";
+  if (!confirm(verb + " this transcript?" + (j.status === "queued" ? "" : " What's been transcribed so far is kept."))) return;
+  try {
+    await api("/api/jobs/" + j.id + "/stop", { method: "POST", json: {} });
+    refreshNow();
+  } catch (e) { toast(e.message); }
+}
+
+async function retryJob() {
+  const j = S.job;
+  if (!j) return;
+  try {
+    const nj = await api("/api/jobs/" + j.id + "/retry", { method: "POST", json: {} });
+    location.hash = "#/job/" + nj.id;
+  } catch (e) { toast(e.message); }
+}
+
+async function deleteJob() {
+  const j = S.job;
+  if (!j) return;
+  if (!confirm("Delete this transcript for everyone? This can't be undone.")) return;
+  try {
+    await api("/api/jobs/" + j.id + "/delete", { method: "POST", json: {} });
+    location.hash = "#/";
+  } catch (e) { toast(e.message); }
+}
+
+// ---------- background polling ----------
+async function tick() {
+  await refreshStatus();
+  if (S.view === "home") await refreshJobs();
+  const busy = S.status && (S.status.engine.active || S.status.queue.queued > 0);
+  setTimeout(tick, document.hidden ? 15000 : (busy ? 3000 : 6000));
+}
+document.addEventListener("visibilitychange", function () {
+  if (!document.hidden && S.view === "job") refreshNow();
+});
+
+(async function boot() {
+  await refreshStatus();
+  route();
+  setTimeout(tick, 3000);
+})();
+</script>
+</body>
+</html>
