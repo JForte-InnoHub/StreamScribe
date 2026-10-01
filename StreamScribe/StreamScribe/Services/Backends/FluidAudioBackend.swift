@@ -146,7 +146,7 @@ actor FluidAudioBackend: DiarizationBackend {
         // route through R2; FluidAudio's `ModelRegistry.baseURL` is
         // the equivalent knob here. If the mirror key isn't set,
         // FluidAudio falls through to HuggingFace as default.
-        ModelRegistry.baseURL = FluidAudioBackend.resolvedMirrorURL
+        ModelRegistry.baseURL = FluidAudioBackend.registryBaseURL
         print("[FluidAudio] Model registry: \(ModelRegistry.baseURL)")
 
         // Offline pipeline. `prepareModels()` downloads + Core ML-compiles
@@ -165,6 +165,22 @@ actor FluidAudioBackend: DiarizationBackend {
         // symlink to the unified StreamScribe models directory.
         let wasCached = Self.isModelCached()
         let prepareStart = Date()
+        // Models already complete on disk: load them ourselves rather than
+        // through prepareModels(), which DELETES the whole diarizer repo
+        // after any failed first load (OfflineDiarizerManager
+        // .purgeDiarizerRepo ignores offlineMode) and re-downloads — so a
+        // single transient load failure after a restart used to wipe a good
+        // cache. See loadCachedOfflineModels (2026-10-01).
+        if offlineManager == nil, let models = await Self.loadCachedOfflineModels() {
+            let manager = OfflineDiarizerManager(config: OfflineDiarizerConfig())
+            manager.initialize(models: models)
+            self.offlineManager = manager
+            print(String(format: "[FluidAudio] Offline diarizer ready from on-disk cache (%.1fs).",
+                         Date().timeIntervalSince(prepareStart)))
+        }
+        // A cancelled Start must not reach prepareModels(): it purges the
+        // repo after any failed load, cancellation included.
+        try Task.checkCancellation()
         if offlineManager == nil {
             let manager = OfflineDiarizerManager(config: OfflineDiarizerConfig())
             do {
@@ -493,6 +509,85 @@ extension FluidAudioBackend {
     static var resolvedMirrorURL: String {
         let custom = UserDefaults.standard.string(forKey: mirrorURLKey) ?? ""
         return custom.isEmpty ? ModelDownloadManager.mirrorBaseURL : custom
+    }
+
+    /// The mirror as FluidAudio's `ModelRegistry.baseURL` needs it: with NO
+    /// trailing slash. ModelRegistry builds "\(baseURL)/api/models/…" and
+    /// "\(baseURL)/<repo>/resolve/main/…", so the canonical mirror
+    /// (".../r2.dev/") produced "r2.dev//api/…" — and R2 answers a
+    /// double-slash path with its HTML 404 page. Every FluidAudio download
+    /// from R2 failed that way (found 2026-10-01); the August staging was
+    /// verified with single-slash curls, and existing caches hid it.
+    static var registryBaseURL: String {
+        var base = resolvedMirrorURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        return base
+    }
+
+    /// Load the offline (pyannote) diarizer straight from the on-disk cache,
+    /// with FluidAudio's network AND its delete-and-redownload path switched
+    /// off (`ModelHub.offlineMode`), retrying once on failure. Returns nil
+    /// when the cache is incomplete or both attempts fail; the caller then
+    /// falls back to prepareModels(), whose re-download now works.
+    ///
+    /// Why: OfflineDiarizerManager.prepareModels() purges the repo after ANY
+    /// failed first load, and ModelHub.loadModels purges on any non-network
+    /// error. A transient failure (e.g. CoreML busy while another model loads
+    /// right after a restart) therefore deleted a complete cache, and — with
+    /// the registry-slash bug above — the re-download then failed, leaving
+    /// speaker labelling broken until the sidebar's tarball Download put the
+    /// models back.
+    private static func loadCachedOfflineModels() async -> OfflineDiarizerModels? {
+        let directory = OfflineDiarizerModels.defaultModelsDirectory()
+        let repoDir = directory.appendingPathComponent(Repo.diarizer.folderName)
+        let missing = ModelNames.OfflineDiarizer.requiredModels.filter {
+            !FileManager.default.fileExists(atPath: repoDir.appendingPathComponent($0).path)
+        }
+        guard missing.isEmpty else {
+            print("[FluidAudio] Offline diarizer cache incomplete at \(repoDir.path) (missing: \(missing.sorted().joined(separator: ", "))) — downloading.")
+            return nil
+        }
+        for attempt in 1...2 {
+            // Held only for the load itself — not during the retry pause —
+            // because the flag is process-wide: any other FluidAudio
+            // download (sidebar, portal, Canary, EOU) fails while it's on.
+            holdOfflineMode()
+            do {
+                let models = try await OfflineDiarizerModels.load(from: directory)
+                releaseOfflineMode()
+                return models
+            } catch {
+                releaseOfflineMode()
+                print("[FluidAudio] Loading cached offline diarizer failed (attempt \(attempt) of 2): \(error.localizedDescription)")
+                if attempt == 1 { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+            }
+        }
+        print("[FluidAudio] Cached offline diarizer wouldn't load twice — falling back to a fresh download.")
+        return nil
+    }
+
+    // `ModelHub.offlineMode` is one process-wide flag. A plain save/restore
+    // breaks when two loads overlap (A saves false, B saves true, A restores
+    // false, B restores true → stuck on, blocking every FluidAudio download
+    // until relaunch); a reference count restores the original value only
+    // when the last holder lets go.
+    private static let offlineLock = NSLock()
+    nonisolated(unsafe) private static var offlineHolders = 0
+    nonisolated(unsafe) private static var offlineSaved = false
+
+    private static func holdOfflineMode() {
+        offlineLock.lock(); defer { offlineLock.unlock() }
+        if offlineHolders == 0 {
+            offlineSaved = ModelHub.offlineMode
+            ModelHub.offlineMode = true
+        }
+        offlineHolders += 1
+    }
+
+    private static func releaseOfflineMode() {
+        offlineLock.lock(); defer { offlineLock.unlock() }
+        offlineHolders = max(0, offlineHolders - 1)
+        if offlineHolders == 0 { ModelHub.offlineMode = offlineSaved }
     }
 
     /// Best-effort check for whether FluidAudio's models are already

@@ -75,8 +75,10 @@ actor EouBackend: TranscriptionBackend {
         // EOU model from the same mirror.
         if let mirrorURL = UserDefaults.standard.string(forKey: FluidAudioBackend.mirrorURLKey),
            !mirrorURL.isEmpty {
-            ModelRegistry.baseURL = mirrorURL
-            print("[EOU] Using R2 mirror: \(mirrorURL)")
+            // registryBaseURL: the same value minus any trailing slash, which
+            // would make FluidAudio request "…//api/…" (an R2 404 page).
+            ModelRegistry.baseURL = FluidAudioBackend.registryBaseURL
+            print("[EOU] Using R2 mirror: \(ModelRegistry.baseURL)")
         }
 
         // 160ms chunk variant: lowest latency step size, the flagship

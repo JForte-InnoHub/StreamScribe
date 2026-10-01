@@ -56,7 +56,7 @@ actor CanaryBackend: TranscriptionBackend {
     func prepare() async throws {
         guard manager == nil else { return }
 
-        ModelRegistry.baseURL = FluidAudioBackend.resolvedMirrorURL
+        ModelRegistry.baseURL = FluidAudioBackend.registryBaseURL
         print("[Canary] Model registry: \(ModelRegistry.baseURL)")
 
         let appSupport = FileManager.default
