@@ -141,6 +141,11 @@ select:disabled { opacity: .6; }
 .probe.bad { background: var(--warn-soft); color: var(--warn); }
 .probe .spin { width: 9px; height: 9px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: rot .8s linear infinite; flex: none; align-self: center; }
 @keyframes rot { to { transform: rotate(360deg); } }
+.dl { padding: 10px 12px; border-radius: 8px; background: var(--panel-2); font-size: 13.5px; }
+.dl .dlh { font-weight: 600; }
+.dl .btn { margin-top: 8px; }
+.dl .progress { margin-top: 8px; }
+.dl.bad { background: var(--warn-soft); color: var(--warn); }
 
 .drop {
   margin-top: 12px; border: 1.5px dashed var(--line); border-radius: var(--radius);
@@ -449,12 +454,18 @@ function jobProgress(j) {
 async function refreshStatus() {
   try {
     const st = await api("/api/status");
+    const prevModels = S.status ? JSON.stringify([S.status.options.models, S.status.options.downloads]) : "";
     S.status = st;
     banner(null);
     renderHeader();
     if (!S.formReady) {
       initForm();
       if (S.view === "home") rebuildOptions();
+    } else if (S.view === "home" && JSON.stringify([st.options.models, st.options.downloads]) !== prevModels) {
+      // Only the model area: rebuilding the whole form every poll during a
+      // download would snap shut any dropdown someone has open.
+      refreshFormModels();
+      rebuildModelArea();
     }
   } catch (e) {
     if (e.network) banner(e.message);
@@ -572,6 +583,68 @@ function initForm() {
   S.formReady = !!st;
 }
 
+// A model finished downloading (or vanished): fill in any engine whose model
+// choice is empty, and drop a choice that's no longer on the Mini.
+function refreshFormModels() {
+  const f = S.form;
+  if (!f) return;
+  ["whisperKit", "parakeet"].forEach(function (engine) {
+    const list = downloaded(engine);
+    if (!list.some(function (o) { return o.id === f.models[engine]; })) {
+      const want = S.status.defaults.models ? S.status.defaults.models[engine] : null;
+      f.models[engine] = list.some(function (o) { return o.id === want; }) ? want : (list.length ? list[0].id : null);
+    }
+  });
+}
+
+function engineReady(engine) { return engine === "auto" || downloaded(engine).length > 0; }
+
+function downloadPanel(engine) {
+  const st = S.status;
+  const d = st && st.options.downloads ? st.options.downloads[engine] : null;
+  const name = { whisperKit: "WhisperKit", parakeet: "Parakeet", canary: "Canary" }[engine] || engine;
+  const admin = st && st.me.isAdmin;
+  if (d && (d.state === "downloading" || d.state === "loading")) {
+    const pct = d.progress !== null && d.progress !== undefined ? d.progress * 100 : null;
+    return h("div", { class: "dl" }, [
+      h("div", { class: "dlh", text: (d.state === "loading" ? "Loading " : "Downloading ") + d.label + "…" }),
+      h("div", { class: "progress" + (pct === null ? " ind" : "") }, h("div", { style: pct === null ? "" : "width:" + pct.toFixed(1) + "%" })),
+      h("div", { class: "hint", text: pct === null ? "On the Mac Mini. This can take a few minutes." : Math.round(pct) + "% · on the Mac Mini" })
+    ]);
+  }
+  const failed = d && d.state === "error";
+  const kids = [
+    h("div", { class: "dlh", text: failed ? "The download didn't finish." : name + " isn't downloaded on the Mac Mini yet." }),
+    d ? h("div", { class: "hint", text: d.label }) : null,
+    failed && d.message ? h("div", { class: "hint", text: d.message }) : null
+  ];
+  if (admin && d) {
+    kids.push(h("button", { class: "btn sm", type: "button", text: failed ? "Try again" : "Download to the Mac Mini", onclick: function (e) { startDownload(engine, e.target); } }));
+  } else if (!admin) {
+    kids.push(h("div", { class: "hint", text: "Ask a portal admin to download it, or pick another engine." }));
+  }
+  return h("div", { class: "dl" + (failed ? " bad" : "") }, kids);
+}
+
+async function startDownload(engine, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    S.status = await api("/api/models/download", { method: "POST", json: { engine: engine } });
+    rebuildModelArea();
+  } catch (e) {
+    toast(e.message);
+    if (btn) btn.disabled = false;
+  }
+}
+
+function syncSubmit() {
+  const btn = $("submitBtn"), hint = $("submitHint");
+  if (!btn || !S.form) return;
+  const ready = engineReady(S.form.engine);
+  if (!S.uploading) btn.disabled = !ready;
+  if (hint) hint.textContent = ready ? "" : "Download the model first, or pick another engine.";
+}
+
 function segmented(id, options, value, onPick, isDisabled) {
   const wrap = h("div", { class: "tabs seg", id: id, role: "group" });
   for (const o of options) {
@@ -600,6 +673,7 @@ function modelControl() {
     ];
   }
   const list = downloaded(f.engine);
+  if (!list.length) return [downloadPanel(f.engine)];
   if (f.engine === "canary") {
     return [h("select", { id: "o-model" }, list.map(function (o) { return h("option", { value: o.id, text: o.label }); }))];
   }
@@ -626,11 +700,11 @@ function buildOptions() {
     h("label", { class: "f", text: "Source type" }),
     segmented("o-mode", sourceTypes, f.sourceType, function (v) { f.sourceType = v; rebuildOptions(); }),
     h("label", { class: "f", text: "Transcription engine" }),
-    segmented("o-engine", engines, f.engine, function (v) { f.engine = v; rebuildOptions(); },
-      function (id) { return id !== "auto" && downloaded(id).length === 0 ? "Not downloaded on the Mac Mini" : null; }),
+    segmented("o-engine", engines, f.engine, function (v) { f.engine = v; rebuildOptions(); }),
     h("div", { class: "hint", text: ENGINE_HINT[f.engine] || "" }),
-    h("label", { class: "f", for: "o-model", text: "Model" })
-  ].concat(modelControl()));
+    h("label", { class: "f", for: "o-model", text: "Model" }),
+    h("div", { id: "modelArea" }, modelControl())
+  ]);
 
   const diarSel = optionSelect("o-diar", o.diarizers, f.diarization);
   diarSel.addEventListener("change", function (e) { f.diarization = e.target.value; });
@@ -659,9 +733,16 @@ function buildOptions() {
   return h("div", { id: "optsWrap" }, [options, advanced]);
 }
 
+function rebuildModelArea() {
+  const el = $("modelArea");
+  if (el) el.replaceWith(h("div", { id: "modelArea" }, modelControl()));
+  syncSubmit();
+}
+
 function rebuildOptions() {
   const old = $("optsWrap");
   if (old) old.replaceWith(buildOptions());
+  syncSubmit();
 }
 
 function readSettings() {
@@ -735,6 +816,7 @@ function renderHome() {
   ]);
 
   view.appendChild(h("div", { class: "grid-home" }, [newCard, listCard]));
+  syncSubmit();
   renderProbe();
   renderJobs();
 }
@@ -860,6 +942,7 @@ async function submit() {
     toast(e.message);
   } finally {
     if ($("submitBtn")) $("submitBtn").disabled = false;
+    syncSubmit();
   }
 }
 
@@ -1332,7 +1415,9 @@ async function deleteJob() {
 async function tick() {
   await refreshStatus();
   if (S.view === "home") await refreshJobs();
-  const busy = S.status && (S.status.engine.active || S.status.queue.queued > 0);
+  const dls = S.status && S.status.options.downloads ? Object.values(S.status.options.downloads) : [];
+  const downloading = dls.some(function (d) { return d.state === "downloading" || d.state === "loading"; });
+  const busy = S.status && (S.status.engine.active || S.status.queue.queued > 0 || downloading);
   setTimeout(tick, document.hidden ? 15000 : (busy ? 3000 : 6000));
 }
 document.addEventListener("visibilitychange", function () {

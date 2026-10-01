@@ -758,7 +758,35 @@ actor ParakeetBackend: TranscriptionBackend {
         let mlxAudioDirName = "\(org)_\(name)"
         let hubLayoutDirName = "models--\(org)--\(name)"
 
-        // Primary: HF_HOME-redirected Documents location, mlx-audio's
+        // FIRST: the unified models root, ~/Library/Application Support/
+        // StreamScribe/Models/huggingface/hub/… (2026-10-01). This is where
+        // `ModelDownloadManager.mirror(for: .parakeet)` extracts the R2
+        // tarball AND where HF_HOME points at launch, so it is where every
+        // current download lands — yet it was missing from this list. The
+        // model loaded fine (fromPretrained resolves through HF_HOME), but
+        // isModelCached reported "not downloaded" after every relaunch,
+        // so the sidebar offered a re-download and the web portal hid
+        // Parakeet entirely. Same bug WhisperKitBackend.cacheCandidatePaths
+        // had until 2026-09-29. Sortformer inherits the fix (its
+        // isModelCached delegates here). Must stay in sync with
+        // `ModelDownloadManager.streamScribeModelsRoot()` +
+        // `StreamScribeApp.setupUnifiedModelsRoot()`.
+        if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let hub = appSupport
+                .appendingPathComponent("StreamScribe")
+                .appendingPathComponent("Models")
+                .appendingPathComponent("huggingface")
+                .appendingPathComponent("hub")
+            candidates.append(hub
+                .appendingPathComponent("mlx-audio")
+                .appendingPathComponent(mlxAudioDirName)
+                .path)
+            candidates.append(hub
+                .appendingPathComponent(hubLayoutDirName)
+                .path)
+        }
+
+        // Older: HF_HOME-redirected Documents location, mlx-audio's
         // own subdir layout.
         if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
             candidates.append(docs

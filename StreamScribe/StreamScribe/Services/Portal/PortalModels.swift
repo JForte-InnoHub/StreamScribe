@@ -524,8 +524,11 @@ struct PortalStatusDTO: Encodable {
         let languages: [PortalOptionDTO]
         let exportFormats: [PortalOptionDTO]
         /// Engine id → models downloaded on the Mini. An engine with no
-        /// entry (or an empty list) can't be used from the portal.
+        /// entry (or an empty list) can't be used until a model is downloaded.
         let models: [String: [PortalOptionDTO]]
+        /// Engine id → the model a portal download would fetch for it, and
+        /// that download's state when one is running or has failed.
+        let downloads: [String: PortalDownloadDTO]
         let uploadExtensions: [String]
         let maxUploadBytes: Int64
         let chunkBytes: Int
@@ -591,6 +594,20 @@ struct PortalProbeDTO: Encodable {
     /// e.g. "YouTube", "U.S. Senate", "HLS Stream"
     let source: String?
     let message: String?
+}
+
+struct PortalDownloadDTO: Encodable {
+    /// The model that would be (or is being) downloaded.
+    let model: String
+    let label: String
+    /// idle | downloading | loading | error
+    let state: String
+    let progress: Double?
+    let message: String?
+}
+
+struct PortalDownloadBody: Decodable {
+    let engine: String
 }
 
 struct PortalPauseBody: Decodable {

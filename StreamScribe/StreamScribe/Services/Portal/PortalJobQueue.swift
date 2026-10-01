@@ -144,6 +144,12 @@ final class PortalJobQueue: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.checkAttachment() }
             .store(in: &cancellables)
+        // A download finishing (from the portal or the Mac sidebar) changes
+        // what the portal can offer — drop the cached model list.
+        ModelDownloadManager.shared.$statuses
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.modelCache = nil }
+            .store(in: &cancellables)
 
         applyServerSetting()
         refreshSummary()
@@ -704,6 +710,8 @@ final class PortalJobQueue: ObservableObject {
             return createUpload(request, who)
         case ("POST", 1) where r[0] == "probe":
             return await probeLink(request)
+        case ("POST", 2) where r[0] == "models" && r[1] == "download":
+            return startModelDownload(request, who)
         case ("POST", 3) where r[0] == "uploads":
             guard let id = UUID(uuidString: r[1]) else { return .error(404, "Unknown upload") }
             switch r[2] {
@@ -784,6 +792,7 @@ final class PortalJobQueue: ObservableObject {
                 languages: languages,
                 exportFormats: formats.map { .init(id: $0.fileExtension, label: $0.rawValue) },
                 models: downloadedModels(),
+                downloads: downloadStates(),
                 uploadExtensions: Self.uploadExtensions,
                 maxUploadBytes: Self.maxUploadBytes,
                 chunkBytes: Self.uploadChunkBytes),
@@ -883,11 +892,81 @@ final class PortalJobQueue: ObservableObject {
             .filter { ParakeetBackend.isModelCached(modelRepo: $0) }
             .map { PortalOptionDTO(id: $0, label: TranscriptionEngine.displayName(forParakeetModel: $0)) }
         let canary = CanaryBackend.isModelCached()
-            ? [PortalOptionDTO(id: "canary-1b-v2", label: "Canary 1B v2 (int4) — 573 MB")]
+            ? [PortalOptionDTO(id: "canary-1b-v2", label: "Canary 1B v2 (int4)")]
             : []
         let models = ["whisperKit": whisper, "parakeet": parakeet, "canary": canary]
         modelCache = (Date(), models)
         return models
+    }
+
+    // MARK: - Model downloads
+
+    /// The model a portal download fetches for each engine: the Mini's
+    /// currently selected model (what Auto would use), or Canary's only one.
+    private func downloadTarget(_ engineID: String) -> (key: ModelDownloadManager.ModelKey, model: String, label: String)? {
+        switch engineID {
+        case "whisperKit":
+            let name = engine?.whisperModelName ?? TranscriptionEngine.defaultWhisperModel
+            return (.whisper(modelName: name), name, TranscriptionEngine.displayName(forWhisperModel: name))
+        case "parakeet":
+            let repo = engine?.parakeetModelName ?? TranscriptionEngine.defaultParakeetModel
+            return (.parakeet(modelRepo: repo), repo, TranscriptionEngine.displayName(forParakeetModel: repo))
+        case "canary":
+            // Size from the R2 object's Content-Length (532,228,379 bytes).
+            return (.canary, "canary-1b-v2", "Canary 1B v2 (int4) — about 530 MB download")
+        default:
+            return nil
+        }
+    }
+
+    private func downloadStates() -> [String: PortalDownloadDTO] {
+        var out: [String: PortalDownloadDTO] = [:]
+        for id in ["whisperKit", "parakeet", "canary"] {
+            guard let target = downloadTarget(id) else { continue }
+            let status = ModelDownloadManager.shared.statuses[target.key] ?? .unknown
+            let state: String
+            var progress: Double? = nil
+            var message: String? = nil
+            switch status {
+            case .downloading(_, let p):
+                state = "downloading"
+                progress = p.map { max(0, min(1, $0)) }
+            case .loading:
+                state = "loading"
+            case .error(let m):
+                state = "error"
+                message = m
+            default:
+                state = "idle"
+            }
+            out[id] = PortalDownloadDTO(model: target.model, label: target.label, state: state,
+                                        progress: progress, message: message)
+        }
+        return out
+    }
+
+    /// Download an engine's model to the Mini, through the same
+    /// ModelDownloadManager path as the Mac sidebar's Download buttons (R2
+    /// mirror first). Admins only: it's a large download on the Mini's
+    /// connection, which a running YouTube job also depends on.
+    private func startModelDownload(_ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard isAdmin(who) else { return .error(403, "Only portal admins can download models to the Mac Mini") }
+        guard let body = request.decodeBody(PortalDownloadBody.self),
+              let target = downloadTarget(body.engine) else {
+            return .error(400, "Expected {\"engine\": \"whisperKit\" | \"parakeet\" | \"canary\"}")
+        }
+        let manager = ModelDownloadManager.shared
+        print("[Portal] \(who.email) started a download of \(target.label).")
+        Task {
+            switch target.key {
+            case .whisper(let name): await manager.downloadWhisperModel(name: name)
+            case .parakeet(let repo): await manager.downloadParakeetModel(repo: repo)
+            case .canary: await manager.downloadCanaryModel()
+            default: break
+            }
+            PortalJobQueue.shared.modelCache = nil
+        }
+        return .dto(statusDTO(who))
     }
 
     /// Refuse a job whose engine or model isn't on the Mini. "auto" always
