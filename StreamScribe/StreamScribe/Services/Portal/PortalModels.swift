@@ -47,8 +47,12 @@ enum PortalJobStatus: String, Codable {
 struct PortalJobSettings: Codable, Equatable {
     /// default | auto | live | static
     var mode: String = "default"
-    /// auto | whisperKit | parakeet
+    /// auto | whisperKit | parakeet | canary
     var engine: String = "auto"
+    /// Model for the chosen engine (a WhisperKit model name or a Parakeet
+    /// repo). nil = the Mini's current model for that engine. Ignored for
+    /// "auto" and for Canary, which has a single model.
+    var model: String? = nil
     /// default | off | fluidAudio | speakerKit | sortformer
     var diarization: String = "default"
     /// nil = Mini default; 0 = unconstrained; N = expected number of voices
@@ -68,6 +72,7 @@ struct PortalJobSettings: Codable, Equatable {
         // `try?` flattens the optional (SE-0230), so each line is String?/Int?/Bool?.
         mode = (try? c.decodeIfPresent(String.self, forKey: .mode)) ?? "default"
         engine = (try? c.decodeIfPresent(String.self, forKey: .engine)) ?? "auto"
+        model = try? c.decodeIfPresent(String.self, forKey: .model)
         diarization = (try? c.decodeIfPresent(String.self, forKey: .diarization)) ?? "default"
         expectedSpeakers = try? c.decodeIfPresent(Int.self, forKey: .expectedSpeakers)
         language = (try? c.decodeIfPresent(String.self, forKey: .language)) ?? "default"
@@ -76,7 +81,7 @@ struct PortalJobSettings: Codable, Equatable {
     }
 
     static let modeIDs = ["default", "auto", "live", "static"]
-    static let engineIDs = ["auto", "whisperKit", "parakeet"]
+    static let engineIDs = ["auto", "whisperKit", "parakeet", "canary"]
     static let diarizationIDs = ["default", "off", "fluidAudio", "speakerKit", "sortformer"]
 
     /// Returns a human-readable problem, or nil when every field is valid.
@@ -85,6 +90,16 @@ struct PortalJobSettings: Codable, Equatable {
         if !Self.engineIDs.contains(engine) { return "Unknown engine '\(engine)'" }
         if !Self.diarizationIDs.contains(diarization) { return "Unknown speaker engine '\(diarization)'" }
         if let n = expectedSpeakers, n < 0 || n > 60 { return "Expected speakers must be between 0 and 60" }
+        if let model, !model.isEmpty {
+            switch engine {
+            case "whisperKit":
+                if !TranscriptionEngine.availableWhisperModels.contains(model) { return "Unknown WhisperKit model '\(model)'" }
+            case "parakeet":
+                if !TranscriptionEngine.availableParakeetModels.contains(model) { return "Unknown Parakeet model '\(model)'" }
+            default:
+                break
+            }
+        }
         if language != "default" && language != "auto" {
             let known = TranscriptionEngine.availableLanguages.compactMap { $0.code }
             if !known.contains(language) { return "Unsupported language '\(language)'" }
@@ -96,6 +111,7 @@ struct PortalJobSettings: Codable, Equatable {
         switch id {
         case "whisperKit": return .whisperKit
         case "parakeet": return .parakeet
+        case "canary": return .canary
         default: return nil
         }
     }
@@ -210,6 +226,8 @@ enum PortalSettingsApplier {
     private static let transcriptionKey = "engine.transcriptionEngine"
     private static let diarizationKey = "engine.diarizationEngine"
     private static let languageKey = "engine.language"
+    private static let whisperModelKey = "engine.whisperModel"
+    private static let parakeetModelKey = "engine.parakeetModel"
     private static let udBoolPrefix = "ud.bool:"
     private static let udIntPrefix = "ud.int:"
 
@@ -253,6 +271,14 @@ enum PortalSettingsApplier {
             // value is already right — start() would still flip it.
             engine.portalEngineChoiceActive = true
             change(transcriptionKey, to: engineID)
+        }
+
+        if let model = settings.model, !model.isEmpty {
+            switch settings.engine {
+            case "whisperKit": change(whisperModelKey, to: model)
+            case "parakeet": change(parakeetModelKey, to: model)
+            default: break
+            }
         }
 
         if let kind = PortalJobSettings.diarizationKind(settings.diarization) {
@@ -312,6 +338,8 @@ enum PortalSettingsApplier {
         case transcriptionKey: return engine.transcriptionEngine.rawValue
         case diarizationKey: return engine.diarizationEngine.rawValue
         case languageKey: return engine.selectedLanguageCode ?? "auto"
+        case whisperModelKey: return engine.whisperModelName
+        case parakeetModelKey: return engine.parakeetModelName
         default: return nil
         }
     }
@@ -338,6 +366,10 @@ enum PortalSettingsApplier {
             if let k = DiarizationEngineKind(rawValue: value) { engine.diarizationEngine = k }
         case languageKey:
             engine.selectedLanguageCode = (value == "auto") ? nil : value
+        case whisperModelKey:
+            engine.whisperModelName = value
+        case parakeetModelKey:
+            engine.parakeetModelName = value
         default:
             break
         }
@@ -491,6 +523,9 @@ struct PortalStatusDTO: Encodable {
         let diarizers: [PortalOptionDTO]
         let languages: [PortalOptionDTO]
         let exportFormats: [PortalOptionDTO]
+        /// Engine id → models downloaded on the Mini. An engine with no
+        /// entry (or an empty list) can't be used from the portal.
+        let models: [String: [PortalOptionDTO]]
         let uploadExtensions: [String]
         let maxUploadBytes: Int64
         let chunkBytes: Int
@@ -498,6 +533,8 @@ struct PortalStatusDTO: Encodable {
     struct Defaults: Encodable {
         let mode: String
         let engine: String
+        /// Engine id → the Mini's currently selected model for it.
+        let models: [String: String]
         let diarization: String
         let language: String
         let expectedSpeakers: Int
@@ -522,6 +559,9 @@ struct PortalCreateJobBody: Decodable {
 struct PortalCreateUploadBody: Decodable {
     let filename: String
     let size: Int64
+    /// Optional here (required at finish): lets the server reject a bad
+    /// engine/model choice BEFORE a multi-gigabyte upload, not after.
+    let settings: PortalJobSettings?
 }
 
 struct PortalFinishUploadBody: Decodable {

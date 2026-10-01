@@ -2576,36 +2576,14 @@ struct SidebarView: View {
         return base + [engine.parakeetModelName]
     }
 
+    // Model labels live on TranscriptionEngine so the web portal shows
+    // the same names as these pickers.
     private func whisperDisplayName(_ raw: String) -> String {
-        switch raw {
-        case "openai_whisper-tiny.en":                          return "Tiny (English) — 39 MB"
-        case "openai_whisper-base.en":                          return "Base (English) — 74 MB"
-        case "openai_whisper-small.en":                         return "Small (English) — 244 MB"
-        case "openai_whisper-medium.en":                        return "Medium (English) — 769 MB ⚡ — Fastest"
-        case "openai_whisper-large-v3":                         return "Large v3 — 1.5 GB"
-        case "openai_whisper-large-v3-v20240930":               return "Large v3 (Sep 2024) — 1.5 GB"
-        case "openai_whisper-large-v3-v20240930_turbo":         return "Large v3 Turbo — 1.5 GB — Most accurate"
-        case "openai_whisper-large-v3-v20240930_turbo_632MB":   return "Large v3 Turbo (4-bit) — 632 MB — Balanced (recommended)"
-        default:
-            return raw.replacingOccurrences(of: "openai_whisper-", with: "")
-        }
+        TranscriptionEngine.displayName(forWhisperModel: raw)
     }
 
     private func parakeetDisplayName(_ raw: String) -> String {
-        // Strip the org prefix and decorate with rough size hints
-        let short = raw.replacingOccurrences(of: "mlx-community/", with: "")
-        switch raw {
-        case "mlx-community/parakeet-tdt_ctc-1.1b":    return "TDT-CTC 1.1B — Native PnC (recommended)"
-        case "mlx-community/parakeet-tdt-0.6b-v3":     return "TDT 0.6B v3 — Smaller, requires PnC restoration"
-        case "mlx-community/parakeet-tdt-0.6b-v2":     return "TDT 0.6B v2"
-        case "mlx-community/parakeet-tdt-1.1b":        return "TDT 1.1B — No PnC, slightly faster"
-        case "mlx-community/parakeet-tdt_ctc-110m":    return "TDT-CTC 110M (fastest)"
-        case "mlx-community/parakeet-ctc-0.6b":        return "CTC 0.6B"
-        case "mlx-community/parakeet-ctc-1.1b":        return "CTC 1.1B"
-        case "mlx-community/parakeet-rnnt-0.6b":       return "RNN-T 0.6B"
-        case "mlx-community/parakeet-rnnt-1.1b":       return "RNN-T 1.1B"
-        default: return short
-        }
+        TranscriptionEngine.displayName(forParakeetModel: raw)
     }
 
     private func diarizationShortName(_ kind: DiarizationEngineKind) -> String {

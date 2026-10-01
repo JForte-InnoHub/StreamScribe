@@ -92,6 +92,7 @@ final class PortalJobQueue: ObservableObject {
     private var sleepActivity: NSObjectProtocol?
     private var retentionTimer: Timer?
     private var didLoad = false
+    private var modelCache: (at: Date, models: [String: [PortalOptionDTO]])?
     /// Changes every launch; tells browsers to discard diff state.
     let epoch = UUID().uuidString
 
@@ -762,27 +763,83 @@ final class PortalJobQueue: ObservableObject {
                 modes: [.init(id: "auto", label: "Auto (detect live vs. recording)"),
                         .init(id: "live", label: "Live"),
                         .init(id: "static", label: "Recording (whole-file, best speaker labels)")],
-                engines: [.init(id: "auto", label: "Auto (WhisperKit for recordings, Parakeet for live)"),
-                          .init(id: "whisperKit", label: TranscriptionEngineKind.whisperKit.rawValue),
-                          .init(id: "parakeet", label: TranscriptionEngineKind.parakeet.rawValue)],
-                diarizers: [.init(id: "fluidAudio", label: DiarizationEngineKind.fluidAudio.rawValue),
-                            .init(id: "speakerKit", label: DiarizationEngineKind.speakerKit.rawValue),
-                            .init(id: "sortformer", label: DiarizationEngineKind.sortformer.rawValue),
-                            .init(id: "off", label: "Off (no speaker labels)")],
+                engines: [.init(id: "auto", label: "Auto"),
+                          .init(id: "whisperKit", label: "WhisperKit"),
+                          .init(id: "parakeet", label: "Parakeet"),
+                          .init(id: "canary", label: "Canary")],
+                // Short names, as in the Mac sidebar's compact labels.
+                diarizers: [.init(id: "fluidAudio", label: "FluidAudio"),
+                            .init(id: "speakerKit", label: "SpeakerKit"),
+                            .init(id: "sortformer", label: "Sortformer"),
+                            .init(id: "off", label: "Off")],
                 languages: languages,
                 exportFormats: formats.map { .init(id: $0.fileExtension, label: $0.rawValue) },
+                models: downloadedModels(),
                 uploadExtensions: Self.uploadExtensions,
                 maxUploadBytes: Self.maxUploadBytes,
                 chunkBytes: Self.uploadChunkBytes),
             defaults: .init(
                 mode: engine?.sessionMode.rawValue ?? "auto",
-                engine: engine.map { PortalJobSettings.id(for: $0.transcriptionEngine) } ?? "auto",
+                // Always Auto: the Mac's own engine field shows whatever the
+                // per-mode default last picked, which isn't a choice anyone made.
+                engine: "auto",
+                models: [
+                    "whisperKit": engine?.whisperModelName ?? TranscriptionEngine.defaultWhisperModel,
+                    "parakeet": engine?.parakeetModelName ?? TranscriptionEngine.defaultParakeetModel,
+                ],
                 diarization: engine.map { PortalJobSettings.id(for: $0.diarizationEngine) } ?? "fluidAudio",
                 language: engine?.selectedLanguageCode ?? "auto",
                 expectedSpeakers: TranscriptionEngine.expectedSpeakerCount,
                 liveFromStart: AudioStreamExtractor.liveFromStartEnabled,
                 cleanup: d.bool(forKey: TranscriptCleanupService.enabledKey)),
             epoch: epoch)
+    }
+
+    // MARK: - Model availability
+
+    /// Models on the Mini's disk, per engine. The portal only offers these:
+    /// starting a job on a missing model would try to download it mid-job
+    /// (and on the managed fleet, HuggingFace isn't reachable at all).
+    /// Cached for a minute — the probes walk the model folders, and
+    /// /api/status is polled every few seconds by every open page.
+    private func downloadedModels(forceRefresh: Bool = false) -> [String: [PortalOptionDTO]] {
+        if !forceRefresh, let cache = modelCache, Date().timeIntervalSince(cache.at) < 60 {
+            return cache.models
+        }
+        let whisper = TranscriptionEngine.availableWhisperModels
+            .filter { WhisperKitBackend.isModelCached(modelName: $0) }
+            .map { PortalOptionDTO(id: $0, label: TranscriptionEngine.displayName(forWhisperModel: $0)) }
+        let parakeet = TranscriptionEngine.availableParakeetModels
+            .filter { ParakeetBackend.isModelCached(modelRepo: $0) }
+            .map { PortalOptionDTO(id: $0, label: TranscriptionEngine.displayName(forParakeetModel: $0)) }
+        let canary = CanaryBackend.isModelCached()
+            ? [PortalOptionDTO(id: "canary-1b-v2", label: "Canary 1B v2 (int4) — 573 MB")]
+            : []
+        let models = ["whisperKit": whisper, "parakeet": parakeet, "canary": canary]
+        modelCache = (Date(), models)
+        return models
+    }
+
+    /// Refuse a job whose engine or model isn't on the Mini. "auto" always
+    /// passes: it uses the Mini's current model for whichever engine it picks.
+    private func modelProblem(_ settings: PortalJobSettings) -> String? {
+        guard settings.engine != "auto" else { return nil }
+        let models = downloadedModels(forceRefresh: true)[settings.engine] ?? []
+        let engineName: String
+        switch settings.engine {
+        case "whisperKit": engineName = "WhisperKit"
+        case "parakeet": engineName = "Parakeet"
+        case "canary": engineName = "Canary"
+        default: engineName = settings.engine
+        }
+        if models.isEmpty {
+            return "\(engineName) isn't downloaded on the Mac Mini. Pick another engine, or download it in StreamScribe on the Mini."
+        }
+        if settings.engine != "canary", let model = settings.model, !model.isEmpty,
+           !models.contains(where: { $0.id == model }) {
+            return "That \(engineName) model isn't downloaded on the Mac Mini."
+        }
+        return nil
     }
 
     private func jobDTO(_ job: PortalJob, _ who: PortalIdentity) -> PortalJobDTO {
@@ -816,7 +873,7 @@ final class PortalJobQueue: ObservableObject {
             return .error(400, "Expected {\"url\": \"https://…\"}")
         }
         let settings = body.settings ?? PortalJobSettings()
-        if let problem = settings.validationError() { return .error(422, problem) }
+        if let problem = settings.validationError() ?? modelProblem(settings) { return .error(422, problem) }
         let checked = Self.validateSubmittedURL(body.url)
         guard let url = checked.url else { return .error(422, checked.problem ?? "Invalid link") }
         let job = PortalJob(input: url.absoluteString, displaySource: url.absoluteString,
@@ -1089,6 +1146,10 @@ final class PortalJobQueue: ObservableObject {
             return .error(400, "Expected {\"filename\": \"…\", \"size\": 123}")
         }
         guard body.size > 0 else { return .error(422, "That file is empty") }
+        if let settings = body.settings,
+           let problem = settings.validationError() ?? modelProblem(settings) {
+            return .error(422, problem)
+        }
         guard body.size <= Self.maxUploadBytes else {
             return .error(413, "Files up to \(Self.maxUploadBytes / (1024 * 1024 * 1024)) GB are supported")
         }
@@ -1153,7 +1214,7 @@ final class PortalJobQueue: ObservableObject {
             return .json(["error": "Upload incomplete", "received": String(session.received)], status: 409)
         }
         let settings = request.decodeBody(PortalFinishUploadBody.self)?.settings ?? PortalJobSettings()
-        if let problem = settings.validationError() { return .error(422, problem) }
+        if let problem = settings.validationError() ?? modelProblem(settings) { return .error(422, problem) }
         uploads[id] = nil
 
         var job = PortalJob(input: session.fileURL.path, displaySource: session.originalName, isUpload: true,

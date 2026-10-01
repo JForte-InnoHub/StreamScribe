@@ -125,6 +125,13 @@ details.opts summary { cursor: pointer; font-weight: 600; font-size: 13.5px; col
 details.opts summary::before { content: "▸ "; }
 details.opts[open] summary::before { content: "▾ "; }
 .hint { font-size: 12.5px; color: var(--faint); margin-top: 4px; }
+.tabs.seg { margin-top: 2px; }
+.tabs.seg button { padding: 6px 4px; font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tabs.seg button:disabled { opacity: .4; cursor: not-allowed; }
+select:disabled { opacity: .6; }
+.check { display: flex; gap: 9px; align-items: flex-start; margin-top: 14px; font-size: 14px; cursor: pointer; }
+.check input { margin: 3px 0 0; width: 16px; height: 16px; flex: none; accent-color: var(--accent); }
+.check .hint { margin-top: 1px; }
 
 .drop {
   margin-top: 12px; border: 1.5px dashed var(--line); border-radius: var(--radius);
@@ -295,7 +302,8 @@ const S = {
   pollTimer: null,
   jobTimer: null,
   lastRenderKey: "",
-  formDraft: null
+  form: null,
+  formReady: false
 };
 
 // ---------- helpers ----------
@@ -433,6 +441,10 @@ async function refreshStatus() {
     S.status = st;
     banner(null);
     renderHeader();
+    if (!S.formReady) {
+      initForm();
+      if (S.view === "home") rebuildOptions();
+    }
   } catch (e) {
     if (e.network) banner(e.message);
   }
@@ -509,64 +521,163 @@ function optionSelect(id, options, value) {
   return sel;
 }
 
-function labelFor(list, id) {
-  const f = (list || []).find(function (o) { return o.id === id; });
-  return f ? f.label : id;
+const ENGINE_HINT = {
+  auto: "WhisperKit for recordings, Parakeet for live streams.",
+  whisperKit: "Accurate and multilingual. Best for recordings.",
+  parakeet: "Fastest, English only. Best for keeping up with live streams.",
+  canary: "Highest accuracy, multilingual, punctuated. Slower than Parakeet."
+};
+
+function downloaded(engine) {
+  const m = S.status && S.status.options.models ? S.status.options.models[engine] : null;
+  return m || [];
+}
+
+// Form state lives in S.form (not the DOM) so it survives re-renders: switching
+// Link/Upload, changing engine, or coming back from a job page.
+function initForm() {
+  const st = S.status;
+  const d = st ? st.defaults : null;
+  const prev = S.form;
+  const pickModel = function (engine) {
+    const list = downloaded(engine);
+    const want = d && d.models ? d.models[engine] : null;
+    if (want && list.some(function (o) { return o.id === want; })) return want;
+    return list.length ? list[0].id : null;
+  };
+  S.form = {
+    url: prev ? prev.url : "",
+    sourceType: d ? d.mode : "auto",
+    engine: "auto",
+    models: { whisperKit: pickModel("whisperKit"), parakeet: pickModel("parakeet") },
+    diarization: d ? d.diarization : "fluidAudio",
+    language: d ? d.language : "en",
+    expectedSpeakers: d && d.expectedSpeakers > 0 ? String(d.expectedSpeakers) : "",
+    liveFromStart: d ? !!d.liveFromStart : false,
+    cleanup: d ? !!d.cleanup : false,
+    optsOpen: prev ? prev.optsOpen : false,
+    advOpen: prev ? prev.advOpen : false
+  };
+  S.formReady = !!st;
+}
+
+function segmented(id, options, value, onPick, isDisabled) {
+  const wrap = h("div", { class: "tabs seg", id: id, role: "group" });
+  for (const o of options) {
+    const off = isDisabled ? isDisabled(o.id) : null;
+    wrap.appendChild(h("button", {
+      type: "button",
+      class: o.id === value ? "on" : "",
+      "aria-pressed": o.id === value ? "true" : "false",
+      disabled: !!off,
+      title: off || o.title || null,
+      text: o.label,
+      onclick: function () { onPick(o.id); }
+    }));
+  }
+  return wrap;
+}
+
+function modelControl() {
+  const f = S.form;
+  if (f.engine === "auto") {
+    const w = downloaded("whisperKit").find(function (o) { return o.id === f.models.whisperKit; });
+    const p = downloaded("parakeet").find(function (o) { return o.id === f.models.parakeet; });
+    return [
+      h("select", { id: "o-model", disabled: true }, h("option", { text: "Chosen with the engine" })),
+      h("div", { class: "hint", text: "Recordings: " + (w ? w.label : "WhisperKit default") + ". Live: " + (p ? p.label : "Parakeet default") + "." })
+    ];
+  }
+  const list = downloaded(f.engine);
+  if (f.engine === "canary") {
+    return [h("select", { id: "o-model" }, list.map(function (o) { return h("option", { value: o.id, text: o.label }); }))];
+  }
+  const sel = optionSelect("o-model", list, f.models[f.engine]);
+  sel.addEventListener("change", function (e) { f.models[f.engine] = e.target.value; });
+  return [sel, h("div", { class: "hint", text: "Only models already downloaded on the Mac Mini are listed." })];
 }
 
 function buildOptions() {
   const st = S.status;
   const o = st ? st.options : { modes: [], engines: [], diarizers: [], languages: [] };
-  const d = st ? st.defaults : null;
-  const dflt = function (txt) { return { id: "default", label: "Mac Mini default" + (txt ? " (" + txt + ")" : "") }; };
-  const yn = function (b) { return b ? "on" : "off"; };
+  if (!S.form) initForm();
+  const f = S.form;
 
-  const modeSel = optionSelect("o-mode", [dflt(d ? labelFor(o.modes, d.mode) : "")].concat(o.modes), "default");
-  const engineSel = optionSelect("o-engine", o.engines, "auto");
-  const diarSel = optionSelect("o-diar", [dflt(d ? labelFor(o.diarizers, d.diarization) : "")].concat(o.diarizers), "default");
-  const langSel = optionSelect("o-lang", [dflt(d ? labelFor(o.languages, d.language) : "")].concat(o.languages), "default");
-  const spk = h("input", { id: "o-spk", type: "number", min: "0", max: "60", placeholder: d ? (d.expectedSpeakers > 0 ? "Mac Mini default (" + d.expectedSpeakers + ")" : "Mac Mini default (any)") : "" });
-  const backlog = optionSelect("o-backlog", [dflt(d ? yn(d.liveFromStart) : ""), { id: "yes", label: "Yes — from the start of the broadcast" }, { id: "no", label: "No — join at the live edge" }], "default");
-  const cleanup = optionSelect("o-clean", [dflt(d ? yn(d.cleanup) : ""), { id: "yes", label: "On" }, { id: "no", label: "Off" }], "default");
+  const sourceTypes = [
+    { id: "auto", label: "Auto", title: "Detect live stream vs. recording" },
+    { id: "live", label: "Live" },
+    { id: "static", label: "Recording", title: "Whole-file processing: best speaker labels" }
+  ];
+  const engines = (o.engines && o.engines.length) ? o.engines : [{ id: "auto", label: "Auto" }];
 
-  return h("details", { class: "opts", id: "opts" }, [
+  const options = h("details", { class: "opts", id: "opts", open: f.optsOpen, ontoggle: function (e) { f.optsOpen = e.target.open; } }, [
     h("summary", { text: "Options" }),
-    h("label", { class: "f", for: "o-mode", text: "Source type" }), modeSel,
-    h("label", { class: "f", for: "o-engine", text: "Transcription engine" }), engineSel,
+    h("label", { class: "f", text: "Source type" }),
+    segmented("o-mode", sourceTypes, f.sourceType, function (v) { f.sourceType = v; rebuildOptions(); }),
+    h("label", { class: "f", text: "Transcription engine" }),
+    segmented("o-engine", engines, f.engine, function (v) { f.engine = v; rebuildOptions(); },
+      function (id) { return id !== "auto" && downloaded(id).length === 0 ? "Not downloaded on the Mac Mini" : null; }),
+    h("div", { class: "hint", text: ENGINE_HINT[f.engine] || "" }),
+    h("label", { class: "f", for: "o-model", text: "Model" })
+  ].concat(modelControl()));
+
+  const diarSel = optionSelect("o-diar", o.diarizers, f.diarization);
+  diarSel.addEventListener("change", function (e) { f.diarization = e.target.value; });
+  const spk = h("input", { id: "o-spk", type: "number", min: "0", max: "60", inputmode: "numeric", placeholder: "Any", value: f.expectedSpeakers,
+    oninput: function (e) { f.expectedSpeakers = e.target.value; } });
+  const langSel = optionSelect("o-lang", o.languages, f.language);
+  langSel.addEventListener("change", function (e) { f.language = e.target.value; });
+
+  const advanced = h("details", { class: "opts", id: "adv", open: f.advOpen, ontoggle: function (e) { f.advOpen = e.target.open; } }, [
+    h("summary", { text: "Advanced" }),
     h("div", { class: "row2" }, [
       h("div", null, [h("label", { class: "f", for: "o-diar", text: "Speaker labels" }), diarSel]),
       h("div", null, [h("label", { class: "f", for: "o-spk", text: "Expected speakers" }), spk])
     ]),
     h("div", { class: "hint", text: "Knowing how many people speak (e.g. a hearing roster) is the biggest single boost to speaker accuracy." }),
-    h("label", { class: "f", for: "o-lang", text: "Language (WhisperKit)" }), langSel,
-    h("label", { class: "f", for: "o-backlog", text: "Live streams: transcribe from the beginning?" }), backlog,
-    h("label", { class: "f", for: "o-clean", text: "AI cleanup pass" }), cleanup
+    h("label", { class: "f", for: "o-lang", text: "Language (WhisperKit only)" }), langSel,
+    h("label", { class: "check" }, [
+      h("input", { type: "checkbox", id: "o-backlog", checked: f.liveFromStart, onchange: function (e) { f.liveFromStart = e.target.checked; } }),
+      h("span", null, ["Live streams: transcribe from the beginning", h("div", { class: "hint", text: "Otherwise transcription starts at the live edge." })])
+    ]),
+    h("label", { class: "check" }, [
+      h("input", { type: "checkbox", id: "o-clean", checked: f.cleanup, onchange: function (e) { f.cleanup = e.target.checked; } }),
+      h("span", null, ["AI cleanup pass", h("div", { class: "hint", text: "Fixes filler, numerals and punctuation after transcription." })])
+    ])
   ]);
+  return h("div", { id: "optsWrap" }, [options, advanced]);
+}
+
+function rebuildOptions() {
+  const old = $("optsWrap");
+  if (old) old.replaceWith(buildOptions());
 }
 
 function readSettings() {
-  const val = function (id) { const el = $(id); return el ? el.value : "default"; };
-  const tri = function (id) { const v = val(id); return v === "yes" ? true : (v === "no" ? false : null); };
+  const f = S.form;
   const s = {
-    mode: val("o-mode"),
-    engine: val("o-engine") || "auto",
-    diarization: val("o-diar"),
-    language: val("o-lang")
+    mode: f.sourceType,
+    engine: f.engine,
+    diarization: f.diarization,
+    language: f.language,
+    expectedSpeakers: Math.max(0, Math.min(60, parseInt(f.expectedSpeakers, 10) || 0)),
+    liveFromStart: f.liveFromStart,
+    cleanup: f.cleanup
   };
-  const spk = $("o-spk") ? $("o-spk").value.trim() : "";
-  if (spk !== "") s.expectedSpeakers = Math.max(0, Math.min(60, parseInt(spk, 10) || 0));
-  const b = tri("o-backlog"); if (b !== null) s.liveFromStart = b;
-  const c = tri("o-clean"); if (c !== null) s.cleanup = c;
+  if ((f.engine === "whisperKit" || f.engine === "parakeet") && f.models[f.engine]) s.model = f.models[f.engine];
   return s;
 }
 
 function renderHome() {
   const view = $("view");
   view.textContent = "";
+  if (!S.form) initForm();
 
   const urlPane = h("div", { id: "pane-url", class: S.mode === "url" ? "" : "hidden" }, [
     h("label", { class: "f", for: "url", text: "Link" }),
-    h("input", { id: "url", type: "url", placeholder: "https://www.youtube.com/watch?v=…", autocomplete: "off", onkeydown: function (e) { if (e.key === "Enter") submit(); } }),
+    h("input", { id: "url", type: "url", placeholder: "https://www.youtube.com/watch?v=…", autocomplete: "off", value: S.form ? S.form.url : "",
+      oninput: function (e) { if (S.form) S.form.url = e.target.value; },
+      onkeydown: function (e) { if (e.key === "Enter") submit(); } }),
     h("div", { class: "hint", text: "YouTube, House/Senate hearings, state legislatures, X, podcasts, direct audio/video links…" })
   ]);
 
@@ -591,7 +702,9 @@ function renderHome() {
     h("button", { class: S.mode === "file" ? "on" : "", text: "Upload a file", onclick: function () { setMode("file"); } })
   ]);
 
-  const newCard = h("section", { class: "card sticky" }, [
+  // Not sticky: with Options and Advanced open the form is taller than a
+  // laptop screen, and a pinned card that tall hides its own Transcribe button.
+  const newCard = h("section", { class: "card" }, [
     h("div", { class: "hd" }, h("h2", { text: "New transcript" })),
     h("div", { class: "bd" }, [
       tabs, urlPane, upPane, buildOptions(),
@@ -610,7 +723,6 @@ function renderHome() {
   ]);
 
   view.appendChild(h("div", { class: "grid-home" }, [newCard, listCard]));
-  if (S.formDraft) restoreDraft();
   renderJobs();
 }
 
@@ -621,21 +733,7 @@ function dropContent() {
   return [h("strong", { text: "Choose an audio or video file" }), h("div", { class: "hint", text: "or drag it here · up to 10 GB" })];
 }
 
-function saveDraft() {
-  const ids = ["url", "o-mode", "o-engine", "o-diar", "o-lang", "o-spk", "o-backlog", "o-clean"];
-  const d = {};
-  for (const id of ids) { const el = $(id); if (el) d[id] = el.value; }
-  d.open = $("opts") ? $("opts").open : false;
-  S.formDraft = d;
-}
-function restoreDraft() {
-  const d = S.formDraft;
-  for (const id of Object.keys(d)) { const el = $(id); if (el && id !== "open") el.value = d[id]; }
-  if (d.open && $("opts")) $("opts").open = true;
-}
-
 function setMode(m) {
-  saveDraft();
   S.mode = m;
   renderHome();
 }
@@ -662,13 +760,12 @@ async function submit() {
       const url = $("url").value.trim();
       if (!url) { toast("Paste a link first."); return; }
       const job = await api("/api/jobs", { method: "POST", json: { url: url, settings: settings } });
-      S.formDraft = null;
+      S.form.url = "";
       location.hash = "#/job/" + job.id;
     } else {
       if (!S.file) { toast("Choose a file first."); return; }
       const job = await upload(S.file, settings);
       S.file = null;
-      S.formDraft = null;
       location.hash = "#/job/" + job.id;
     }
   } catch (e) {
@@ -694,7 +791,7 @@ async function upload(file, settings) {
   };
   let uploadId = null;
   try {
-    const created = await api("/api/uploads", { method: "POST", json: { filename: file.name, size: file.size } });
+    const created = await api("/api/uploads", { method: "POST", json: { filename: file.name, size: file.size, settings: settings } });
     uploadId = created.uploadId;
     const chunk = parseInt(created.chunkBytes, 10) || (16 * 1024 * 1024);
     let offset = 0;
