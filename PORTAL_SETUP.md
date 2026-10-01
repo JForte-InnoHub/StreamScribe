@@ -57,17 +57,29 @@ Dashboard route (simplest):
 
 ## 4. Protect it with Cloudflare Access — do this before sharing the link
 
-1. **Zero Trust → Access → Applications → Add an application → Self-hosted.**
-2. Application domain: the same hostname (`transcripts.yourdomain.com`), no path.
-3. Session duration: something like 1 week, so people aren't asked for a code constantly.
-4. Add a policy named *Team*, action **Allow**, include **Emails** (list people) or **Emails ending in** `@yourcompany.com`.
-5. Login method: **One-time PIN** (emailed code; no accounts to manage).
+New Zero Trust accounts sign people in with a **Cloudflare account** by default, so the login page asks for a Cloudflare email and password. The emailed-code method (One-time PIN) has to be added first, then chosen for this application.
+
+**4a. Turn on One-time PIN** (once per account)
+
+1. **Zero Trust → Integrations → Identity providers → Add new identity provider → One-time PIN.**
+2. It saves immediately; there is nothing to configure.
+
+**4b. Create the application**
+
+1. **Zero Trust → Access controls → Applications → Create new application → Self-hosted and private → Add public hostname.**
+2. Hostname: the same one the tunnel uses (`transcripts.yourdomain.com`), no path.
+3. **Access policies:** create a policy named *Team*, action **Allow**, with an **Include** rule of **Emails ending in** `@yourcompany.com`. Add more domains, or **Emails** for individual outside addresses, in the same rule.
+4. **Login methods:** turn off **Accept all available identity providers**, tick only **One-time PIN**, and turn on **Apply instant authentication**. Users then go straight to the "enter your email" box instead of a list of login choices.
+5. **Session duration:** something like 1 week, so people aren't asked for a code constantly.
+6. **Create**.
+
+Codes are only emailed to addresses the policy allows. Anyone else sees the same "check your email" screen but never receives a code, so the page doesn't reveal who has access. The code comes from Cloudflare's notification address. If a corporate mail filter quarantines it, ask IT to allow that sender.
 
 **Fail-safe:** if a request reaches the portal through Cloudflare *without* an Access identity (for example, the Access application is missing or its hostname has a typo), the portal refuses it with *"This portal must be reached through Cloudflare Access."* Seeing that message means Access isn't covering the hostname yet.
 
 ## 5. Check it end to end
 
-- Open the hostname on a phone off Wi-Fi. You should get Cloudflare's sign-in page, then the portal, with your email in the top-right corner.
+- Open the hostname in a private window, or on a phone off Wi-Fi. You should see Cloudflare's "enter your email" page (not a Cloudflare account login). Enter an allowed address, type in the emailed code, and the portal should load with your email in the top-right corner.
 - Submit a link, open the job, rename a speaker, pin a quote, and download a .docx.
 - Upload a file larger than 100 MB. Uploads are sent in 16 MB pieces because Cloudflare rejects any single request over 100 MB. An interrupted piece is retried automatically.
 
