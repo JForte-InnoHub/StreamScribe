@@ -1516,6 +1516,11 @@ final class TranscriptionEngine: ObservableObject {
         // until the pipeline's natural-end branch confirms the cache
         // file is on disk.
         playbackMediaURL = nil
+        // A previous session that ended on its own (not via Stop) can still
+        // have its video download running; stop() is the only other place
+        // that cancels it. Left alone, it lands after this session started
+        // and republishes the OLD video as this session's playback media.
+        VideoCacheDownloader.shared.cancel()
         MediaCacheManager.clearAll()
 
         // Per-session silence diagnostics — these are app-lifetime

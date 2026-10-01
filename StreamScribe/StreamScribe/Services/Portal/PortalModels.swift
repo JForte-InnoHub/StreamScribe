@@ -181,6 +181,11 @@ struct PortalJob: Codable, Identifiable {
     /// token that says "the engine is still holding this transcript".
     var engineSession: Int?
     var stoppedBy: String?
+    /// Browser-playable copy of the job's media on the Mini, for the web
+    /// player and clips. Optional so job files saved before this existed load.
+    var mediaPath: String?
+    /// preparing | ready | unavailable (nil = not attempted yet)
+    var mediaState: String?
 
     init(id: UUID = UUID(), input: String, displaySource: String, isUpload: Bool,
          uploadDirectory: String?, settings: PortalJobSettings, submittedBy: String) {
@@ -487,6 +492,8 @@ struct PortalJobDTO: Encodable {
     let canManage: Bool
     /// True while the Mac is still holding this transcript (edits sync both ways).
     let live: Bool
+    /// Web player: preparing | ready | unavailable, or nil when not applicable yet.
+    let media: String?
     let settings: PortalJobSettings
 }
 
@@ -529,6 +536,7 @@ struct PortalStatusDTO: Encodable {
         /// Engine id → the model a portal download would fetch for it, and
         /// that download's state when one is running or has failed.
         let downloads: [String: PortalDownloadDTO]
+        let speakerPlacements: [PortalOptionDTO]
         let uploadExtensions: [String]
         let maxUploadBytes: Int64
         let chunkBytes: Int
@@ -538,6 +546,9 @@ struct PortalStatusDTO: Encodable {
         let engine: String
         /// Engine id → the Mini's currently selected model for it.
         let models: [String: String]
+        /// The Mac's Settings → Transcript Export values, used as each
+        /// browser's starting export options.
+        let export: PortalExportOptionsDTO
         let diarization: String
         let language: String
         let expectedSpeakers: Int
@@ -594,6 +605,15 @@ struct PortalProbeDTO: Encodable {
     /// e.g. "YouTube", "U.S. Senate", "HLS Stream"
     let source: String?
     let message: String?
+}
+
+struct PortalExportOptionsDTO: Encodable {
+    let timestamps: Bool
+    let bold: Bool
+    let placement: String
+    let title: Bool
+    let source: Bool
+    let generated: Bool
 }
 
 struct PortalDownloadDTO: Encodable {

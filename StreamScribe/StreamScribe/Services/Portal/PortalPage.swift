@@ -258,6 +258,27 @@ select:disabled { opacity: .6; }
 }
 .hidden { display: none !important; }
 
+/* Web miniplayer: pinned above the transcript while you scroll it. */
+.player { position: sticky; top: 62px; z-index: 15; margin-bottom: 14px; overflow: hidden; }
+.player video { display: block; width: 100%; max-height: 42vh; background: #000; }
+.player.audio video { height: 54px; background: var(--panel-2); }
+.player .pc { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 8px 12px; font-size: 13px; color: var(--muted); }
+.player .pc select { width: auto; padding: 4px 8px; font-size: 13px; }
+.player .pc label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+.player .pc .grow { flex: 1; }
+.player-note { padding: 12px 14px; font-size: 13.5px; color: var(--muted); }
+.seg.now { background: var(--accent-soft); box-shadow: inset 0 -2px 0 var(--accent); }
+.block .time.seek { cursor: pointer; }
+.block .time.seek:hover { color: var(--accent); text-decoration: underline; }
+.pinrow .pa { display: flex; gap: 10px; margin-top: 4px; font-size: 12.5px; }
+.pinrow .pa button { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font-weight: 600; }
+.exp { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); max-width: 560px; }
+.exp .row2 { margin-top: 2px; }
+.exp .check { margin-top: 8px; }
+.exp select { width: auto; max-width: 100%; }
+.exp .foot { display: flex; gap: 12px; align-items: center; margin-top: 12px; font-size: 12.5px; color: var(--faint); flex-wrap: wrap; }
+.exp .foot button { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: 12.5px; }
+
 /* Speaker colours: same palette order and hash as the Mac app's SpeakerPanel,
    so a speaker is the same colour on the Mac and on the web. */
 .c0 { --spk: #007aff; } .c1 { --spk: #9a3fcb; } .c2 { --spk: #c45f00; } .c3 { --spk: #d6204a; }
@@ -273,6 +294,8 @@ select:disabled { opacity: .6; }
 
 @media (max-width: 900px) {
   .grid-home, .grid-job { grid-template-columns: minmax(0, 1fr); }
+  .player { top: 52px; }
+  .player video { max-height: 30vh; }
   .sticky { position: static; }
   main { padding: 14px; }
   .who { display: none; }
@@ -284,6 +307,8 @@ select:disabled { opacity: .6; }
   .wide { display: none; }
   .brand small { display: none; }
   .row2 { grid-template-columns: 1fr; }
+  .actionbar #actionText { display: none; }
+  .actionbar { padding: 8px; gap: 6px; }
   .transcript { padding: 4px 12px 14px; }
 }
 </style>
@@ -302,7 +327,9 @@ select:disabled { opacity: .6; }
 </main>
 <div class="actionbar hidden" id="actionbar">
   <span id="actionText">1 segment selected</span>
+  <button class="btn sm hidden" id="playSelBtn">Play from here</button>
   <button class="btn sm" id="pinSelBtn">Pin quote</button>
+  <button class="btn sm hidden" id="clipSelBtn">Clip</button>
   <button class="btn sm" id="clearSelBtn">Cancel</button>
 </div>
 <div class="toast hidden" id="toast"></div>
@@ -333,7 +360,11 @@ const S = {
   form: null,
   formReady: false,
   probe: null,
-  probeTimer: null
+  probeTimer: null,
+  followPlay: true,
+  nowSeg: null,
+  expOpen: false,
+  exportPrefs: null
 };
 
 // ---------- helpers ----------
@@ -532,7 +563,7 @@ function route() {
     S.view = "job";
     S.jobId = m[1].toUpperCase();
     S.job = null; S.epoch = ""; S.rev = 0; S.segs = new Map(); S.order = []; S.speakers = []; S.pins = [];
-    S.follow = true; S.lastRenderKey = "";
+    S.follow = true; S.lastRenderKey = ""; S.nowSeg = null;
     renderJobShell();
     pollJob();
   } else {
@@ -1064,6 +1095,7 @@ function renderJobShell() {
     h("div", { class: "job-meta", id: "jobMeta" }),
     h("div", { id: "jobProg" }),
     h("div", { class: "actions", id: "jobActions" }),
+    h("div", { id: "expWrap" }),
     h("div", { class: "msg", id: "jobMsg" })
   ]);
   const transcriptCard = h("section", { class: "card" }, [
@@ -1087,7 +1119,8 @@ function renderJobShell() {
     ])
   ]);
   view.appendChild(head);
-  view.appendChild(h("div", { class: "grid-job" }, [transcriptCard, h("div", { class: "sticky" }, side)]));
+  const playerSlot = h("div", { id: "playerSlot" });
+  view.appendChild(h("div", { class: "grid-job" }, [h("div", null, [playerSlot, transcriptCard]), h("div", { class: "sticky" }, side)]));
 }
 
 function stopJobPolling() {
@@ -1192,14 +1225,19 @@ function renderJobHead() {
     act.appendChild(h("button", { class: "btn primary", text: "Download", onclick: function () {
       const f = $("fmt").value;
       try { localStorage.setItem("ss.fmt", f); } catch (e) {}
-      window.location.href = "/api/jobs/" + j.id + "/export?format=" + encodeURIComponent(f);
+      window.location.href = exportURL(j.id, f);
     } }));
+    act.appendChild(h("button", { class: "btn", id: "expBtn", "aria-expanded": S.expOpen ? "true" : "false", text: "Export options",
+      onclick: function () { S.expOpen = !S.expOpen; renderExportPanel(); } }));
   }
   if (isTerminal(j.status)) {
     act.appendChild(h("button", { class: "btn", text: "Run again", onclick: retryJob }));
     if (j.canManage) act.appendChild(h("button", { class: "btn danger", text: "Delete", onclick: deleteJob }));
   }
   }
+
+  renderExportPanel();
+  renderPlayer();
 
   const msg = $("jobMsg");
   let m = j.message || "";
@@ -1208,6 +1246,169 @@ function renderJobHead() {
   msg.textContent = m;
   msg.className = "msg" + (j.status === "failed" || j.status === "interrupted" ? " bad" : "");
   $("followWrap").classList.toggle("hidden", !isOnEngine(j.status));
+}
+
+// ---------- web miniplayer ----------
+function playerReady() { return !!(S.job && S.job.media === "ready" && $("player")); }
+
+function renderPlayer() {
+  const slot = $("playerSlot");
+  const j = S.job;
+  if (!slot || !j) return;
+  const want = j.media === "ready" ? "ready:" + j.id
+    : j.media === "preparing" ? "preparing"
+    : (isOnEngine(j.status) || j.status === "queued") ? "later" : "none";
+  if (slot.getAttribute("data-state") === want) return;   // never rebuild a playing player
+  slot.setAttribute("data-state", want);
+  slot.textContent = "";
+  if (want === "preparing") {
+    slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "Preparing playback on the Mac Mini…"));
+  } else if (want === "later") {
+    slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "Playback will be available here when this transcript finishes."));
+  } else if (want.indexOf("ready:") === 0) {
+    const video = h("video", { id: "player", controls: true, preload: "metadata", playsinline: true, src: "/api/jobs/" + j.id + "/media" });
+    const card = h("section", { class: "card player", id: "playerCard" }, [
+      video,
+      h("div", { class: "pc" }, [
+        h("label", null, ["Speed",
+          (function () {
+            const sel = optionSelect("speed", [0.75, 1, 1.25, 1.5, 1.75, 2].map(function (r) { return { id: String(r), label: r + "×" }; }), "1");
+            sel.addEventListener("change", function (e) { video.playbackRate = parseFloat(e.target.value); });
+            return sel;
+          })()]),
+        h("span", { class: "grow" }),
+        h("label", null, [
+          h("input", { type: "checkbox", id: "followPlay", checked: S.followPlay, onchange: function (e) { S.followPlay = e.target.checked; } }),
+          "Follow playback"
+        ])
+      ])
+    ]);
+    video.addEventListener("loadedmetadata", function () {
+      // Audio-only media: no picture area, just the control bar.
+      if (!video.videoWidth) card.classList.add("audio");
+    });
+    video.addEventListener("timeupdate", onPlayerTime);
+    video.addEventListener("seeked", onPlayerTime);
+    video.addEventListener("error", function () {
+      slot.setAttribute("data-state", "error");
+      slot.textContent = "";
+      slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "This browser can't play the recording. The transcript and downloads still work."));
+    });
+    slot.appendChild(card);
+    // Seek links and pin buttons depend on the player existing.
+    renderTranscript();
+    renderPins();
+  }
+}
+
+function onPlayerTime() {
+  const v = $("player");
+  if (!v) return;
+  const t = v.currentTime + 0.15;
+  let now = null;
+  for (const id of S.order) {
+    const s = S.segs.get(id);
+    if (!s) continue;
+    if (s.start <= t) now = id; else break;
+  }
+  if (now === S.nowSeg) return;
+  const prev = S.nowSeg ? document.querySelector('.seg[data-id="' + S.nowSeg + '"]') : null;
+  if (prev) prev.classList.remove("now");
+  S.nowSeg = now;
+  const el = now ? document.querySelector('.seg[data-id="' + now + '"]') : null;
+  if (!el) return;
+  el.classList.add("now");
+  if (S.followPlay && !v.paused) {
+    const r = el.getBoundingClientRect();
+    const card = $("playerCard");
+    const top = card ? card.getBoundingClientRect().bottom + 8 : 70;
+    if (r.top < top || r.bottom > window.innerHeight - 20) {
+      const y = window.scrollY + r.top - top - Math.max(0, (window.innerHeight - top) / 3);
+      window.scrollTo({ top: y, behavior: "smooth" });
+    }
+  }
+}
+
+function playFrom(t) {
+  const v = $("player");
+  if (!v || !isFinite(t)) return;
+  v.currentTime = Math.max(0, t - 0.25);
+  const p = v.play();
+  if (p && p.catch) p.catch(function () {});
+  const card = $("playerCard");
+  if (card && card.getBoundingClientRect().top < 0) card.scrollIntoView({ block: "start" });
+}
+
+function downloadClip(start, end) {
+  if (!S.job) return;
+  const a = Math.max(0, start - 1), b = end + 1;
+  if (b - a > 15 * 60) { toast("Clips can be up to 15 minutes long."); return; }
+  toast("Preparing the clip on the Mac Mini…");
+  window.location.href = "/api/jobs/" + S.job.id + "/clip?start=" + a.toFixed(2) + "&end=" + b.toFixed(2);
+}
+
+// ---------- export options ----------
+// Start from the Mac Mini's Settings → Transcript Export; each browser keeps
+// its own changes.
+const EXPORT_KEYS = ["timestamps", "bold", "placement", "title", "source", "generated"];
+
+function exportPrefs() {
+  if (S.exportPrefs) return S.exportPrefs;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem("ss.exportPrefs") || "null"); } catch (e) {}
+  const d = S.status && S.status.defaults.export ? S.status.defaults.export : null;
+  const base = d ? Object.assign({}, d) : { timestamps: true, bold: true, placement: "above", title: true, source: true, generated: true };
+  S.exportPrefs = saved ? Object.assign(base, saved) : base;
+  return S.exportPrefs;
+}
+
+function saveExportPrefs() {
+  try { localStorage.setItem("ss.exportPrefs", JSON.stringify(S.exportPrefs)); } catch (e) {}
+}
+
+function exportURL(jobId, format) {
+  const p = exportPrefs();
+  const q = ["format=" + encodeURIComponent(format)];
+  const b = function (v) { return v ? "1" : "0"; };
+  q.push("ts=" + b(p.timestamps), "bold=" + b(p.bold), "placement=" + encodeURIComponent(p.placement),
+         "title=" + b(p.title), "source=" + b(p.source), "generated=" + b(p.generated));
+  return "/api/jobs/" + jobId + "/export?" + q.join("&");
+}
+
+function renderExportPanel() {
+  const wrap = $("expWrap");
+  if (!wrap) return;
+  const btn = $("expBtn");
+  if (btn) btn.setAttribute("aria-expanded", S.expOpen ? "true" : "false");
+  const show = S.expOpen && !!$("fmt");
+  if (!show) { wrap.textContent = ""; return; }
+  if (wrap.firstChild) return;   // already open; keep the user's focus
+  const p = exportPrefs();
+  const box = function (key, label) {
+    return h("label", { class: "check" }, [
+      h("input", { type: "checkbox", checked: !!p[key], onchange: function (e) { p[key] = e.target.checked; saveExportPrefs(); } }),
+      h("span", { text: label })
+    ]);
+  };
+  const placements = S.status ? S.status.options.speakerPlacements : [{ id: "above", label: "Above each segment" }];
+  const place = optionSelect("o-place", placements, p.placement);
+  place.addEventListener("change", function (e) { p.placement = e.target.value; saveExportPrefs(); });
+  wrap.appendChild(h("div", { class: "exp" }, [
+    h("div", { class: "row2" }, [
+      h("div", null, [box("timestamps", "Include timestamps"), box("bold", "Bold speaker labels")]),
+      h("div", null, [box("title", "Include title"), box("source", "Include source link"), box("generated", "Include date generated")])
+    ]),
+    h("label", { class: "f", for: "o-place", text: "Speaker label placement" }), place,
+    h("div", { class: "foot" }, [
+      h("span", { text: "Saved in this browser. Subtitle (.srt, .vtt) and JSON downloads ignore these." }),
+      h("button", { type: "button", text: "Reset to the Mac Mini's settings", onclick: function () {
+        try { localStorage.removeItem("ss.exportPrefs"); } catch (e) {}
+        S.exportPrefs = null;
+        wrap.textContent = "";
+        renderExportPanel();
+      } })
+    ])
+  ]));
 }
 
 function shortURL(u) {
@@ -1244,7 +1445,8 @@ function renderTranscript(firstLoad) {
       block = h("div", { class: "block" }, [
         h("div", { class: "who2" }, [
           h("span", { class: "name " + speakerClass(s.speaker), text: nameFor(s.speaker) }),
-          h("span", { class: "time", text: fmtTime(s.start) })
+          h("span", { class: "time" + (playerReady() ? " seek" : ""), "data-t": String(s.start),
+            title: playerReady() ? "Play from here" : null, text: fmtTime(s.start) })
         ]),
         para
       ]);
@@ -1256,6 +1458,7 @@ function renderTranscript(firstLoad) {
     if (pinned.has(s.id)) cls += " pinned";
     if (S.selected === s.id) cls += " sel";
     if (s.review) cls += " review";
+    if (S.nowSeg === s.id) cls += " now";
     para.appendChild(h("span", {
       class: cls, "data-id": s.id,
       title: fmtTime(s.start) + (s.review ? " · flagged for review (too garbled to clean up)" : ""),
@@ -1271,6 +1474,8 @@ function renderTranscript(firstLoad) {
 function scrollToEnd() { window.scrollTo(0, document.body.scrollHeight); }
 
 document.addEventListener("click", function (e) {
+  const t = e.target.closest ? e.target.closest(".time.seek") : null;
+  if (t && S.view === "job") { playFrom(parseFloat(t.getAttribute("data-t"))); return; }
   const seg = e.target.closest ? e.target.closest(".seg") : null;
   if (!seg || S.view !== "job") return;
   const id = seg.getAttribute("data-id");
@@ -1287,8 +1492,19 @@ function updateActionbar() {
   const isPinned = S.pins.some(function (p) { return p.segmentId === S.selected; });
   $("actionText").textContent = s ? (nameFor(s.speaker) + " · " + fmtTime(s.start)) : "Selected";
   $("pinSelBtn").textContent = isPinned ? "Unpin" : "Pin quote";
+  $("playSelBtn").classList.toggle("hidden", !playerReady());
+  $("clipSelBtn").classList.toggle("hidden", !playerReady());
   bar.classList.remove("hidden");
 }
+
+$("playSelBtn").addEventListener("click", function () {
+  const s = S.segs.get(S.selected);
+  if (s) playFrom(s.start);
+});
+$("clipSelBtn").addEventListener("click", function () {
+  const s = S.segs.get(S.selected);
+  if (s) downloadClip(s.start, s.end);
+});
 
 $("clearSelBtn").addEventListener("click", function () {
   S.selected = null;
@@ -1372,7 +1588,11 @@ function renderPins() {
         p.keyword ? h("span", { text: "· keyword: " + p.keyword }) : null,
         h("button", { class: "x", title: "Remove pin", text: "×", onclick: function () { unpin(p.id); } })
       ]),
-      h("div", { class: "pt", text: p.text, onclick: function () { jumpTo(p.segmentId); } })
+      h("div", { class: "pt", text: p.text, onclick: function () { jumpTo(p.segmentId); } }),
+      playerReady() ? h("div", { class: "pa" }, [
+        h("button", { type: "button", text: "▶ Play", onclick: function () { playFrom(p.start); } }),
+        h("button", { type: "button", text: "Download clip", onclick: function () { downloadClip(p.start, p.end); } })
+      ]) : null
     ]));
   }
 }

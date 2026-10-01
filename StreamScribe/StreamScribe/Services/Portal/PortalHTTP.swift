@@ -51,10 +51,51 @@ nonisolated struct PortalHTTPRequest: Sendable {
 
 // MARK: - Response
 
+/// A byte range of a file on disk, streamed after the response head instead
+/// of being held in memory (media can be gigabytes).
+nonisolated struct PortalFileBody: Sendable {
+    let url: URL
+    let offset: Int64
+    let length: Int64
+}
+
+nonisolated enum PortalByteRange: Equatable {
+    case full
+    case partial(start: Int64, end: Int64)   // inclusive
+    case unsatisfiable
+
+    /// Parse a `Range` header against a file of `size` bytes. Single ranges
+    /// only ("bytes=0-499", "bytes=500-", "bytes=-500"); anything else is
+    /// served whole, which RFC 9110 permits.
+    static func parse(_ header: String?, size: Int64) -> PortalByteRange {
+        guard let header = header?.trimmingCharacters(in: .whitespaces),
+              header.lowercased().hasPrefix("bytes=") else { return .full }
+        let spec = header.dropFirst("bytes=".count).trimmingCharacters(in: .whitespaces)
+        guard !spec.contains(",") else { return .full }
+        let parts = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return .full }
+        let a = parts[0].trimmingCharacters(in: .whitespaces)
+        let b = parts[1].trimmingCharacters(in: .whitespaces)
+        guard size > 0 else { return .unsatisfiable }
+        if a.isEmpty {
+            // Suffix range: the last N bytes.
+            guard let n = Int64(b), n > 0 else { return .unsatisfiable }
+            return .partial(start: max(0, size - n), end: size - 1)
+        }
+        guard let start = Int64(a), start >= 0 else { return .full }
+        guard start < size else { return .unsatisfiable }
+        if b.isEmpty { return .partial(start: start, end: size - 1) }
+        guard let end = Int64(b), end >= start else { return .full }
+        return .partial(start: start, end: min(end, size - 1))
+    }
+}
+
 nonisolated struct PortalHTTPResponse: Sendable {
     var status: Int
     var headers: [(String, String)] = []
     var body: Data = Data()
+    /// When set, the body is streamed from this file range and `body` is ignored.
+    var file: PortalFileBody? = nil
 
     /// Non-finite doubles are encoded as strings rather than throwing — a NaN
     /// duration must never take the whole response down. A fresh encoder per
@@ -112,6 +153,15 @@ nonisolated struct PortalHTTPResponse: Sendable {
     /// and percent-encoded for the RFC 5987 `filename*` form, so a title with
     /// quotes, newlines or non-Latin characters can't break the header.
     static func attachment(_ data: Data, filename: String, contentType: String) -> PortalHTTPResponse {
+        PortalHTTPResponse(
+            status: 200,
+            headers: [("Content-Type", contentType),
+                      ("Cache-Control", "no-store"),
+                      ("Content-Disposition", contentDisposition(filename))],
+            body: data)
+    }
+
+    static func contentDisposition(_ filename: String) -> String {
         let ascii = String(filename.unicodeScalars.map { scalar -> Character in
             let v = scalar.value
             if v < 0x20 || v > 0x7E || scalar == "\"" || scalar == "\\" || scalar == ";" { return "_" }
@@ -120,15 +170,43 @@ nonisolated struct PortalHTTPResponse: Sendable {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         let encoded = filename.addingPercentEncoding(withAllowedCharacters: allowed) ?? ascii
-        return PortalHTTPResponse(
-            status: 200,
-            headers: [("Content-Type", contentType),
-                      ("Cache-Control", "no-store"),
-                      ("Content-Disposition", "attachment; filename=\"\(ascii)\"; filename*=UTF-8''\(encoded)")],
-            body: data)
+        return "attachment; filename=\"\(ascii)\"; filename*=UTF-8''\(encoded)"
+    }
+
+    /// Serve a file (or the requested byte range of it) from disk, streamed.
+    /// `downloadName` nil = play inline; otherwise save-as with that name.
+    static func file(_ url: URL, contentType: String, rangeHeader: String?,
+                     downloadName: String? = nil) -> PortalHTTPResponse {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.int64Value else {
+            return .error(404, "That file is no longer on the Mac Mini")
+        }
+        var headers: [(String, String)] = [
+            ("Content-Type", contentType),
+            ("Accept-Ranges", "bytes"),
+            ("Cache-Control", "private, max-age=3600"),
+        ]
+        if let downloadName { headers.append(("Content-Disposition", contentDisposition(downloadName))) }
+        switch PortalByteRange.parse(rangeHeader, size: size) {
+        case .full:
+            return PortalHTTPResponse(status: 200, headers: headers,
+                                      file: PortalFileBody(url: url, offset: 0, length: size))
+        case .partial(let start, let end):
+            headers.append(("Content-Range", "bytes \(start)-\(end)/\(size)"))
+            return PortalHTTPResponse(status: 206, headers: headers,
+                                      file: PortalFileBody(url: url, offset: start, length: end - start + 1))
+        case .unsatisfiable:
+            return PortalHTTPResponse(status: 416, headers: [("Content-Range", "bytes */\(size)")])
+        }
     }
 
     func serialized() -> Data {
+        var out = serializedHead(contentLength: Int64(body.count))
+        out.append(body)
+        return out
+    }
+
+    func serializedHead(contentLength: Int64) -> Data {
         var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\n"
         for (name, value) in headers {
             // Defense in depth against header injection from any computed value.
@@ -136,21 +214,20 @@ nonisolated struct PortalHTTPResponse: Sendable {
                 .replacingOccurrences(of: "\n", with: " ")
             head += "\(name): \(clean)\r\n"
         }
-        head += "Content-Length: \(body.count)\r\n"
+        head += "Content-Length: \(contentLength)\r\n"
         head += "Connection: close\r\n"
         head += "X-Content-Type-Options: nosniff\r\n"
         head += "Referrer-Policy: no-referrer\r\n"
         head += "X-Frame-Options: DENY\r\n"
         head += "\r\n"
-        var out = Data(head.utf8)
-        out.append(body)
-        return out
+        return Data(head.utf8)
     }
 
     static func reason(_ status: Int) -> String {
         switch status {
         case 100: return "Continue"
         case 200: return "OK"
+        case 206: return "Partial Content"
         case 201: return "Created"
         case 204: return "No Content"
         case 400: return "Bad Request"
@@ -161,6 +238,7 @@ nonisolated struct PortalHTTPResponse: Sendable {
         case 411: return "Length Required"
         case 413: return "Payload Too Large"
         case 415: return "Unsupported Media Type"
+        case 416: return "Range Not Satisfiable"
         case 422: return "Unprocessable Entity"
         case 410: return "Gone"
         case 431: return "Request Header Fields Too Large"
@@ -546,6 +624,10 @@ nonisolated final class PortalConnection: @unchecked Sendable {
     private var finished = false
     private var sentContinue = false
     private var timeoutItem: DispatchWorkItem?
+    /// Closes a response stream whose reader has stopped reading (a paused
+    /// video tab that went away without resetting the connection).
+    private var stallItem: DispatchWorkItem?
+    private static let stallTimeout: TimeInterval = 120
 
     var onClose: (() -> Void)?
 
@@ -609,17 +691,84 @@ nonisolated final class PortalConnection: @unchecked Sendable {
 
     private func dispatch(_ request: PortalHTTPRequest) {
         let handler = self.handler
+        let isHead = request.method == "HEAD"
         Task {
             let response = await handler(request)
-            self.queue.async { self.respond(response) }
+            self.queue.async { self.respond(response, headOnly: isHead) }
         }
     }
 
-    private func respond(_ response: PortalHTTPResponse) {
+    private func respond(_ response: PortalHTTPResponse, headOnly: Bool = false) {
         guard !finished else { return }
         timeoutItem?.cancel()
-        connection.send(content: response.serialized(), completion: .contentProcessed { [weak self] _ in
-            self?.close()
+        guard let file = response.file else {
+            let data = headOnly
+                ? response.serializedHead(contentLength: Int64(response.body.count))
+                : response.serialized()
+            connection.send(content: data, completion: .contentProcessed { [weak self] _ in
+                self?.close()
+            })
+            return
+        }
+        let head = response.serializedHead(contentLength: file.length)
+        if headOnly {
+            connection.send(content: head, completion: .contentProcessed { [weak self] _ in self?.close() })
+            return
+        }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: file.url)
+            try handle.seek(toOffset: UInt64(file.offset))
+        } catch {
+            respond(.error(404, "That file is no longer on the Mac Mini"))
+            return
+        }
+        armStallTimer()
+        connection.send(content: head, completion: .contentProcessed { [weak self] error in
+            guard let self, error == nil else { try? handle.close(); self?.close(); return }
+            self.queue.async { self.streamFile(handle, remaining: file.length) }
+        })
+    }
+
+    private func armStallTimer() {
+        stallItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, !self.finished else { return }
+            print("[Portal] Closing a stalled download (no progress in \(Int(Self.stallTimeout))s).")
+            self.close()
+        }
+        stallItem = item
+        queue.asyncAfter(deadline: .now() + Self.stallTimeout, execute: item)
+    }
+
+    /// Send the file in 512 KB pieces, each after the previous one has been
+    /// handed to the network stack, so memory stays flat and a client that
+    /// goes away (a seek abandons the old request) stops the reads promptly.
+    /// The per-request timeout was cancelled in respond(): it guards requests
+    /// that never finish ARRIVING, not long downloads.
+    private func streamFile(_ handle: FileHandle, remaining: Int64) {
+        guard !finished, remaining > 0 else {
+            try? handle.close()
+            close()
+            return
+        }
+        let data: Data
+        do {
+            data = try handle.read(upToCount: Int(min(remaining, 512 * 1024))) ?? Data()
+        } catch {
+            try? handle.close()
+            close()
+            return
+        }
+        guard !data.isEmpty else {
+            try? handle.close()
+            close()
+            return
+        }
+        armStallTimer()
+        connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            guard let self, error == nil else { try? handle.close(); self?.close(); return }
+            self.queue.async { self.streamFile(handle, remaining: remaining - Int64(data.count)) }
         })
     }
 
@@ -627,6 +776,7 @@ nonisolated final class PortalConnection: @unchecked Sendable {
         guard !finished else { return }
         finished = true
         timeoutItem?.cancel()
+        stallItem?.cancel()
         connection.cancel()
         onClose?()
         onClose = nil

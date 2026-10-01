@@ -93,6 +93,10 @@ final class PortalJobQueue: ObservableObject {
     private var retentionTimer: Timer?
     private var didLoad = false
     private var modelCache: (at: Date, models: [String: [PortalOptionDTO]])?
+    /// Bumped whenever a job's media is set, so a conversion that finishes
+    /// after a newer file was chosen (the video landing mid-remux) is dropped
+    /// instead of reverting the job to audio and deleting the video.
+    private var mediaGeneration: [UUID: Int] = [:]
     private var probeCache: [String: (at: Date, result: PortalProbeDTO)] = [:]
     private var probesInFlight: [String: Task<PortalProbeDTO, Never>] = [:]
     /// At most this many link checks run at once (each is a yt-dlp or ffmpeg
@@ -143,6 +147,12 @@ final class PortalJobQueue: ObservableObject {
         engine.$sessionStartedAt
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.checkAttachment() }
+            .store(in: &cancellables)
+        // Static sessions download the video separately; when it lands after
+        // the transcript finished, upgrade the job's audio-only snapshot.
+        engine.$playbackMediaURL
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] url in self?.handlePlaybackMediaChange(url) }
             .store(in: &cancellables)
         // A download finishing (from the portal or the Mac sidebar) changes
         // what the portal can offer — drop the cached model list.
@@ -393,6 +403,11 @@ final class PortalJobQueue: ObservableObject {
         }
         update(job, saveNow: true)
         print("[Portal] Job \(id.uuidString.prefix(8)) \(job.status.rawValue) (\(job.segments.count) segments).")
+        if job.isUpload {
+            prepareUploadMedia(id)
+        } else {
+            snapshotEngineMedia(id)
+        }
         pump()
     }
 
@@ -517,6 +532,9 @@ final class PortalJobQueue: ObservableObject {
     }
     private static var jobsDirectory: URL { rootDirectory.appendingPathComponent("jobs") }
     private static var uploadsDirectory: URL { rootDirectory.appendingPathComponent("uploads") }
+    private static var mediaDirectory: URL { rootDirectory.appendingPathComponent("media") }
+    private static var clipsDirectory: URL { rootDirectory.appendingPathComponent("clips") }
+    private static func mediaFolder(_ id: UUID) -> URL { mediaDirectory.appendingPathComponent(id.uuidString) }
 
     private static func jobFile(_ id: UUID) -> URL {
         jobsDirectory.appendingPathComponent("\(id.uuidString).json")
@@ -581,12 +599,36 @@ final class PortalJobQueue: ObservableObject {
         }
         jobs = loaded.sorted { $0.createdAt < $1.createdAt }
         for job in jobs where job.status == .interrupted { saveNow(job.id) }
+        // A media conversion cut off by a quit: uploads can be redone from
+        // the upload; a URL job's source cache is gone, so it has no player.
+        for job in jobs where job.mediaState == "preparing" {
+            if job.isUpload {
+                prepareUploadMedia(job.id)
+            } else if let path = job.mediaPath, FileManager.default.fileExists(atPath: path) {
+                var j = job
+                j.mediaState = "ready"
+                update(j, saveNow: true)
+            } else {
+                // The remux works from a copy in the job's own folder, which
+                // survives a quit — redo it rather than giving up.
+                let folder = Self.mediaFolder(job.id)
+                let source = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil))?
+                    .first { $0.lastPathComponent.hasPrefix("session-source.") }
+                if let source {
+                    convertMedia(job.id, input: source, output: folder.appendingPathComponent("session.mp4"),
+                                 transcode: false, deleteInputAfter: true)
+                } else {
+                    markMediaUnavailable(job.id)
+                }
+            }
+        }
         print("[Portal] Loaded \(jobs.count) job(s); \(jobs.filter { $0.status == .queued }.count) queued.")
     }
 
     private func deleteJobFiles(_ job: PortalJob) {
         let fm = FileManager.default
         try? fm.removeItem(at: Self.jobFile(job.id))
+        try? fm.removeItem(at: Self.mediaFolder(job.id))
         if let dir = job.uploadDirectory,
            !jobs.contains(where: { $0.id != job.id && $0.uploadDirectory == dir }) {
             try? fm.removeItem(at: URL(fileURLWithPath: dir))
@@ -594,6 +636,7 @@ final class PortalJobQueue: ObservableObject {
     }
 
     private func applyRetention() {
+        cleanupOldClips()
         let d = UserDefaults.standard
         let days = d.object(forKey: Self.retentionDaysKey) == nil
             ? Self.defaultRetentionDays : d.integer(forKey: Self.retentionDaysKey)
@@ -736,7 +779,11 @@ final class PortalJobQueue: ObservableObject {
             let since = Int(request.query["since"] ?? "") ?? 0
             return transcriptResponse(job, since: since, clientEpoch: request.query["epoch"] ?? "", who: who)
         case ("GET", "export"):
-            return exportResponse(job, format: request.query["format"] ?? "docx")
+            return exportResponse(job, request)
+        case ("GET", "media"), ("HEAD", "media"):
+            return mediaResponse(job, request)
+        case ("GET", "clip"):
+            return await clipResponse(job, request)
         case ("POST", "stop"):
             return stopJob(job, who)
         case ("POST", "retry"):
@@ -793,6 +840,7 @@ final class PortalJobQueue: ObservableObject {
                 exportFormats: formats.map { .init(id: $0.fileExtension, label: $0.rawValue) },
                 models: downloadedModels(),
                 downloads: downloadStates(),
+                speakerPlacements: SpeakerPlacement.allCases.map { PortalOptionDTO(id: $0.rawValue, label: $0.displayName) },
                 uploadExtensions: Self.uploadExtensions,
                 maxUploadBytes: Self.maxUploadBytes,
                 chunkBytes: Self.uploadChunkBytes),
@@ -805,6 +853,12 @@ final class PortalJobQueue: ObservableObject {
                     "whisperKit": engine?.whisperModelName ?? TranscriptionEngine.defaultWhisperModel,
                     "parakeet": engine?.parakeetModelName ?? TranscriptionEngine.defaultParakeetModel,
                 ],
+                export: {
+                    let o = Self.macExportOptions()
+                    return PortalExportOptionsDTO(timestamps: o.includeTimestamps, bold: o.speakerLabelsBold,
+                                                  placement: o.speakerPlacement.rawValue, title: o.includeTitle,
+                                                  source: o.includeSource, generated: o.includeGenerated)
+                }(),
                 diarization: engine.map { PortalJobSettings.id(for: $0.diarizationEngine) } ?? "fluidAudio",
                 language: engine?.selectedLanguageCode ?? "auto",
                 expectedSpeakers: TranscriptionEngine.expectedSpeakerCount,
@@ -1014,6 +1068,7 @@ final class PortalJobQueue: ObservableObject {
             queuePosition: position,
             canManage: canManage(job, who),
             live: isAttached(job),
+            media: job.mediaState,
             settings: job.settings)
     }
 
@@ -1225,7 +1280,42 @@ final class PortalJobQueue: ObservableObject {
                                          order: order, segments: segments, speakers: speakers, pins: pins))
     }
 
-    private func exportResponse(_ job: PortalJob, format id: String) -> PortalHTTPResponse {
+    /// The Mac's Settings → Transcript Export values (same defaults as ContentView).
+    static func macExportOptions() -> ExportOptions {
+        let d = UserDefaults.standard
+        func pref(_ key: String, _ fallback: Bool) -> Bool {
+            d.object(forKey: key) == nil ? fallback : d.bool(forKey: key)
+        }
+        return ExportOptions(
+            includeTimestamps: pref("export.includeTimestamps", true),
+            speakerLabelsBold: pref("export.speakerLabelsBold", true),
+            speakerPlacement: SpeakerPlacement(rawValue: d.string(forKey: "export.speakerPlacement") ?? "") ?? .above,
+            includeTitle: pref("export.includeTitle", true),
+            includeSource: pref("export.includeSource", true),
+            includeGenerated: pref("export.includeGenerated", true))
+    }
+
+    /// Export options for one download: the Mac's settings, overridden by any
+    /// the browser sent (?ts=&bold=&placement=&title=&source=&generated=).
+    static func exportOptions(from query: [String: String]) -> ExportOptions {
+        var o = macExportOptions()
+        func flag(_ key: String) -> Bool? {
+            guard let v = query[key]?.lowercased() else { return nil }
+            if ["1", "true", "yes", "on"].contains(v) { return true }
+            if ["0", "false", "no", "off"].contains(v) { return false }
+            return nil
+        }
+        if let v = flag("ts") { o.includeTimestamps = v }
+        if let v = flag("bold") { o.speakerLabelsBold = v }
+        if let p = query["placement"].flatMap(SpeakerPlacement.init(rawValue:)) { o.speakerPlacement = p }
+        if let v = flag("title") { o.includeTitle = v }
+        if let v = flag("source") { o.includeSource = v }
+        if let v = flag("generated") { o.includeGenerated = v }
+        return o
+    }
+
+    private func exportResponse(_ job: PortalJob, _ request: PortalHTTPRequest) -> PortalHTTPResponse {
+        let id = request.query["format"] ?? "docx"
         if isAttached(job) { syncAttached() }
         let current = self.job(job.id) ?? job
         guard let format = TranscriptFormat.allCases.first(where: { $0.fileExtension == id.lowercased() }) else {
@@ -1239,17 +1329,7 @@ final class PortalJobQueue: ObservableObject {
             if let name = current.displayName(for: seg.speaker) { copy.speaker = name }
             return copy
         }
-        let d = UserDefaults.standard
-        func pref(_ key: String, _ fallback: Bool) -> Bool {
-            d.object(forKey: key) == nil ? fallback : d.bool(forKey: key)
-        }
-        let options = ExportOptions(
-            includeTimestamps: pref("export.includeTimestamps", true),
-            speakerLabelsBold: pref("export.speakerLabelsBold", true),
-            speakerPlacement: SpeakerPlacement(rawValue: d.string(forKey: "export.speakerPlacement") ?? "") ?? .above,
-            includeTitle: pref("export.includeTitle", true),
-            includeSource: pref("export.includeSource", true),
-            includeGenerated: pref("export.includeGenerated", true))
+        let options = Self.exportOptions(from: request.query)
 
         let data: Data?
         if format.isBinary {
@@ -1286,6 +1366,256 @@ final class PortalJobQueue: ObservableObject {
         name = name.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
         if name.count > 100 { name = String(name.prefix(100)).trimmingCharacters(in: .whitespaces) }
         return name.isEmpty ? "transcript" : name
+    }
+
+    // MARK: - Playback media (web player + clips)
+    //
+    // The Mac's media cache is wiped at every Start, so a finished job's media
+    // is copied into Portal/media/<job id>/ — an APFS clone, so instant and
+    // no extra disk until either copy changes. Everything served to browsers
+    // is MP4 (H.264/AAC, the same settings the Mac's video cache uses) or
+    // MP3/M4A, which every browser plays.
+
+    /// Upload formats browsers play as-is. (WAV is excluded on purpose: clips
+    /// are stream copies into MP4, which can't hold PCM.)
+    private static let browserReadyExtensions: Set<String> = ["mp4", "m4a", "mp3", "aac"]
+
+    private func handlePlaybackMediaChange(_ url: URL?) {
+        guard let url, url == MediaCacheManager.videoDownloadFileURL,
+              let id = attachedJobID, let job = job(id), job.status.isTerminal, !job.isUpload else { return }
+        snapshotEngineMedia(id)
+    }
+
+    /// Copy the Mac's playback file for a finished URL job into the job's
+    /// folder. session-video.mp4 is used as-is; the session's own cache
+    /// (current.mp4, written progressively by the transcription pipe) is
+    /// remuxed to a regular faststart MP4 so browsers can seek in it.
+    private func snapshotEngineMedia(_ id: UUID) {
+        guard let engine, var job = job(id) else { return }
+        let fm = FileManager.default
+        guard let src = engine.playbackMediaURL, src.isFileURL, fm.fileExists(atPath: src.path) else {
+            if job.mediaPath == nil {
+                job.mediaState = "unavailable"
+                update(job, saveNow: true)
+            }
+            return
+        }
+        let isVideoCache = (src == MediaCacheManager.videoDownloadFileURL)
+        let folder = Self.mediaFolder(id)
+        let clone = folder.appendingPathComponent((isVideoCache ? "video" : "session") + "-source." + (src.pathExtension.isEmpty ? "mp4" : src.pathExtension))
+        // Already have the video (the engine re-publishes the same URL at
+        // finalize): nothing to do. The audio-only snapshot never short-
+        // circuits this, so the video always replaces it when it lands.
+        if isVideoCache, job.mediaPath == clone.path, job.mediaState == "ready" { return }
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            if fm.fileExists(atPath: clone.path) { try fm.removeItem(at: clone) }
+            try fm.copyItem(at: src, to: clone)   // APFS: a clone, effectively instant
+        } catch {
+            print("[Portal] Couldn't copy playback media for job \(id.uuidString.prefix(8)): \(error.localizedDescription)")
+            if job.mediaPath == nil {
+                job.mediaState = "unavailable"
+                update(job, saveNow: true)
+            }
+            return
+        }
+        if isVideoCache {
+            setMedia(id, to: clone)
+        } else {
+            if job.mediaPath == nil {
+                job.mediaState = "preparing"
+                update(job, saveNow: true)
+            }
+            let out = folder.appendingPathComponent("session.mp4")
+            convertMedia(id, input: clone, output: out, transcode: false, deleteInputAfter: true)
+        }
+    }
+
+    /// Uploads: browser-ready formats are served straight from the upload;
+    /// MOV/M4V are remuxed (no re-encode); anything else is converted once.
+    private func prepareUploadMedia(_ id: UUID) {
+        guard var job = job(id), job.isUpload else { return }
+        let input = URL(fileURLWithPath: job.input)
+        guard FileManager.default.fileExists(atPath: input.path) else {
+            job.mediaState = "unavailable"
+            update(job, saveNow: true)
+            return
+        }
+        let ext = input.pathExtension.lowercased()
+        if Self.browserReadyExtensions.contains(ext) {
+            setMedia(id, to: input)
+            return
+        }
+        job.mediaState = "preparing"
+        update(job, saveNow: true)
+        let out = Self.mediaFolder(id).appendingPathComponent("upload.mp4")
+        try? FileManager.default.createDirectory(at: Self.mediaFolder(id), withIntermediateDirectories: true)
+        convertMedia(id, input: input, output: out, transcode: !["mov", "m4v"].contains(ext), deleteInputAfter: false)
+    }
+
+    private func setMedia(_ id: UUID, to url: URL) {
+        mediaGeneration[id, default: 0] += 1
+        guard var job = job(id) else { return }
+        let old = job.mediaPath
+        job.mediaPath = url.path
+        job.mediaState = "ready"
+        update(job, saveNow: true)
+        // Drop a superseded copy (e.g. the audio-only snapshot once the video
+        // lands) — but never anything outside this job's media folder.
+        if let old, old != url.path, old.hasPrefix(Self.mediaFolder(id).path) {
+            try? FileManager.default.removeItem(atPath: old)
+        }
+    }
+
+    /// Remux (stream copy) or transcode `input` into a faststart MP4 off the
+    /// main thread. A failed remux falls back to a transcode; a failed
+    /// transcode leaves the job without a player rather than retrying forever.
+    private func convertMedia(_ id: UUID, input: URL, output: URL, transcode: Bool, deleteInputAfter: Bool) {
+        guard let ffmpeg = ToolManager.shared.ffmpegPath else {
+            print("[Portal] ffmpeg unavailable — no web player for job \(id.uuidString.prefix(8)).")
+            if deleteInputAfter { setMedia(id, to: input) } else { markMediaUnavailable(id) }
+            return
+        }
+        let generation = mediaGeneration[id, default: 0]
+        Task {
+            var ok = await Self.runFFmpeg(ffmpeg, Self.mediaArguments(input: input, output: output, transcode: transcode))
+            if !ok && !transcode && self.mediaGeneration[id, default: 0] == generation {
+                print("[Portal] Remux failed for job \(id.uuidString.prefix(8)); converting instead.")
+                ok = await Self.runFFmpeg(ffmpeg, Self.mediaArguments(input: input, output: output, transcode: true))
+            }
+            guard self.mediaGeneration[id, default: 0] == generation else {
+                // Superseded while converting (e.g. the video arrived).
+                try? FileManager.default.removeItem(at: output)
+                if deleteInputAfter { try? FileManager.default.removeItem(at: input) }
+                return
+            }
+            if ok {
+                if deleteInputAfter { try? FileManager.default.removeItem(at: input) }
+                self.setMedia(id, to: output)
+                print("[Portal] Web player media ready for job \(id.uuidString.prefix(8)).")
+            } else if deleteInputAfter {
+                // Keep the untouched copy: some browsers will still play it.
+                self.setMedia(id, to: input)
+            } else {
+                self.markMediaUnavailable(id)
+            }
+        }
+    }
+
+    private func markMediaUnavailable(_ id: UUID) {
+        guard var job = job(id) else { return }
+        job.mediaState = "unavailable"
+        update(job, saveNow: true)
+    }
+
+    /// `0:V` (capital) skips cover-art pictures, as everywhere else in the app.
+    private static func mediaArguments(input: URL, output: URL, transcode: Bool) -> [String] {
+        var args = ["-hide_banner", "-nostdin", "-nostats", "-loglevel", "error", "-y",
+                    "-i", input.path, "-map", "0:V:0?", "-map", "0:a:0?"]
+        if transcode {
+            args += ["-c:v", "h264_videotoolbox", "-b:v", "1500k", "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-b:a", "128k"]
+        } else {
+            args += ["-c", "copy"]
+        }
+        args += ["-movflags", "+faststart", output.path]
+        return args
+    }
+
+    /// Run ffmpeg to completion. stderr is discarded (kept short by
+    /// -loglevel error anyway) so a long conversion can't fill a pipe and hang.
+    private nonisolated static func runFFmpeg(_ ffmpeg: String, _ args: [String]) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: ffmpeg)
+            proc.arguments = args
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            proc.terminationHandler = { p in
+                let out = args.last.map { URL(fileURLWithPath: $0) }
+                let size = out.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? NSNumber }?.int64Value ?? 0
+                continuation.resume(returning: p.terminationStatus == 0 && size > 0)
+            }
+            do {
+                try proc.run()
+            } catch {
+                continuation.resume(returning: false)
+            }
+        }
+    }
+
+    private static func mimeType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "mp4", "m4v": return "video/mp4"
+        case "m4a": return "audio/mp4"
+        case "mp3": return "audio/mpeg"
+        case "aac": return "audio/aac"
+        case "wav": return "audio/wav"
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "mkv": return "video/x-matroska"
+        default: return "application/octet-stream"
+        }
+    }
+
+    private func mediaResponse(_ job: PortalJob, _ request: PortalHTTPRequest) -> PortalHTTPResponse {
+        guard job.mediaState == "ready", let path = job.mediaPath else {
+            return .error(404, "Playback isn't available for this transcript")
+        }
+        let url = URL(fileURLWithPath: path)
+        return .file(url, contentType: Self.mimeType(for: url), rangeHeader: request.header("range"))
+    }
+
+    /// A downloadable clip of the job's media. Clips are kept in
+    /// Portal/clips and swept after an hour.
+    private func clipResponse(_ job: PortalJob, _ request: PortalHTTPRequest) async -> PortalHTTPResponse {
+        guard job.mediaState == "ready", let path = job.mediaPath else {
+            return .error(404, "Playback isn't available for this transcript")
+        }
+        guard let start = Double(request.query["start"] ?? ""), let end = Double(request.query["end"] ?? ""),
+              start.isFinite, end.isFinite, start >= 0, end > start else {
+            return .error(400, "Expected ?start=&end= in seconds")
+        }
+        guard end - start <= 15 * 60 else { return .error(422, "Clips can be up to 15 minutes long") }
+        guard let ffmpeg = ToolManager.shared.ffmpegPath else {
+            return .error(503, "ffmpeg isn't available on the Mac Mini")
+        }
+        cleanupOldClips()
+        // Same cut as the Mac's ClipExporter.exportSpan (stream copy, so it
+        // snaps to the keyframe before `start`), plus the -map pair used
+        // everywhere else: an MP3/M4A upload's cover art is an image stream
+        // that "-c copy" into MP4 would reject. Written straight to
+        // Portal/clips rather than the Mini's ~/Movies.
+        let dest = Self.clipsDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+        try? FileManager.default.createDirectory(at: Self.clipsDirectory, withIntermediateDirectories: true)
+        let args = ["-hide_banner", "-nostdin", "-nostats", "-loglevel", "error", "-y",
+                    "-ss", String(format: "%.2f", start), "-i", path,
+                    "-t", String(format: "%.2f", end - start),
+                    "-map", "0:V:0?", "-map", "0:a:0?", "-c", "copy",
+                    "-movflags", "+faststart", dest.path]
+        guard await Self.runFFmpeg(ffmpeg, args) else {
+            try? FileManager.default.removeItem(at: dest)
+            return .error(500, "The clip couldn't be cut from this recording")
+        }
+        func stamp(_ t: Double) -> String {
+            let s = Int(t)
+            return s >= 3600 ? String(format: "%dh%02dm%02ds", s / 3600, (s % 3600) / 60, s % 60)
+                             : String(format: "%dm%02ds", s / 60, s % 60)
+        }
+        let base = Self.safeFilename(job.title ?? "transcript")
+        return .file(dest, contentType: "video/mp4", rangeHeader: nil,
+                     downloadName: "\(base) clip \(stamp(start))–\(stamp(end)).mp4")
+    }
+
+    private func cleanupOldClips() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: Self.clipsDirectory,
+                                                      includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        let cutoff = Date().addingTimeInterval(-3600)
+        for f in files {
+            let modified = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if modified < cutoff { try? fm.removeItem(at: f) }
+        }
     }
 
     // MARK: - Endpoints: uploads (chunked, resumable)
