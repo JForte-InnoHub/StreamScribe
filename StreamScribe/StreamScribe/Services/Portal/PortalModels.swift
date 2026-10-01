@@ -577,6 +577,22 @@ struct PortalPinBody: Decodable {
     let segmentId: String
 }
 
+struct PortalProbeBody: Decodable {
+    let url: String
+}
+
+/// Result of checking a pasted link before submitting it.
+struct PortalProbeDTO: Encodable {
+    let url: String
+    /// recording | live | failed | busy
+    let kind: String
+    let durationSeconds: Double?
+    let title: String?
+    /// e.g. "YouTube", "U.S. Senate", "HLS Stream"
+    let source: String?
+    let message: String?
+}
+
 struct PortalPauseBody: Decodable {
     let paused: Bool
 }

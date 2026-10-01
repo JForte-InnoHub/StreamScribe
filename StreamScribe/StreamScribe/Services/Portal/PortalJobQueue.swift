@@ -93,6 +93,13 @@ final class PortalJobQueue: ObservableObject {
     private var retentionTimer: Timer?
     private var didLoad = false
     private var modelCache: (at: Date, models: [String: [PortalOptionDTO]])?
+    private var probeCache: [String: (at: Date, result: PortalProbeDTO)] = [:]
+    private var probesInFlight: [String: Task<PortalProbeDTO, Never>] = [:]
+    /// At most this many link checks run at once (each is a yt-dlp or ffmpeg
+    /// process). Every one is a request from the Mini's IP — the same IP a
+    /// running YouTube job depends on — so they are kept few and cached.
+    private static let maxConcurrentProbes = 2
+    private static let probeCacheSeconds: TimeInterval = 600
     /// Changes every launch; tells browsers to discard diff state.
     let epoch = UUID().uuidString
 
@@ -695,6 +702,8 @@ final class PortalJobQueue: ObservableObject {
             return .dto(statusDTO(who))
         case ("POST", 1) where r[0] == "uploads":
             return createUpload(request, who)
+        case ("POST", 1) where r[0] == "probe":
+            return await probeLink(request)
         case ("POST", 3) where r[0] == "uploads":
             guard let id = UUID(uuidString: r[1]) else { return .error(404, "Unknown upload") }
             switch r[2] {
@@ -793,6 +802,67 @@ final class PortalJobQueue: ObservableObject {
                 liveFromStart: AudioStreamExtractor.liveFromStartEnabled,
                 cleanup: d.bool(forKey: TranscriptCleanupService.enabledKey)),
             epoch: epoch)
+    }
+
+    // MARK: - Link check (probe before submitting)
+
+    /// Check a pasted link the way the Mac's URL field does — live vs
+    /// recording, duration, title, or why it can't be read — WITHOUT using
+    /// the engine's probe. That probe is a single shared slot (beginProbe
+    /// cancels the previous one, and start() reuses its cached duration),
+    /// so web users checking links would cancel the Mac's own probe or the
+    /// one the dispatcher runs just before starting a job.
+    /// `TranscriptionEngine.probeForPortal` runs the same resolution and
+    /// per-source strategy with no shared state, so any number can overlap
+    /// with each other and with a running session. Identical links share
+    /// one in-flight check and a 10-minute cache.
+    private func probeLink(_ request: PortalHTTPRequest) async -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalProbeBody.self) else {
+            return .error(400, "Expected {\"url\": \"https://…\"}")
+        }
+        let checked = Self.validateSubmittedURL(body.url)
+        guard let url = checked.url else { return .error(422, checked.problem ?? "Invalid link") }
+        let key = url.absoluteString
+
+        if let cached = probeCache[key], Date().timeIntervalSince(cached.at) < Self.probeCacheSeconds {
+            return .dto(cached.result)
+        }
+        if let running = probesInFlight[key] {
+            return .dto(await running.value)
+        }
+        guard probesInFlight.count < Self.maxConcurrentProbes else {
+            return .dto(PortalProbeDTO(url: key, kind: "busy", durationSeconds: nil, title: nil,
+                                       source: nil, message: "Other links are being checked; retrying shortly."))
+        }
+
+        let task = Task { () -> PortalProbeDTO in
+            let result = await TranscriptionEngine.probeForPortal(url: url)
+            switch result.kind {
+            case .recording(let seconds):
+                return PortalProbeDTO(url: key, kind: "recording", durationSeconds: seconds, title: result.title,
+                                      source: result.source.rawValue, message: nil)
+            case .live:
+                return PortalProbeDTO(url: key, kind: "live", durationSeconds: nil, title: result.title,
+                                      source: result.source.rawValue, message: nil)
+            case .failed(let reason):
+                return PortalProbeDTO(url: key, kind: "failed", durationSeconds: nil, title: result.title,
+                                      source: result.source.rawValue, message: reason)
+            }
+        }
+        probesInFlight[key] = task
+        let dto = await task.value
+        probesInFlight[key] = nil
+        // Failures aren't cached: they're often transient (network, a stream
+        // that hasn't started yet), and a retry should actually retry.
+        if dto.kind != "failed" {
+            probeCache[key] = (Date(), dto)
+            if probeCache.count > 200 {
+                let cutoff = Date().addingTimeInterval(-Self.probeCacheSeconds)
+                probeCache = probeCache.filter { $0.value.at > cutoff }
+            }
+        }
+        print("[Portal] Link check \(dto.kind)\(dto.durationSeconds.map { String(format: " %.0fs", $0) } ?? ""): \(key)")
+        return .dto(dto)
     }
 
     // MARK: - Model availability

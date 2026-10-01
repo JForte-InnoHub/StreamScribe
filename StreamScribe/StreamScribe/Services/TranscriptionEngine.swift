@@ -7968,224 +7968,7 @@ final class TranscriptionEngine: ObservableObject {
             // strategy is captured by `source` — it's stable for the task's
             // lifetime since urlString changes cancel the task before
             // assigning a new one.
-            let probeResult: ProbeOutcome
-            let probedTitle: String?
-            if source == .senateGov {
-                // Senate.gov: resolve to m3u8 + title via our own extractor,
-                // then duration-probe the m3u8 with ffmpeg (sub-second).
-                // Total ~500 ms-1 s vs ~6-9 s for yt-dlp + fallback. On
-                // extractor failure, fall through to yt-dlp — same as
-                // AudioStreamExtractor does for the download path.
-                do {
-                    let resolved = try await SenateGovExtractor.resolve(url: url)
-                    probedTitle = resolved.title
-                    if resolved.isLive {
-                        // type=live on the ISVP URL — no need to probe
-                        // duration; we know it's a live stream.
-                        probeResult = .live
-                    } else {
-                        // Archived hearing. Probe the m3u8 for duration
-                        // — ffmpeg reads the manifest header in <1 s.
-                        //
-                        // Try the primary URL first, then fall through to
-                        // the alternatives if it fails. Older archived
-                        // content sometimes lives on a different CDN
-                        // (msl3archive instead of media-srs, or legacy
-                        // akamaihd paths) than current live streams. The
-                        // extractor produces all viable candidates in
-                        // `alternativeURLs` (primary first, then backups);
-                        // we try each until one returns a finite duration.
-                        var ff: FFmpegProbeResult = .failed("no candidates")
-                        let candidates = resolved.alternativeURLs.isEmpty
-                            ? [resolved.m3u8URL]
-                            : resolved.alternativeURLs
-                        for (idx, candidate) in candidates.enumerated() {
-                            ff = await Self.probeRemoteDurationViaFFmpeg(url: candidate)
-                            if case .finite = ff {
-                                if idx > 0 {
-                                    print("[Probe] U.S. Senate: primary m3u8 unreachable; alternative \(idx) (\(candidate.host ?? "?")) succeeded.")
-                                }
-                                break
-                            }
-                            if case .live = ff { break } // explicit live signal — no point continuing
-                        }
-                        switch ff {
-                        case .finite(let s): probeResult = .finite(s)
-                        case .live:          probeResult = .live
-                        case .failed:
-                            // All m3u8 alternatives failed ffmpeg probe.
-                            // Two possibilities:
-                            //   1. Network/firewall blocking the akamaized/akamaihd
-                            //      CDNs (corporate proxy, captive portal).
-                            //   2. Archive content lives at a URL pattern we
-                            //      don't know about yet.
-                            // BUT — we already know from `type=arch` on the ISVP
-                            // URL that this is archived content, not live. So
-                            // we don't fall through to `.live` (which would
-                            // misclassify the session and run live-mode
-                            // transcription on a recording). Instead, surface
-                            // as `.failed` with a clear message — the user
-                            // gets feedback that something's wrong with the
-                            // probe and can either retry or manually choose
-                            // Static mode (which proceeds with unknown
-                            // duration since this is yt-dlp-source-eligible).
-                            print("[Probe] U.S. Senate: all \(candidates.count) m3u8 alternatives failed ffmpeg probe for archived hearing. Reporting as failed rather than defaulting to Live (extractor confirmed type=arch).")
-                            probeResult = .failed("Senate.gov archived hearing m3u8 unreachable — network or firewall may be blocking the akamaized/akamaihd CDN. Try again, or manually select Static mode.")
-                        }
-                    }
-                } catch {
-                    // Extractor failed (unknown committee, parse failure,
-                    // page structure changed). Fall back to the yt-dlp
-                    // probe path with URL-resolution fallback.
-                    print("[Probe] U.S. Senate direct extractor failed (\(error.localizedDescription)) — falling back to yt-dlp probe.")
-                    if let meta = await Self.probeYTDlpMetadata(url: url) {
-                        probedTitle = meta.title
-                        if let seconds = meta.duration {
-                            probeResult = .finite(seconds)
-                        } else {
-                            probeResult = .live
-                        }
-                    } else {
-                        probedTitle = nil
-                        probeResult = .failed("Senate.gov resolution failed and yt-dlp probe also failed — check URL or network.")
-                    }
-                }
-            } else if source == .criticalMention || source == .granicus || source == .iqMedia {
-                // Critical Mention: resolve the SPA clip page to its
-                // signed HLS URL via our browser extractor, then
-                // ffmpeg-probe the m3u8 for duration. Without this
-                // branch the probe fell through to the generic HLS
-                // path on the ORIGINAL page URL — which is HTML, not
-                // media, so ffmpeg gave up and the outer `case .failed`
-                // silently fell back to `.live`. That misclassified
-                // clips as live streams and hid the duration.
-                //
-                // Every Critical Mention clip is static (they're
-                // recordings from broadcast archives, never live
-                // feeds), so there's no `isLive` branch — if
-                // extraction succeeds and the m3u8 probe reports a
-                // finite duration, we use it. On extractor timeout,
-                // surface `.failed` with a hint about clip privacy
-                // — there's no yt-dlp fallback since yt-dlp has no
-                // CriticalMention extractor.
-                do {
-                    let resolved = try await CriticalMentionExtractor.resolve(url: url)
-                    probedTitle = resolved.title
-                    let ff = await Self.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL, referer: url)
-                    switch ff {
-                    case .finite(let s):
-                        probeResult = .finite(s)
-                    case .live, .failed:
-                        // "Live" from ffmpeg on a CM stream just
-                        // means "no duration in the manifest," which
-                        // for CM clips shouldn't happen but if it
-                        // does we surface as failed rather than
-                        // classifying as live (which would run
-                        // live-mode transcription on a finite clip).
-                        probeResult = .failed("Critical Mention m3u8 has no duration — clip may be malformed or still being processed.")
-                    }
-                } catch {
-                    probedTitle = nil
-                    probeResult = .failed("Critical Mention extraction failed: \(error.localizedDescription). The clip may be private (requires login), or the page couldn't load.")
-                }
-            } else if source.requiresYTDlp {
-                if let meta = await Self.probeYTDlpMetadata(url: url) {
-                    probedTitle = meta.title
-                    if let seconds = meta.duration {
-                        probeResult = .finite(seconds)
-                    } else {
-                        probeResult = .live
-                    }
-                } else {
-                    // probeYTDlpMetadata returned nil → probe failed
-                    // outright. Common causes:
-                    //   - macOS Keychain prompt for cookies-from-browser
-                    //     was dismissed or denied → yt-dlp can't read
-                    //     cookies → YouTube returns 403 on age/login-gated
-                    //     content
-                    //   - Network blocked (corporate firewall, captive
-                    //     portal, VPN flap)
-                    //   - yt-dlp binary missing, wrong path, or version
-                    //     incompatible with the site's current page layout
-                    //   - URL is malformed or for a site yt-dlp doesn't
-                    //     support
-                    //
-                    // Previously we silently fell back to .live so the
-                    // user could still attempt to Start, but that hid
-                    // the failure and made the Retry button (which keys
-                    // off `probeStatus == .failed`) dead code. Surface
-                    // the failure explicitly so the sidebar shows the
-                    // Retry button and the user can iterate (grant
-                    // Keychain access, fix the URL, etc.) without
-                    // having to retype the URL.
-                    probedTitle = nil
-                    probeResult = .failed("yt-dlp probe failed — check URL, cookies, or network")
-                }
-            } else {
-                // Referer-gated CDNs (2026-09-29). Some manifest hosts 403
-                // a request with no Referer — C-SPAN's
-                // m3u8-*.c-spanvideo.org and Frame.io's sahls.frame.io
-                // both do. This probe previously sent none, so such a
-                // manifest failed the header read and fell into the silent
-                // `.live` fallback below, which misclassifies a finite
-                // program as a livestream and hides its duration. Reuse
-                // the same host→origin map the extractor uses for ffmpeg
-                // so all three paths (probe, transcribe, download) agree.
-                let hostReferer = AudioStreamExtractor
-                    .playerOriginForManifestHost(url.absoluteString)
-                    .flatMap { URL(string: $0) }
-                var ff = await Self.probeRemoteDurationViaFFmpeg(url: url, referer: hostReferer)
-
-                // ONE RETRY ON A REFERER-GATED HOST (2026-09-29). A host in
-                // that map got there because a resolver rewrote a portal
-                // page to its CDN manifest, so we already know this is a
-                // recording, not a live feed — and those CDNs abort reads
-                // intermittently (C-SPAN's did, once, then passed five
-                // consecutive reruns of the identical command). Falling
-                // straight through to `.live` on a transient abort is the
-                // worst possible answer: it hides the duration AND runs
-                // live-mode transcription over a finite program. Retry once
-                // before accepting that. Bounded at one extra attempt —
-                // `probeRemoteDurationViaFFmpeg` has its own 8 s ceiling,
-                // so the cost of being wrong is 8 s, and only on the
-                // handful of hosts in the map.
-                if case .failed = ff, hostReferer != nil {
-                    print("[Probe] \(url.host ?? "manifest") failed on first attempt — retrying once (referer-gated CDN, aborts here are usually transient).")
-                    ff = await Self.probeRemoteDurationViaFFmpeg(url: url, referer: hostReferer)
-                }
-
-                // ASK THE PLAYLIST (2026-09-29). ffmpeg reports
-                // `Duration: N/A` for a MASTER playlist carrying several
-                // variants, and C-SPAN's segments additionally start at an
-                // absolute PTS (`start: 45572.746222`), so it has nothing to
-                // derive a duration from. Both of those are properties of
-                // ffmpeg's demuxer, not of the content: the variant playlist
-                // right behind that master says
-                // `#EXT-X-PLAYLIST-TYPE:VOD`, `#EXT-X-MEDIA-SEQUENCE:0`,
-                // `#EXT-X-ENDLIST` and 583 × `#EXTINF:6.400`. A finished
-                // 62-minute program was being classified as a livestream
-                // while the manifest said otherwise in four separate ways.
-                //
-                // Only consulted when ffmpeg came back without a duration,
-                // so the common path costs nothing, and gated on the
-                // playlist declaring itself VOD — a real live stream has a
-                // sliding window with neither marker and stays `.live`.
-                switch ff {
-                case .finite:
-                    break
-                case .live, .failed:
-                    if let seconds = await Self.vodDurationFromHLSPlaylist(url: url, referer: hostReferer) {
-                        ff = .finite(seconds)
-                    }
-                }
-
-                probedTitle = nil  // HLS/direct audio: no title source
-                switch ff {
-                case .finite(let s): probeResult = .finite(s)
-                case .live:          probeResult = .live
-                case .failed:        probeResult = .live  // silent fallback
-                }
-            }
+            let (probeResult, probedTitle) = await Self.probeResolvedSource(url: url, source: source)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self else { return }
@@ -8375,6 +8158,267 @@ final class TranscriptionEngine: ObservableObject {
         } else {
             phaseEdgeWindows = 0
             livePhase = .catchingUp(rate: rate)
+        }
+    }
+
+    /// The per-source probe, with no side effects on engine state: returns
+    /// the outcome and any title instead of writing `probeStatus` /
+    /// `probedDuration` / `detectedTitle`. Extracted verbatim from
+    /// `beginProbe` (2026-10-01) so the web portal can check a pasted link
+    /// without touching the engine's single probe slot — which the Mac UI
+    /// and the portal's own job dispatch both depend on. `url` must already
+    /// have been through `resolvePortalMedia`.
+    private static func probeResolvedSource(url: URL, source: StreamSource) async -> (ProbeOutcome, String?) {
+        let probeResult: ProbeOutcome
+        let probedTitle: String?
+        if source == .senateGov {
+            // Senate.gov: resolve to m3u8 + title via our own extractor,
+            // then duration-probe the m3u8 with ffmpeg (sub-second).
+            // Total ~500 ms-1 s vs ~6-9 s for yt-dlp + fallback. On
+            // extractor failure, fall through to yt-dlp — same as
+            // AudioStreamExtractor does for the download path.
+            do {
+                let resolved = try await SenateGovExtractor.resolve(url: url)
+                probedTitle = resolved.title
+                if resolved.isLive {
+                    // type=live on the ISVP URL — no need to probe
+                    // duration; we know it's a live stream.
+                    probeResult = .live
+                } else {
+                    // Archived hearing. Probe the m3u8 for duration
+                    // — ffmpeg reads the manifest header in <1 s.
+                    //
+                    // Try the primary URL first, then fall through to
+                    // the alternatives if it fails. Older archived
+                    // content sometimes lives on a different CDN
+                    // (msl3archive instead of media-srs, or legacy
+                    // akamaihd paths) than current live streams. The
+                    // extractor produces all viable candidates in
+                    // `alternativeURLs` (primary first, then backups);
+                    // we try each until one returns a finite duration.
+                    var ff: FFmpegProbeResult = .failed("no candidates")
+                    let candidates = resolved.alternativeURLs.isEmpty
+                        ? [resolved.m3u8URL]
+                        : resolved.alternativeURLs
+                    for (idx, candidate) in candidates.enumerated() {
+                        ff = await Self.probeRemoteDurationViaFFmpeg(url: candidate)
+                        if case .finite = ff {
+                            if idx > 0 {
+                                print("[Probe] U.S. Senate: primary m3u8 unreachable; alternative \(idx) (\(candidate.host ?? "?")) succeeded.")
+                            }
+                            break
+                        }
+                        if case .live = ff { break } // explicit live signal — no point continuing
+                    }
+                    switch ff {
+                    case .finite(let s): probeResult = .finite(s)
+                    case .live:          probeResult = .live
+                    case .failed:
+                        // All m3u8 alternatives failed ffmpeg probe.
+                        // Two possibilities:
+                        //   1. Network/firewall blocking the akamaized/akamaihd
+                        //      CDNs (corporate proxy, captive portal).
+                        //   2. Archive content lives at a URL pattern we
+                        //      don't know about yet.
+                        // BUT — we already know from `type=arch` on the ISVP
+                        // URL that this is archived content, not live. So
+                        // we don't fall through to `.live` (which would
+                        // misclassify the session and run live-mode
+                        // transcription on a recording). Instead, surface
+                        // as `.failed` with a clear message — the user
+                        // gets feedback that something's wrong with the
+                        // probe and can either retry or manually choose
+                        // Static mode (which proceeds with unknown
+                        // duration since this is yt-dlp-source-eligible).
+                        print("[Probe] U.S. Senate: all \(candidates.count) m3u8 alternatives failed ffmpeg probe for archived hearing. Reporting as failed rather than defaulting to Live (extractor confirmed type=arch).")
+                        probeResult = .failed("Senate.gov archived hearing m3u8 unreachable — network or firewall may be blocking the akamaized/akamaihd CDN. Try again, or manually select Static mode.")
+                    }
+                }
+            } catch {
+                // Extractor failed (unknown committee, parse failure,
+                // page structure changed). Fall back to the yt-dlp
+                // probe path with URL-resolution fallback.
+                print("[Probe] U.S. Senate direct extractor failed (\(error.localizedDescription)) — falling back to yt-dlp probe.")
+                if let meta = await Self.probeYTDlpMetadata(url: url) {
+                    probedTitle = meta.title
+                    if let seconds = meta.duration {
+                        probeResult = .finite(seconds)
+                    } else {
+                        probeResult = .live
+                    }
+                } else {
+                    probedTitle = nil
+                    probeResult = .failed("Senate.gov resolution failed and yt-dlp probe also failed — check URL or network.")
+                }
+            }
+        } else if source == .criticalMention || source == .granicus || source == .iqMedia {
+            // Critical Mention: resolve the SPA clip page to its
+            // signed HLS URL via our browser extractor, then
+            // ffmpeg-probe the m3u8 for duration. Without this
+            // branch the probe fell through to the generic HLS
+            // path on the ORIGINAL page URL — which is HTML, not
+            // media, so ffmpeg gave up and the outer `case .failed`
+            // silently fell back to `.live`. That misclassified
+            // clips as live streams and hid the duration.
+            //
+            // Every Critical Mention clip is static (they're
+            // recordings from broadcast archives, never live
+            // feeds), so there's no `isLive` branch — if
+            // extraction succeeds and the m3u8 probe reports a
+            // finite duration, we use it. On extractor timeout,
+            // surface `.failed` with a hint about clip privacy
+            // — there's no yt-dlp fallback since yt-dlp has no
+            // CriticalMention extractor.
+            do {
+                let resolved = try await CriticalMentionExtractor.resolve(url: url)
+                probedTitle = resolved.title
+                let ff = await Self.probeRemoteDurationViaFFmpeg(url: resolved.m3u8URL, referer: url)
+                switch ff {
+                case .finite(let s):
+                    probeResult = .finite(s)
+                case .live, .failed:
+                    // "Live" from ffmpeg on a CM stream just
+                    // means "no duration in the manifest," which
+                    // for CM clips shouldn't happen but if it
+                    // does we surface as failed rather than
+                    // classifying as live (which would run
+                    // live-mode transcription on a finite clip).
+                    probeResult = .failed("Critical Mention m3u8 has no duration — clip may be malformed or still being processed.")
+                }
+            } catch {
+                probedTitle = nil
+                probeResult = .failed("Critical Mention extraction failed: \(error.localizedDescription). The clip may be private (requires login), or the page couldn't load.")
+            }
+        } else if source.requiresYTDlp {
+            if let meta = await Self.probeYTDlpMetadata(url: url) {
+                probedTitle = meta.title
+                if let seconds = meta.duration {
+                    probeResult = .finite(seconds)
+                } else {
+                    probeResult = .live
+                }
+            } else {
+                // probeYTDlpMetadata returned nil → probe failed
+                // outright. Common causes:
+                //   - macOS Keychain prompt for cookies-from-browser
+                //     was dismissed or denied → yt-dlp can't read
+                //     cookies → YouTube returns 403 on age/login-gated
+                //     content
+                //   - Network blocked (corporate firewall, captive
+                //     portal, VPN flap)
+                //   - yt-dlp binary missing, wrong path, or version
+                //     incompatible with the site's current page layout
+                //   - URL is malformed or for a site yt-dlp doesn't
+                //     support
+                //
+                // Previously we silently fell back to .live so the
+                // user could still attempt to Start, but that hid
+                // the failure and made the Retry button (which keys
+                // off `probeStatus == .failed`) dead code. Surface
+                // the failure explicitly so the sidebar shows the
+                // Retry button and the user can iterate (grant
+                // Keychain access, fix the URL, etc.) without
+                // having to retype the URL.
+                probedTitle = nil
+                probeResult = .failed("yt-dlp probe failed — check URL, cookies, or network")
+            }
+        } else {
+            // Referer-gated CDNs (2026-09-29). Some manifest hosts 403
+            // a request with no Referer — C-SPAN's
+            // m3u8-*.c-spanvideo.org and Frame.io's sahls.frame.io
+            // both do. This probe previously sent none, so such a
+            // manifest failed the header read and fell into the silent
+            // `.live` fallback below, which misclassifies a finite
+            // program as a livestream and hides its duration. Reuse
+            // the same host→origin map the extractor uses for ffmpeg
+            // so all three paths (probe, transcribe, download) agree.
+            let hostReferer = AudioStreamExtractor
+                .playerOriginForManifestHost(url.absoluteString)
+                .flatMap { URL(string: $0) }
+            var ff = await Self.probeRemoteDurationViaFFmpeg(url: url, referer: hostReferer)
+
+            // ONE RETRY ON A REFERER-GATED HOST (2026-09-29). A host in
+            // that map got there because a resolver rewrote a portal
+            // page to its CDN manifest, so we already know this is a
+            // recording, not a live feed — and those CDNs abort reads
+            // intermittently (C-SPAN's did, once, then passed five
+            // consecutive reruns of the identical command). Falling
+            // straight through to `.live` on a transient abort is the
+            // worst possible answer: it hides the duration AND runs
+            // live-mode transcription over a finite program. Retry once
+            // before accepting that. Bounded at one extra attempt —
+            // `probeRemoteDurationViaFFmpeg` has its own 8 s ceiling,
+            // so the cost of being wrong is 8 s, and only on the
+            // handful of hosts in the map.
+            if case .failed = ff, hostReferer != nil {
+                print("[Probe] \(url.host ?? "manifest") failed on first attempt — retrying once (referer-gated CDN, aborts here are usually transient).")
+                ff = await Self.probeRemoteDurationViaFFmpeg(url: url, referer: hostReferer)
+            }
+
+            // ASK THE PLAYLIST (2026-09-29). ffmpeg reports
+            // `Duration: N/A` for a MASTER playlist carrying several
+            // variants, and C-SPAN's segments additionally start at an
+            // absolute PTS (`start: 45572.746222`), so it has nothing to
+            // derive a duration from. Both of those are properties of
+            // ffmpeg's demuxer, not of the content: the variant playlist
+            // right behind that master says
+            // `#EXT-X-PLAYLIST-TYPE:VOD`, `#EXT-X-MEDIA-SEQUENCE:0`,
+            // `#EXT-X-ENDLIST` and 583 × `#EXTINF:6.400`. A finished
+            // 62-minute program was being classified as a livestream
+            // while the manifest said otherwise in four separate ways.
+            //
+            // Only consulted when ffmpeg came back without a duration,
+            // so the common path costs nothing, and gated on the
+            // playlist declaring itself VOD — a real live stream has a
+            // sliding window with neither marker and stays `.live`.
+            switch ff {
+            case .finite:
+                break
+            case .live, .failed:
+                if let seconds = await Self.vodDurationFromHLSPlaylist(url: url, referer: hostReferer) {
+                    ff = .finite(seconds)
+                }
+            }
+
+            probedTitle = nil  // HLS/direct audio: no title source
+            switch ff {
+            case .finite(let s): probeResult = .finite(s)
+            case .live:          probeResult = .live
+            case .failed:        probeResult = .live  // silent fallback
+            }
+        }
+        return (probeResult, probedTitle)
+    }
+
+    /// Result of a web-portal link check.
+    struct PortalProbeResult {
+        enum Kind { case recording(TimeInterval), live, failed(String) }
+        let kind: Kind
+        let title: String?
+        let source: StreamSource
+    }
+
+    /// Stateless probe for the web portal: the same resolution and
+    /// per-source strategy as `beginProbe`, but nothing is written to the
+    /// engine, so it is safe to run while a session is active or while the
+    /// Mac (or the portal's dispatcher) has its own probe in flight. Title
+    /// precedence matches `beginProbe`: the probe's own title, else the
+    /// portal resolver's.
+    static func probeForPortal(url: URL) async -> PortalProbeResult {
+        var url = url
+        var source = StreamSource.detect(from: url)
+        var resolvedTitle: String? = nil
+        if let resolved = await resolvePortalMedia(url: url) {
+            url = resolved.mediaURL
+            source = StreamSource.detect(from: url)
+            resolvedTitle = resolved.title
+        }
+        let (outcome, probedTitle) = await probeResolvedSource(url: url, source: source)
+        let title = (probedTitle?.isEmpty == false) ? probedTitle : resolvedTitle
+        switch outcome {
+        case .finite(let seconds): return PortalProbeResult(kind: .recording(seconds), title: title, source: source)
+        case .live: return PortalProbeResult(kind: .live, title: title, source: source)
+        case .failed(let reason): return PortalProbeResult(kind: .failed(reason), title: title, source: source)
         }
     }
 

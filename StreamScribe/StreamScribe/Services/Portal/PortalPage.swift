@@ -146,6 +146,15 @@ select:disabled { opacity: .6; }
 .check { display: flex; gap: 9px; align-items: flex-start; margin-top: 14px; font-size: 14px; cursor: pointer; }
 .check input { margin: 3px 0 0; width: 16px; height: 16px; flex: none; accent-color: var(--accent); }
 .check .hint { margin-top: 1px; }
+.probe { margin-top: 8px; padding: 8px 10px; border-radius: 8px; font-size: 13px; background: var(--panel-2); color: var(--muted); }
+.probe .pl { display: flex; gap: 7px; align-items: baseline; font-weight: 600; }
+.probe .pt { margin-top: 2px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.probe .pm { margin-top: 2px; font-weight: 400; }
+.probe.ok { background: var(--ok-soft); color: var(--ok); }
+.probe.live { background: var(--accent-soft); color: var(--accent); }
+.probe.bad { background: var(--warn-soft); color: var(--warn); }
+.probe .spin { width: 9px; height: 9px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent; animation: rot .8s linear infinite; flex: none; align-self: center; }
+@keyframes rot { to { transform: rotate(360deg); } }
 
 .drop {
   margin-top: 12px; border: 1.5px dashed var(--line); border-radius: var(--radius);
@@ -317,7 +326,9 @@ const S = {
   jobTimer: null,
   lastRenderKey: "",
   form: null,
-  formReady: false
+  formReady: false,
+  probe: null,
+  probeTimer: null
 };
 
 // ---------- helpers ----------
@@ -690,9 +701,10 @@ function renderHome() {
   const urlPane = h("div", { id: "pane-url", class: S.mode === "url" ? "" : "hidden" }, [
     h("label", { class: "f", for: "url", text: "Link" }),
     h("input", { id: "url", type: "url", placeholder: "https://www.youtube.com/watch?v=…", autocomplete: "off", value: S.form ? S.form.url : "",
-      oninput: function (e) { if (S.form) S.form.url = e.target.value; },
+      oninput: function (e) { if (S.form) { S.form.url = e.target.value; scheduleProbe(); } },
       onkeydown: function (e) { if (e.key === "Enter") submit(); } }),
-    h("div", { class: "hint", text: "YouTube, House/Senate hearings, state legislatures, X, podcasts, direct audio/video links…" })
+    h("div", { class: "hint", text: "YouTube, House/Senate hearings, state legislatures, X, podcasts, direct audio/video links…" }),
+    h("div", { id: "probe", class: "probe hidden", "aria-live": "polite" })
   ]);
 
   const fileInput = h("input", { id: "file", type: "file", class: "hidden", onchange: function (e) { pickFile(e.target.files[0]); } });
@@ -737,6 +749,7 @@ function renderHome() {
   ]);
 
   view.appendChild(h("div", { class: "grid-home" }, [newCard, listCard]));
+  renderProbe();
   renderJobs();
 }
 
@@ -750,6 +763,80 @@ function dropContent() {
 function setMode(m) {
   S.mode = m;
   renderHome();
+}
+
+// ---------- link check (probe) ----------
+// Checks a pasted link on the Mini (live vs. recording, length, title) the way
+// the Mac's URL field does. Debounced so typing doesn't fire a check per key;
+// a result for a link that's no longer in the box is ignored.
+function looksLikeLink(u) { return /^https?:\/\/[^\s\/]+\.[^\s]+$/i.test(u); }
+
+function scheduleProbe() {
+  clearTimeout(S.probeTimer);
+  const u = (S.form ? S.form.url : "").trim();
+  if (!looksLikeLink(u)) { S.probe = null; renderProbe(); return; }
+  if (S.probe && S.probe.url === u && S.probe.state !== "error") { renderProbe(); return; }
+  S.probe = { url: u, state: "waiting" };
+  renderProbe();
+  S.probeTimer = setTimeout(function () { runProbe(u); }, 600);
+}
+
+async function runProbe(u) {
+  const current = function () { return S.form && S.form.url.trim() === u; };
+  if (!current()) return;
+  S.probe = { url: u, state: "checking" };
+  renderProbe();
+  let r;
+  try {
+    r = await api("/api/probe", { method: "POST", json: { url: u } });
+  } catch (e) {
+    if (!current()) return;
+    S.probe = { url: u, state: "error", message: e.message };
+    renderProbe();
+    return;
+  }
+  if (!current()) return;
+  if (r.kind === "busy") {
+    S.probeTimer = setTimeout(function () { runProbe(u); }, 3000);
+    return;
+  }
+  S.probe = { url: u, state: r.kind, data: r };
+  renderProbe();
+}
+
+function renderProbe() {
+  const el = $("probe");
+  if (!el) return;
+  const p = S.probe;
+  el.textContent = "";
+  if (!p || !S.form || p.url !== S.form.url.trim()) { el.className = "probe hidden"; return; }
+  const d = p.data || {};
+  const src = d.source && d.source !== "Unknown" ? " · " + d.source : "";
+  let cls = "probe", head = [], msg = null;
+  if (p.state === "waiting" || p.state === "checking") {
+    head = [h("span", { class: "spin" }), "Checking link on the Mac Mini…"];
+  } else if (p.state === "recording") {
+    cls += " ok";
+    head = ["✓ Recording" + (d.durationSeconds ? " · " + fmtTime(d.durationSeconds) : "") + src];
+  } else if (p.state === "live") {
+    cls += " live";
+    head = ["● Live stream" + src];
+  } else if (p.state === "failed") {
+    cls += " bad";
+    head = ["Couldn't read this link" + src];
+    const reason = (d.message || "").trim();
+    msg = (reason ? reason + (/[.!?…]$/.test(reason) ? " " : ". ") : "") + "You can still try transcribing it.";
+  } else {
+    cls += " bad";
+    head = ["Couldn't check this link"];
+    msg = p.message || "";
+  }
+  el.className = cls;
+  el.appendChild(h("div", { class: "pl" }, head));
+  if (d.title && (p.state === "recording" || p.state === "live" || p.state === "failed")) {
+    el.appendChild(h("div", { class: "pt", title: d.title, text: d.title }));
+  }
+  if (msg) el.appendChild(h("div", { class: "pm", text: msg }));
 }
 
 function pickFile(f) {
@@ -775,6 +862,7 @@ async function submit() {
       if (!url) { toast("Paste a link first."); return; }
       const job = await api("/api/jobs", { method: "POST", json: { url: url, settings: settings } });
       S.form.url = "";
+      S.probe = null;
       location.hash = "#/job/" + job.id;
     } else {
       if (!S.file) { toast("Choose a file first."); return; }
