@@ -180,6 +180,8 @@ struct PortalJob: Codable, Identifiable {
     /// `TranscriptionEngine.sessionGeneration` of this job's session — the
     /// token that says "the engine is still holding this transcript".
     var engineSession: Int?
+    /// Which portal engine slot ran this job (0 = the Mac window's engine).
+    var slotIndex: Int?
     var stoppedBy: String?
     /// Browser-playable copy of the job's media on the Mini, for the web
     /// player and clips. Optional so job files saved before this existed load.
@@ -501,7 +503,13 @@ struct PortalStatusDTO: Encodable {
         let title: String?
         let activeJobId: String?
     }
-    struct Queue: Encodable { let paused: Bool; let queued: Int }
+    struct Queue: Encodable {
+        let paused: Bool
+        let queued: Int
+        /// Jobs on an engine right now (ids), and how many may run at once.
+        let running: [String]
+        let capacity: Int
+    }
     struct Options: Encodable {
         let modes: [PortalOptionDTO]
         let engines: [PortalOptionDTO]

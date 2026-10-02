@@ -530,6 +530,14 @@ function renderHeader() {
     cls = "pill busy";
     text = (st.engine.label || "Working") + (st.engine.title ? " · " + st.engine.title : "");
   }
+  const running = (st.queue.running || []).length;
+  if (running > 1) {
+    cls = "pill busy";
+    text = "Transcribing " + running + " jobs";
+  } else if (running === 1 && !st.engine.active) {
+    cls = "pill busy";
+    text = "Transcribing";
+  }
   if (st.queue.paused) { cls = "pill warn"; text = "Queue paused" + (st.engine.active ? " · finishing current job" : ""); }
   if (st.queue.queued > 0) text += " · " + st.queue.queued + " waiting";
   pill.className = cls;

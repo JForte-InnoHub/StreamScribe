@@ -62,11 +62,14 @@ final class PortalJobQueue: ObservableObject {
 
     @Published private(set) var serverState: PortalServerState = .stopped
     /// True while a job is between "picked from the queue" and "engine confirmed
-    /// it started". The Mac's Start button is disabled during this window.
+    /// it started" ON THE MAC WINDOW'S ENGINE. The Mac's Start button and URL
+    /// field are disabled during this window. Headless engines never set it.
     @Published private(set) var isDispatching = false
-    /// ContentView copies this into the Mac's URL field.
+    /// ContentView copies this into the Mac's URL field (primary engine only).
     @Published private(set) var macURLMirror: String?
     @Published private(set) var summary: String = "No jobs"
+    /// Engines currently holding a portal job (for Settings).
+    @Published private(set) var runningCount = 0
     @Published var isPaused: Bool = UserDefaults.standard.bool(forKey: PortalJobQueue.pausedKey) {
         didSet {
             UserDefaults.standard.set(isPaused, forKey: Self.pausedKey)
@@ -75,19 +78,56 @@ final class PortalJobQueue: ObservableObject {
         }
     }
 
+    // MARK: Engine slots
+    //
+    // CONCURRENT SESSIONS (2026-10-02). The portal runs jobs on a small pool
+    // of TranscriptionEngines. Slot 0 is the PRIMARY: the engine the Mac
+    // window shows, so a job on it appears in the Mac UI exactly as before
+    // and a session started on the Mac occupies it. Extra slots are
+    // HEADLESS engines created on demand up to `capacity` (Settings → Web
+    // Portal → Jobs at once, default 1); their sessions are visible only in
+    // the portal. Every piece of per-session state that used to be global
+    // (media cache, settings snapshot, voiceprint identities, proxy
+    // rotation) is now per engine, which is what makes this safe.
+
+    static let capacityKey = "portal.maxConcurrentJobs"
+    static let maxCapacity = 4
+
+    /// Jobs allowed at once, from Settings (1…maxCapacity).
+    var capacity: Int {
+        let stored = UserDefaults.standard.integer(forKey: Self.capacityKey)
+        return min(Self.maxCapacity, max(1, stored == 0 ? 1 : stored))
+    }
+
+    final class EngineSlot {
+        let index: Int
+        let engine: TranscriptionEngine
+        var isPrimary: Bool { index == 0 }
+        var activeJobID: UUID?            // on the engine now
+        var attachedJobID: UUID?          // engine still holds its session
+        var dispatchingJobID: UUID?
+        var cancelDuringDispatch: Set<UUID> = []
+        var restoreItems: [PortalRestoreItem] = []
+        var cancellables = Set<AnyCancellable>()
+        var isDispatching: Bool { dispatchingJobID != nil }
+        /// Busy = dispatching, holding a job, or running a session that
+        /// started elsewhere (the Mac).
+        var isBusy: Bool { isDispatching || activeJobID != nil || engine.state.isActive }
+        init(index: Int, engine: TranscriptionEngine) {
+            self.index = index
+            self.engine = engine
+        }
+    }
+
     // MARK: State
 
-    private weak var engine: TranscriptionEngine?
+    private var slots: [EngineSlot] = []
+    private var primary: EngineSlot? { slots.first }
     private let server = PortalServer()
     private var cancellables = Set<AnyCancellable>()
     private var jobs: [PortalJob] = []                 // oldest first
     private var indexes: [UUID: PortalTranscriptIndex] = [:]
     private var uploads: [UUID: PortalUploadSession] = [:]
-    private var activeJobID: UUID?                     // on the engine now
-    private var attachedJobID: UUID?                   // engine still holds its session
-    private var dispatchingJobID: UUID?
-    private var cancelDuringDispatch: Set<UUID> = []
-    private var restoreItems: [PortalRestoreItem] = []
     private var pendingSaves: Set<UUID> = []
     private var sleepActivity: NSObjectProtocol?
     private var retentionTimer: Timer?
@@ -111,10 +151,10 @@ final class PortalJobQueue: ObservableObject {
 
     // MARK: - Lifecycle
 
-    /// Called from the app's WindowGroup `.task`. Idempotent.
+    /// Called from the app's WindowGroup `.task` with the Mac window's engine.
+    /// Idempotent.
     func attach(engine: TranscriptionEngine) {
-        if self.engine === engine && didLoad { return }
-        self.engine = engine
+        if primary?.engine === engine && didLoad { return }
 
         if !didLoad {
             didLoad = true
@@ -125,45 +165,55 @@ final class PortalJobQueue: ObservableObject {
             retentionTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { _ in
                 Task { @MainActor in PortalJobQueue.shared.applyRetention() }
             }
+            ModelDownloadManager.shared.$statuses
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.modelCache = nil }
+                .store(in: &cancellables)
         }
 
-        cancellables.removeAll()
+        // (Re)install the primary slot. Headless slots, if any, are kept.
+        if let existing = primary {
+            existing.cancellables.removeAll()
+            slots[0] = EngineSlot(index: 0, engine: engine)
+        } else {
+            slots.append(EngineSlot(index: 0, engine: engine))
+        }
+        observe(slots[0])
+
+        applyServerSetting()
+        refreshSummary()
+        pump()
+    }
+
+    private func observe(_ slot: EngineSlot) {
+        let engine = slot.engine
+        slot.cancellables.removeAll()
         engine.$state
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.handleEngineState() }
-            .store(in: &cancellables)
+            .sink { [weak self, weak slot] _ in if let slot { self?.handleEngineState(slot) } }
+            .store(in: &slot.cancellables)
         engine.$segments
             .throttle(for: .milliseconds(500), scheduler: DispatchQueue.main, latest: true)
-            .sink { [weak self] _ in self?.syncAttached() }
-            .store(in: &cancellables)
+            .sink { [weak self, weak slot] _ in if let slot { self?.syncAttached(slot) } }
+            .store(in: &slot.cancellables)
         Publishers.Merge4(
             engine.$speakerNames.map { _ in () },
             engine.$pinnedQuotes.map { _ in () },
             engine.$detectedTitle.map { _ in () },
             engine.voiceprints.$identifications.map { _ in () })
             .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in self?.syncAttached() }
-            .store(in: &cancellables)
+            .sink { [weak self, weak slot] _ in if let slot { self?.syncAttached(slot) } }
+            .store(in: &slot.cancellables)
         engine.$sessionStartedAt
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.checkAttachment() }
-            .store(in: &cancellables)
+            .sink { [weak self, weak slot] _ in if let slot { self?.checkAttachment(slot) } }
+            .store(in: &slot.cancellables)
         // Static sessions download the video separately; when it lands after
         // the transcript finished, upgrade the job's audio-only snapshot.
         engine.$playbackMediaURL
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] url in self?.handlePlaybackMediaChange(url) }
-            .store(in: &cancellables)
-        // A download finishing (from the portal or the Mac sidebar) changes
-        // what the portal can offer — drop the cached model list.
-        ModelDownloadManager.shared.$statuses
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.modelCache = nil }
-            .store(in: &cancellables)
-
-        applyServerSetting()
-        refreshSummary()
-        pump()
+            .sink { [weak self, weak slot] url in if let slot { self?.handlePlaybackMediaChange(url, slot) } }
+            .store(in: &slot.cancellables)
     }
 
     /// Start or stop the HTTP server to match Settings. Safe to call repeatedly.
@@ -195,56 +245,109 @@ final class PortalJobQueue: ObservableObject {
             reason: "StreamScribe web portal is serving requests")
     }
 
+    /// Settings changed the capacity: start waiting jobs, or let surplus idle
+    /// headless engines go (a busy one finishes its job first).
+    func capacityChanged() {
+        trimIdleSlots()
+        pump()
+    }
+
+    // MARK: - Slots
+
+    private func slot(for job: PortalJob) -> EngineSlot? {
+        guard let i = job.slotIndex, i < slots.count else { return nil }
+        return slots[i]
+    }
+
+    /// A free engine for the next job: the primary when it's free (so the Mac
+    /// shows the job), else a free headless engine, else a new headless
+    /// engine if capacity allows. nil = everything is busy.
+    private func freeSlot() -> EngineSlot? {
+        if let p = primary, !p.isBusy { return p }
+        // Only slots within the current capacity take new work, so lowering
+        // the setting actually lowers concurrency (an idle-but-attached slot
+        // above it isn't trimmed yet, but must not be fed either).
+        if let free = slots.dropFirst().first(where: { $0.index < capacity && !$0.isBusy }) { return free }
+        guard slots.count < capacity, primary != nil else { return nil }
+        let slot = EngineSlot(index: slots.count, engine: TranscriptionEngine())
+        slots.append(slot)
+        observe(slot)
+        print("[Portal] Added headless engine #\(slot.index) (capacity \(capacity)).")
+        return slot
+    }
+
+    /// Drop idle headless engines beyond capacity, highest index first, so
+    /// their models are released. Never the primary; never a busy slot or one
+    /// still holding a finished transcript that the web is editing live.
+    private func trimIdleSlots() {
+        while slots.count > capacity, let last = slots.last, !last.isPrimary,
+              !last.isBusy, last.attachedJobID == nil {
+            last.cancellables.removeAll()
+            last.engine.mediaCache.clear()   // its job's media is already snapshotted
+            slots.removeLast()
+            print("[Portal] Released idle headless engine #\(last.index).")
+        }
+    }
+
     // MARK: - Queue runner
 
     private func pump() {
-        guard let engine, !isPaused, !isDispatching, activeJobID == nil,
-              !engine.state.isActive else { return }
-        guard let next = jobs.first(where: { $0.status == .queued }) else { return }
-        // Claim the engine synchronously so a second pump() in the same
-        // run-loop turn can't dispatch a second job.
-        isDispatching = true
-        dispatchingJobID = next.id
-        refreshSummary()
-        let id = next.id
-        Task { await self.dispatch(id) }
+        guard !isPaused, primary != nil else { return }
+        // Jobs behind one that can't start yet still start when a slot is free:
+        // the queue is FIFO per slot, not strictly global.
+        for job in jobs where job.status == .queued {
+            guard let slot = freeSlot() else { break }
+            // Claim the slot synchronously so a second pump() in the same
+            // run-loop turn can't dispatch a second job to it.
+            slot.dispatchingJobID = job.id
+            if slot.isPrimary { isDispatching = true }
+            refreshSummary()
+            let id = job.id
+            Task { await self.dispatch(id, on: slot) }
+        }
     }
 
-    private func dispatch(_ id: UUID) async {
-        await runDispatch(id)
-        isDispatching = false
-        dispatchingJobID = nil
-        cancelDuringDispatch.remove(id)
+    private func dispatch(_ id: UUID, on slot: EngineSlot) async {
+        await runDispatch(id, on: slot)
+        slot.dispatchingJobID = nil
+        slot.cancelDuringDispatch.remove(id)
+        if slot.isPrimary { isDispatching = false }
         refreshSummary()
         // Processes the new session's current state if the job started, or
         // pumps the next job if it didn't. (A pump() inside runDispatch would
-        // be a no-op: isDispatching is still true there.)
-        handleEngineState()
+        // be a no-op: the slot is still dispatching there.)
+        handleEngineState(slot)
     }
 
-    private func runDispatch(_ id: UUID) async {
-        guard let engine, var job = job(id), job.status == .queued else { return }
+    private func runDispatch(_ id: UUID, on slot: EngineSlot) async {
+        let engine = slot.engine
+        guard var job = job(id), job.status == .queued else { return }
 
         // Final sync of the previous transcript before the engine lets go of it.
-        syncAttached()
-        attachedJobID = nil
+        syncAttached(slot)
+        slot.attachedJobID = nil
 
         job.status = .preparing
         job.message = "Checking source…"
         job.startedAt = Date()
+        job.slotIndex = slot.index
         update(job, saveNow: true)
 
-        // 1. Mirror into the Mac's URL field; let its onChange kick the probe.
+        // 1. Probe. On the primary engine, mirror the link into the Mac's URL
+        //    field and let the sidebar's onChange kick the probe (so the Mac
+        //    shows what it's working on); headless engines probe directly.
         let input = job.input
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        let generationBefore = engine.probeGeneration
-        macURLMirror = input
         var probeKicked = false
-        for _ in 0..<10 {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            if engine.probeGeneration != generationBefore && engine.lastProbeInput == trimmed {
-                probeKicked = true
-                break
+        if slot.isPrimary {
+            let generationBefore = engine.probeGeneration
+            macURLMirror = input
+            for _ in 0..<10 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if engine.probeGeneration != generationBefore && engine.lastProbeInput == trimmed {
+                    probeKicked = true
+                    break
+                }
             }
         }
         if !probeKicked { engine.beginProbe(for: input) }
@@ -253,15 +356,10 @@ final class PortalJobQueue: ObservableObject {
         let deadline = Date().addingTimeInterval(45)
         while engine.probeStatus == .probing && Date() < deadline {
             try? await Task.sleep(nanoseconds: 250_000_000)
-            if cancelDuringDispatch.contains(id) { break }
+            if slot.cancelDuringDispatch.contains(id) { break }
         }
-        if cancelDuringDispatch.remove(id) != nil {
-            if var j = self.job(id) {
-                j.status = .cancelled
-                j.message = "Cancelled before it started"
-                j.finishedAt = Date()
-                update(j, saveNow: true)
-            }
+        if slot.cancelDuringDispatch.remove(id) != nil {
+            markCancelledBeforeStart(id)
             return
         }
 
@@ -278,8 +376,7 @@ final class PortalJobQueue: ObservableObject {
         case .live: resolvedStatic = false
         default: resolvedStatic = nil
         }
-        restoreItems = PortalSettingsApplier.apply(job.settings, resolvedStatic: resolvedStatic, engine: engine)
-        savePendingRestore()
+        slot.restoreItems = PortalSettingsApplier.apply(job.settings, resolvedStatic: resolvedStatic, engine: engine)
 
         if var j = self.job(id) {
             j.message = "Starting…"
@@ -292,16 +389,11 @@ final class PortalJobQueue: ObservableObject {
         guard engine.sessionGeneration != generationBeforeStart else {
             // start() returned at its `guard !state.isActive` — something else
             // got the engine first.
-            restoreSettings()
-            if cancelDuringDispatch.remove(id) != nil {
+            restoreSettings(slot)
+            if slot.cancelDuringDispatch.remove(id) != nil {
                 // Stop was pressed while we were starting: honour it rather
                 // than quietly putting the job back in line.
-                if var j = self.job(id) {
-                    j.status = .cancelled
-                    j.message = "Cancelled before it started"
-                    j.finishedAt = Date()
-                    update(j, saveNow: true)
-                }
+                markCancelledBeforeStart(id)
                 return
             }
             requeue(id, message: "Waiting for a session started on the Mac to finish")
@@ -311,7 +403,7 @@ final class PortalJobQueue: ObservableObject {
             // Early validation failure inside start() (bad URL, missing file…).
             // No snapshot: start() returns before resetting the transcript, so
             // the engine still holds the PREVIOUS session's segments.
-            restoreSettings()
+            restoreSettings(slot)
             if var j = self.job(id) {
                 j.status = .failed
                 j.message = message
@@ -326,15 +418,24 @@ final class PortalJobQueue: ObservableObject {
             j.status = .preparing
             update(j)
         }
-        activeJobID = id
-        attachedJobID = id
-        print("[Portal] Job \(id.uuidString.prefix(8)) started on the engine: \(job.displaySource)")
+        slot.activeJobID = id
+        slot.attachedJobID = id
+        print("[Portal] Job \(id.uuidString.prefix(8)) started on engine #\(slot.index): \(job.displaySource)")
 
         // Stop pressed while start() was still running: honour it now that
         // there is a session to stop. (stopJob already recorded stoppedBy.)
-        if cancelDuringDispatch.remove(id) != nil {
+        if slot.cancelDuringDispatch.remove(id) != nil {
             engine.stop()
         }
+    }
+
+    private func markCancelledBeforeStart(_ id: UUID) {
+        guard var j = job(id) else { return }
+        j.status = .cancelled
+        j.message = "Cancelled before it started"
+        j.finishedAt = Date()
+        j.slotIndex = nil
+        update(j, saveNow: true)
     }
 
     private func requeue(_ id: UUID, message: String) {
@@ -342,22 +443,22 @@ final class PortalJobQueue: ObservableObject {
         j.status = .queued
         j.message = message
         j.startedAt = nil
+        j.slotIndex = nil
         update(j, saveNow: true)
         // pump() runs again when the engine goes idle (state sink).
     }
 
     // MARK: - Engine observation
 
-    private func handleEngineState() {
-        guard let engine else { return }
+    private func handleEngineState(_ slot: EngineSlot) {
         defer { refreshSummary() }
-        guard !isDispatching else { return }
+        guard !slot.isDispatching else { return }
 
-        guard let id = activeJobID, var job = job(id) else {
+        guard let id = slot.activeJobID, var job = job(id) else {
             pump()
             return
         }
-        switch engine.state {
+        switch slot.engine.state {
         case .preparing(let label):
             job.status = .preparing
             job.message = label
@@ -375,17 +476,17 @@ final class PortalJobQueue: ObservableObject {
             job.message = label
             update(job)
         case .idle:
-            finishActive(error: nil)
+            finishActive(slot, error: nil)
         case .error(let message):
-            finishActive(error: message)
+            finishActive(slot, error: message)
         }
     }
 
-    private func finishActive(error: String?) {
-        guard let id = activeJobID else { return }
-        syncAttached()   // final transcript while the token still matches
-        activeJobID = nil
-        restoreSettings()
+    private func finishActive(_ slot: EngineSlot, error: String?) {
+        guard let id = slot.activeJobID else { return }
+        syncAttached(slot)   // final transcript while the token still matches
+        slot.activeJobID = nil
+        restoreSettings(slot)
         guard var job = job(id) else { pump(); return }
         job.finishedAt = Date()
         if let error {
@@ -402,12 +503,13 @@ final class PortalJobQueue: ObservableObject {
             }
         }
         update(job, saveNow: true)
-        print("[Portal] Job \(id.uuidString.prefix(8)) \(job.status.rawValue) (\(job.segments.count) segments).")
+        print("[Portal] Job \(id.uuidString.prefix(8)) \(job.status.rawValue) on engine #\(slot.index) (\(job.segments.count) segments).")
         if job.isUpload {
             prepareUploadMedia(id)
         } else {
             snapshotEngineMedia(id)
         }
+        trimIdleSlots()
         pump()
     }
 
@@ -415,24 +517,31 @@ final class PortalJobQueue: ObservableObject {
     /// Triggered by `$sessionStartedAt`, but decided by `sessionGeneration`:
     /// sessionStartedAt goes nil at every session END, which must not detach
     /// (the finished transcript is still on the Mac and still editable).
-    private func checkAttachment() {
-        guard let engine, let id = attachedJobID, let job = job(id) else { return }
-        if engine.sessionGeneration != job.engineSession {
-            attachedJobID = nil
+    private func checkAttachment(_ slot: EngineSlot) {
+        guard let id = slot.attachedJobID, let job = job(id) else { return }
+        if slot.engine.sessionGeneration != job.engineSession {
+            slot.attachedJobID = nil
             saveNow(id)
+            trimIdleSlots()
         }
     }
 
     private func isAttached(_ job: PortalJob) -> Bool {
-        guard let engine, attachedJobID == job.id, let token = job.engineSession else { return false }
-        return engine.sessionGeneration == token
+        guard let slot = slot(for: job), slot.attachedJobID == job.id, let token = job.engineSession else { return false }
+        return slot.engine.sessionGeneration == token
+    }
+
+    /// The engine still holding this job's session, if any.
+    private func attachedEngine(_ job: PortalJob) -> TranscriptionEngine? {
+        isAttached(job) ? slot(for: job)?.engine : nil
     }
 
     /// Copy the engine's transcript, names and pins into the attached job.
-    private func syncAttached() {
-        guard let engine, let id = attachedJobID, var job = job(id) else { return }
+    private func syncAttached(_ slot: EngineSlot) {
+        let engine = slot.engine
+        guard let id = slot.attachedJobID, var job = job(id) else { return }
         guard isAttached(job) else {
-            attachedJobID = nil
+            slot.attachedJobID = nil
             return
         }
 
@@ -473,25 +582,21 @@ final class PortalJobQueue: ObservableObject {
         update(job)
     }
 
-    // MARK: - Settings restore
-
-    private func restoreSettings() {
-        engine?.portalEngineChoiceActive = false
-        // start() consumes the overrides; if it never ran (requeue, early
-        // failure) they must not carry into a session someone starts on the Mac.
-        engine?.nextSessionOverrides = nil
-        guard !restoreItems.isEmpty else { return }
-        PortalSettingsApplier.restore(restoreItems, engine: engine)
-        restoreItems = []
-        UserDefaults.standard.removeObject(forKey: Self.pendingRestoreKey)
+    /// Sync whichever slot holds this job (used before exports/transcripts).
+    private func syncIfAttached(_ job: PortalJob) {
+        if let slot = slot(for: job), isAttached(job) { syncAttached(slot) }
     }
 
-    private func savePendingRestore() {
-        if restoreItems.isEmpty {
-            UserDefaults.standard.removeObject(forKey: Self.pendingRestoreKey)
-        } else if let data = try? JSONEncoder().encode(restoreItems) {
-            UserDefaults.standard.set(data, forKey: Self.pendingRestoreKey)
-        }
+    // MARK: - Settings restore
+
+    private func restoreSettings(_ slot: EngineSlot) {
+        slot.engine.portalEngineChoiceActive = false
+        // start() consumes the overrides; if it never ran (requeue, early
+        // failure) they must not carry into a session someone starts on the Mac.
+        slot.engine.nextSessionOverrides = nil
+        guard !slot.restoreItems.isEmpty else { return }
+        PortalSettingsApplier.restore(slot.restoreItems, engine: slot.engine)
+        slot.restoreItems = []
     }
 
     /// Older builds applied some per-job settings by rewriting UserDefaults
@@ -659,7 +764,7 @@ final class PortalJobQueue: ObservableObject {
         guard days > 0 else { return }
         let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
         let expired = jobs.filter {
-            $0.status.isTerminal && ($0.finishedAt ?? $0.createdAt) < cutoff && $0.id != attachedJobID
+            $0.status.isTerminal && ($0.finishedAt ?? $0.createdAt) < cutoff && !isAttached($0)
         }
         guard !expired.isEmpty else { return }
         for job in expired {
@@ -687,8 +792,12 @@ final class PortalJobQueue: ObservableObject {
     private func refreshSummary() {
         let queued = jobs.filter { $0.status == .queued }.count
         var parts: [String] = []
-        if let id = activeJobID ?? dispatchingJobID, let job = job(id) {
+        let running = slots.compactMap { $0.activeJobID ?? $0.dispatchingJobID }.compactMap { job($0) }
+        runningCount = running.count
+        if running.count == 1, let job = running.first {
             parts.append("Running: \(job.title ?? job.displaySource)")
+        } else if running.count > 1 {
+            parts.append("Running \(running.count) jobs")
         }
         if queued > 0 { parts.append("\(queued) queued") }
         if isPaused { parts.append("queue paused") }
@@ -821,10 +930,13 @@ final class PortalJobQueue: ObservableObject {
     // MARK: - Endpoints: status / jobs
 
     private func statusDTO(_ who: PortalIdentity) -> PortalStatusDTO {
-        let engine = self.engine
+        // "engine" in the status payload describes the Mac window's engine;
+        // concurrent headless jobs are reported in `running`.
+        let engine = primary?.engine
         let state = engine?.state ?? .idle
-        let busyWithMac = state.isActive && activeJobID == nil && !isDispatching
+        let busyWithMac = state.isActive && primary?.activeJobID == nil && !isDispatching
         let d = UserDefaults.standard
+        let runningIDs = slots.compactMap { ($0.activeJobID ?? $0.dispatchingJobID)?.uuidString }
 
         let languages = TranscriptionEngine.availableLanguages.map {
             PortalOptionDTO(id: $0.code ?? "auto", label: $0.name)
@@ -837,8 +949,9 @@ final class PortalJobQueue: ObservableObject {
                 active: state.isActive,
                 busyWithMacSession: busyWithMac,
                 title: engine?.detectedTitle,
-                activeJobId: (activeJobID ?? dispatchingJobID)?.uuidString),
-            queue: .init(paused: isPaused, queued: jobs.filter { $0.status == .queued }.count),
+                activeJobId: runningIDs.first),
+            queue: .init(paused: isPaused, queued: jobs.filter { $0.status == .queued }.count,
+                         running: runningIDs, capacity: capacity),
             options: .init(
                 modes: [.init(id: "auto", label: "Auto (detect live vs. recording)"),
                         .init(id: "live", label: "Live"),
@@ -976,10 +1089,10 @@ final class PortalJobQueue: ObservableObject {
     private func downloadTarget(_ engineID: String) -> (key: ModelDownloadManager.ModelKey, model: String, label: String)? {
         switch engineID {
         case "whisperKit":
-            let name = engine?.whisperModelName ?? TranscriptionEngine.defaultWhisperModel
+            let name = primary?.engine.whisperModelName ?? TranscriptionEngine.defaultWhisperModel
             return (.whisper(modelName: name), name, TranscriptionEngine.displayName(forWhisperModel: name))
         case "parakeet":
-            let repo = engine?.parakeetModelName ?? TranscriptionEngine.defaultParakeetModel
+            let repo = primary?.engine.parakeetModelName ?? TranscriptionEngine.defaultParakeetModel
             return (.parakeet(modelRepo: repo), repo, TranscriptionEngine.displayName(forParakeetModel: repo))
         case "canary":
             // Size from the R2 object's Content-Length (532,228,379 bytes).
@@ -1141,11 +1254,13 @@ final class PortalJobQueue: ObservableObject {
         case .preparing, .running, .finishing:
             j.stoppedBy = who.email
             update(j)
-            if dispatchingJobID == job.id {
-                cancelDuringDispatch.insert(job.id)
-            } else if activeJobID == job.id, let engine, !engine.isStopping {
-                print("[Portal] Stop requested by \(who.email) for job \(job.id.uuidString.prefix(8)).")
-                engine.stop()
+            if let slot = slot(for: job) {
+                if slot.dispatchingJobID == job.id {
+                    slot.cancelDuringDispatch.insert(job.id)
+                } else if slot.activeJobID == job.id, !slot.engine.isStopping {
+                    print("[Portal] Stop requested by \(who.email) for job \(job.id.uuidString.prefix(8)).")
+                    slot.engine.stop()
+                }
             }
         default:
             return .error(409, "This job has already finished")
@@ -1177,7 +1292,7 @@ final class PortalJobQueue: ObservableObject {
         jobs.removeAll { $0.id == job.id }
         indexes[job.id] = nil
         pendingSaves.remove(job.id)
-        if attachedJobID == job.id { attachedJobID = nil }
+        if let slot = slot(for: job), slot.attachedJobID == job.id { slot.attachedJobID = nil }
         deleteJobFiles(job)
         refreshSummary()
         return .ok()
@@ -1192,13 +1307,13 @@ final class PortalJobQueue: ObservableObject {
         guard job.segments.contains(where: { $0.speaker == body.label }) else {
             return .error(404, "No speaker '\(body.label)' in this transcript")
         }
-        if isAttached(job), let engine {
+        if let engine = attachedEngine(job) {
             if name.isEmpty {
                 engine.speakerNames.removeValue(forKey: body.label)
             } else {
                 engine.speakerNames[body.label] = name
             }
-            syncAttached()
+            syncIfAttached(job)
         } else {
             var j = job
             if name.isEmpty { j.speakerNames.removeValue(forKey: body.label) } else { j.speakerNames[body.label] = name }
@@ -1214,10 +1329,10 @@ final class PortalJobQueue: ObservableObject {
         guard let body = request.decodeBody(PortalPinBody.self), let segID = UUID(uuidString: body.segmentId) else {
             return .error(400, "Expected {\"segmentId\": \"…\"}")
         }
-        if isAttached(job), let engine {
+        if let engine = attachedEngine(job) {
             guard let seg = engine.segments.first(where: { $0.id == segID }) else { return .error(404, "Segment not found") }
             engine.pinSelection(text: seg.text, speaker: seg.speaker, start: seg.start, end: seg.end, sourceSegmentID: seg.id)
-            syncAttached()
+            syncIfAttached(job)
         } else {
             guard let seg = job.segments.first(where: { $0.id == segID }) else { return .error(404, "Segment not found") }
             var j = job
@@ -1234,9 +1349,9 @@ final class PortalJobQueue: ObservableObject {
     }
 
     private func removePin(_ job: PortalJob, _ pinID: UUID, _ who: PortalIdentity) -> PortalHTTPResponse {
-        if isAttached(job), let engine {
+        if let engine = attachedEngine(job) {
             engine.unpin(pinID)
-            syncAttached()
+            syncIfAttached(job)
         } else {
             var j = job
             j.pins.removeAll { $0.id == pinID }
@@ -1252,7 +1367,7 @@ final class PortalJobQueue: ObservableObject {
 
     private func transcriptResponse(_ job: PortalJob, since: Int, clientEpoch: String,
                                     who: PortalIdentity) -> PortalHTTPResponse {
-        if isAttached(job) { syncAttached() }
+        syncIfAttached(job)
         let current = self.job(job.id) ?? job
         let index = indexFor(current)
         let full = clientEpoch != epoch || since <= 0 || since > index.rev
@@ -1332,7 +1447,7 @@ final class PortalJobQueue: ObservableObject {
 
     private func exportResponse(_ job: PortalJob, _ request: PortalHTTPRequest) -> PortalHTTPResponse {
         let id = request.query["format"] ?? "docx"
-        if isAttached(job) { syncAttached() }
+        syncIfAttached(job)
         let current = self.job(job.id) ?? job
         guard let format = TranscriptFormat.allCases.first(where: { $0.fileExtension == id.lowercased() }) else {
             return .error(400, "Unknown export format '\(id)'")
@@ -1396,9 +1511,9 @@ final class PortalJobQueue: ObservableObject {
     /// are stream copies into MP4, which can't hold PCM.)
     private static let browserReadyExtensions: Set<String> = ["mp4", "m4a", "mp3", "aac"]
 
-    private func handlePlaybackMediaChange(_ url: URL?) {
+    private func handlePlaybackMediaChange(_ url: URL?, _ slot: EngineSlot) {
         guard let url, MediaCacheManager.isVideoCacheFile(url),
-              let id = attachedJobID, let job = job(id), job.status.isTerminal, !job.isUpload else { return }
+              let id = slot.attachedJobID, let job = job(id), job.status.isTerminal, !job.isUpload else { return }
         snapshotEngineMedia(id)
     }
 
@@ -1407,7 +1522,7 @@ final class PortalJobQueue: ObservableObject {
     /// (current.mp4, written progressively by the transcription pipe) is
     /// remuxed to a regular faststart MP4 so browsers can seek in it.
     private func snapshotEngineMedia(_ id: UUID) {
-        guard let engine, var job = job(id) else { return }
+        guard var job = job(id), let engine = slot(for: job)?.engine else { return }
         let fm = FileManager.default
         guard let src = engine.playbackMediaURL, src.isFileURL, fm.fileExists(atPath: src.path) else {
             if job.mediaPath == nil {

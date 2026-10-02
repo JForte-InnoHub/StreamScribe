@@ -9,6 +9,7 @@ struct PortalSettingsSection: View {
     @AppStorage(PortalJobQueue.portKey) private var port: Int = PortalJobQueue.defaultPort
     @AppStorage(PortalJobQueue.adminEmailsKey) private var adminEmails: String = ""
     @AppStorage(PortalJobQueue.retentionDaysKey) private var retentionDays: Int = PortalJobQueue.defaultRetentionDays
+    @AppStorage(PortalJobQueue.capacityKey) private var capacity: Int = 1
 
     private var isRunning: Bool {
         if case .running = portal.serverState { return true }
@@ -48,6 +49,14 @@ struct PortalSettingsSection: View {
 
             Toggle("Pause queue", isOn: $portal.isPaused)
 
+            Picker("Jobs at once", selection: $capacity) {
+                ForEach(1...PortalJobQueue.maxCapacity, id: \.self) { n in
+                    Text(n == 1 ? "1 (one at a time)" : "\(n)").tag(n)
+                }
+            }
+            .pickerStyle(.menu)
+            .onChange(of: capacity) { _, _ in portal.capacityChanged() }
+
             HStack {
                 Text("Queue")
                 Spacer()
@@ -85,7 +94,7 @@ struct PortalSettingsSection: View {
         } header: {
             Text("Web Portal")
         } footer: {
-            Text("Lets people on Windows, phones and other Macs use StreamScribe from a browser, through a Cloudflare Tunnel protected by Cloudflare Access. The server listens only on this Mac (127.0.0.1) and refuses requests that reach it through Cloudflare without an Access sign-in. Jobs run one at a time on this Mac's engine, with the Mac's own settings restored after each job. Admins can pause the queue and stop or delete anyone's job; everyone else can manage their own. See PORTAL_SETUP.md.")
+            Text("Lets people on Windows, phones and other Macs use StreamScribe from a browser, through a Cloudflare Tunnel protected by Cloudflare Access. The server listens only on this Mac (127.0.0.1) and refuses requests that reach it through Cloudflare without an Access sign-in. The first job runs on this window's engine, with the Mac's own settings restored afterwards; with Jobs at once above 1, further jobs run on extra engines in the background and appear only in the portal. Each extra job loads its own models (roughly 1–2 GB) and shares the Neural Engine, so raise this only on a Mac with memory to spare. Admins can pause the queue and stop or delete anyone's job; everyone else can manage their own. See PORTAL_SETUP.md.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

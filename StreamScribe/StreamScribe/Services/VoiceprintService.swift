@@ -605,8 +605,6 @@ final class VoiceprintService: ObservableObject {
         return (id.name, true, uncertain)
     }
 
-    // MARK: - R2 loading
-
     // MARK: - Math
 
     /// Cosine similarity between two L2-normalized embeddings reduces
@@ -924,7 +922,6 @@ final class VoiceprintLibrary: ObservableObject {
     /// Look up display info using just a cluster ID. Used by callers
     /// that don't have a segment UUID (legacy paths, exports).
     /// Reflects cluster-level identifications only — for per-segment
-    /// detail, use `displayInfo(forSegmentId:clusterId:)`.
     /// All distinct enrolled identity names from the loaded template
     /// bank (~660 voiceprints from R2), sorted for display. This is
     /// the catalog the user picks from when manually matching an

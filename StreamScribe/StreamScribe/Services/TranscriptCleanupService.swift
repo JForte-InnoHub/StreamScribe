@@ -130,18 +130,22 @@ final class TranscriptCleanupService {
         knownNames: [String] = [],
         progress: @escaping (Int, Int) -> Void
     ) async throws -> CleanupResult {
-        // One pass at a time (see the note on `passTail`).
+        // One pass at a time (see the note on `passTail`): the tail task
+        // wraps THIS pass, so the next caller waits for it to finish.
         let previous = passTail
-        let gate = Task<Void, Never> { await previous?.value }
+        let work = Task<CleanupResult, Error> {
+            await previous?.value
+            try Task.checkCancellation()
+            return try await self.runCleanupPass(segments: segments, knownNames: knownNames, progress: progress)
+        }
+        let gate = Task<Void, Never> { _ = try? await work.value }
         passTail = gate
         activePasses += 1
         defer {
             activePasses -= 1
             if passTail == gate { passTail = nil }
         }
-        await previous?.value
-        try Task.checkCancellation()
-        return try await runCleanupPass(segments: segments, knownNames: knownNames, progress: progress)
+        return try await work.value
     }
 
     private func runCleanupPass(
