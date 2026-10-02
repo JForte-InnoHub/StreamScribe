@@ -13,7 +13,10 @@ import SwiftUI
 /// clearing).
 struct SpeakerPanel: View {
     @EnvironmentObject var engine: TranscriptionEngine
-    @ObservedObject private var voiceprints = VoiceprintService.shared
+    /// This session's speaker identities (per engine since 2026-10-02; the
+    /// engine forwards its change notifications, so reading through it
+    /// keeps the panel live).
+    private var voiceprints: VoiceprintService { engine.voiceprints }
     let onClose: () -> Void
 
     var body: some View {
@@ -101,7 +104,10 @@ struct SpeakerPanel: View {
 
 private struct SpeakerRow: View {
     @EnvironmentObject var engine: TranscriptionEngine
-    @ObservedObject private var voiceprints = VoiceprintService.shared
+    /// This session's speaker identities (per engine since 2026-10-02; the
+    /// engine forwards its change notifications, so reading through it
+    /// keeps the panel live).
+    private var voiceprints: VoiceprintService { engine.voiceprints }
     let machineLabel: String
     @State private var showIdentifySheet = false
 

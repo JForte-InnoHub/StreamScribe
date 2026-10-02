@@ -1505,7 +1505,7 @@ struct SidebarView: View {
             .trimmingCharacters(in: .whitespaces)
             .lowercased()
         let alreadySpotted = Set(engine.spottedSpeakers)
-        return VoiceprintService.shared.templates
+        return VoiceprintLibrary.shared.templates
             .filter { template in
                 !alreadySpotted.contains(template.name) &&
                 (query.isEmpty || template.name.lowercased().contains(query))
@@ -1518,7 +1518,7 @@ struct SidebarView: View {
     /// surface valid names, but this guards against stale state if
     /// templates are reloaded mid-add).
     private func addSpottedSpeaker(_ name: String) {
-        guard VoiceprintService.shared.templates.contains(where: { $0.name == name }) else { return }
+        guard VoiceprintLibrary.shared.templates.contains(where: { $0.name == name }) else { return }
         guard !engine.spottedSpeakers.contains(name) else { return }
         engine.spottedSpeakers.append(name)
         speakerSearchDraft = ""

@@ -140,7 +140,7 @@ final class PortalJobQueue: ObservableObject {
             engine.$speakerNames.map { _ in () },
             engine.$pinnedQuotes.map { _ in () },
             engine.$detectedTitle.map { _ in () },
-            VoiceprintService.shared.$identifications.map { _ in () })
+            engine.voiceprints.$identifications.map { _ in () })
             .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in self?.syncAttached() }
             .store(in: &cancellables)
@@ -450,7 +450,7 @@ final class PortalJobQueue: ObservableObject {
         var seen = Set<String>()
         for seg in segments {
             guard let label = seg.speaker, seen.insert(label).inserted else { continue }
-            let info = VoiceprintService.shared.displayInfo(forClusterId: label)
+            let info = engine.voiceprints.displayInfo(forClusterId: label)
             if info.isIdentified { voiceprint[label] = info.name }
         }
         let names = engine.speakerNames

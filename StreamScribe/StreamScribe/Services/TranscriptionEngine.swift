@@ -1050,7 +1050,7 @@ final class TranscriptionEngine: ObservableObject {
             return custom
         }
         // Cluster-level voiceprint identification.
-        let info = VoiceprintService.shared.displayInfo(forClusterId: label)
+        let info = voiceprints.displayInfo(forClusterId: label)
         if info.isIdentified {
             return info.name
         }
@@ -1180,6 +1180,20 @@ final class TranscriptionEngine: ObservableObject {
     @Published private(set) var mediaCache = MediaCacheManager.makeSessionCache()
     /// Per-engine video download slot (was a process-wide singleton).
     private let videoDownloader = VideoCacheDownloader()
+
+    /// This session's speaker identities (cluster → name, voiceprint
+    /// evidence). Per engine since 2026-10-02; the template bank it matches
+    /// against is the shared VoiceprintLibrary. Changes are forwarded to
+    /// this engine's objectWillChange so views reading
+    /// `engine.voiceprints` re-render.
+    let voiceprints = VoiceprintService()
+    private var voiceprintObservation: AnyCancellable?
+
+    init() {
+        voiceprintObservation = voiceprints.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
 
     /// Settings this engine's CURRENT session runs with — resolved from
     /// UserDefaults at Start, plus `nextSessionOverrides` (which the web
@@ -1418,7 +1432,7 @@ final class TranscriptionEngine: ObservableObject {
         // local. Same applies to the spotter's notified-speakers set
         // (per-session debounce; resets each Start).
         await MainActor.run {
-            VoiceprintService.shared.resetForNewSession()
+            voiceprints.resetForNewSession()
             self.notifiedSpeakers.removeAll()
         }
 
@@ -3612,7 +3626,7 @@ final class TranscriptionEngine: ObservableObject {
     /// session. Sequential, no concurrent extractions — WeSpeaker on
     /// ANE serializes anyway.
     private func runVoiceprintIdentification(newSegments: [TranscriptSegment]) async {
-        guard VoiceprintService.shared.isEnabled else { return }
+        guard voiceprints.isEnabled else { return }
 
         // **Defer to the refined pass when multi-pass refinement is
         // active.** Three wins from this skip:
@@ -3657,7 +3671,7 @@ final class TranscriptionEngine: ObservableObject {
             // cluster evidence now, because identity lives ONLY on
             // clusters and more evidence sharpens the cluster average.
             if let clusterId = seg.speaker,
-               let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+               let clusterIdent = voiceprints.identifications[clusterId],
                clusterIdent.isManual {
                 continue
             }
@@ -3697,17 +3711,17 @@ final class TranscriptionEngine: ObservableObject {
             // person," which is exactly the walked-away-from-a-long-
             // hearing case the spotter exists for.
             let clusterNameBefore = segment.speaker.flatMap {
-                VoiceprintService.shared.identifications[$0]?.name
+                voiceprints.identifications[$0]?.name
             }
             let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
-            VoiceprintService.shared.recordEmbedding(
+            voiceprints.recordEmbedding(
                 segmentId: segment.id,
                 embedding: embedding,
                 clusterId: segment.speaker,
                 weight: Float(max(0, segment.end - segment.start))
             )
             if let cluster = segment.speaker,
-               let id = VoiceprintService.shared.identifications[cluster],
+               let id = voiceprints.identifications[cluster],
                !id.isManual,
                id.name != clusterNameBefore {
                 print("[Voiceprint] Cluster \(cluster) newly → \(id.name) via seg \(String(segment.id.uuidString.prefix(8)))")
@@ -3745,7 +3759,7 @@ final class TranscriptionEngine: ObservableObject {
         windowStart: TimeInterval,
         windowEnd: TimeInterval
     ) async {
-        guard VoiceprintService.shared.isEnabled else { return }
+        guard voiceprints.isEnabled else { return }
 
         let minDurationSeconds: Double = 1.5
         let sampleRate: Double = 16_000
@@ -3768,7 +3782,7 @@ final class TranscriptionEngine: ObservableObject {
             // (user truth). Per-segment gate removed with the
             // unification; see the raw-pass loop for rationale.
             if let clusterId = seg.speaker,
-               let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+               let clusterIdent = voiceprints.identifications[clusterId],
                clusterIdent.isManual {
                 continue
             }
@@ -3789,7 +3803,7 @@ final class TranscriptionEngine: ObservableObject {
 
             do {
                 let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
-                VoiceprintService.shared.recordEmbedding(
+                voiceprints.recordEmbedding(
                     segmentId: seg.id,
                     embedding: embedding,
                     clusterId: seg.speaker,
@@ -3802,7 +3816,7 @@ final class TranscriptionEngine: ObservableObject {
                 // to every segment via `displayInfo`, this is where
                 // the spotter check anchors.
                 if let clusterId = seg.speaker,
-                   let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+                   let clusterIdent = voiceprints.identifications[clusterId],
                    !clusterIdent.isManual {
                     let shortID = String(seg.id.uuidString.prefix(8))
                     print("[Voiceprint] Refined seg \(shortID) (\(seg.speaker ?? "?")) → \(clusterIdent.name) (cluster, conf \(String(format: "%.3f", clusterIdent.confidence)))")
@@ -3872,7 +3886,7 @@ final class TranscriptionEngine: ObservableObject {
     /// the spinner extend by that amount; acceptable trade for
     /// catching diarizer merges visually.
     private func runVoiceprintIdentificationStatic() async {
-        guard VoiceprintService.shared.isEnabled else { return }
+        guard voiceprints.isEnabled else { return }
 
         let (pcm, allSegments) = await MainActor.run {
             (self.fullPcmBuffer ?? [], self.segments)
@@ -3899,7 +3913,7 @@ final class TranscriptionEngine: ObservableObject {
             for seg in allSegments {
                 if let sp = seg.speaker { assignments[seg.id] = sp }
             }
-            VoiceprintService.shared.reaggregate(assignments: assignments)
+            voiceprints.reaggregate(assignments: assignments)
         }
 
         let sampleRate: Double = 16_000
@@ -3915,9 +3929,9 @@ final class TranscriptionEngine: ObservableObject {
             // extraction; only segments the live pass never reached
             // (too short then, session-start races, refinement
             // replacements) are extracted here.
-            if VoiceprintService.shared.hasRetainedEmbedding(segmentId: seg.id) { continue }
+            if voiceprints.hasRetainedEmbedding(segmentId: seg.id) { continue }
             if let clusterId = seg.speaker,
-               let clusterIdent = VoiceprintService.shared.identifications[clusterId],
+               let clusterIdent = voiceprints.identifications[clusterId],
                clusterIdent.isManual {
                 continue
             }
@@ -3936,14 +3950,14 @@ final class TranscriptionEngine: ObservableObject {
             attemptedCount += 1
             do {
                 let embedding = try await WeSpeakerExtractor.shared.extractEmbedding(from: audio)
-                VoiceprintService.shared.recordEmbedding(
+                voiceprints.recordEmbedding(
                     segmentId: seg.id,
                     embedding: embedding,
                     clusterId: seg.speaker,
                     weight: Float(max(0, seg.end - seg.start))
                 )
                 if let cluster = seg.speaker,
-                   VoiceprintService.shared.identifications[cluster] != nil {
+                   voiceprints.identifications[cluster] != nil {
                     identifiedCount += 1
                 }
             } catch {
@@ -3958,7 +3972,7 @@ final class TranscriptionEngine: ObservableObject {
         // 5-since-last-match threshold). At session end we want to run
         // one final match on everything to make sure short clusters
         // get their chance.
-        VoiceprintService.shared.forceMatchAllPendingClusters()
+        voiceprints.forceMatchAllPendingClusters()
 
         // Consolidation: merge over-split clusters using identity
         // agreement and (optionally) the expected-speaker-count
@@ -3998,7 +4012,7 @@ final class TranscriptionEngine: ObservableObject {
             if let sp = seg.speaker { counts[sp, default: 0] += 1 }
         }
         guard counts.count > 1 else { return }
-        let vp = VoiceprintService.shared
+        let vp = voiceprints
 
         func cannotMerge(_ a: String, _ b: String) -> Bool {
             let renameA = speakerNames[a]?.trimmingCharacters(in: .whitespaces)
@@ -4957,7 +4971,7 @@ final class TranscriptionEngine: ObservableObject {
     /// speaker (cluster) as a named person. Thin wrapper over
     /// VoiceprintService so views route through one place.
     func identifyCluster(_ clusterId: String, as name: String) {
-        VoiceprintService.shared.setManualIdentification(clusterId: clusterId, name: name)
+        voiceprints.setManualIdentification(clusterId: clusterId, name: name)
     }
 
     /// UNIFIED IDENTIFY: identify a subset of segments as a named
@@ -4972,7 +4986,7 @@ final class TranscriptionEngine: ObservableObject {
         guard !segmentIDs.isEmpty else { return }
         let label = nextUnusedMachineLabel
         reassignSpeaker(segmentIDs: segmentIDs, to: label)
-        VoiceprintService.shared.setManualIdentification(clusterId: label, name: name)
+        voiceprints.setManualIdentification(clusterId: label, name: name)
         print("[Identify] \(segmentIDs.count) segment(s) split into \(label) → \(name)")
     }
 
@@ -4985,7 +4999,7 @@ final class TranscriptionEngine: ObservableObject {
         guard !slices.isEmpty else { return }
         let label = nextUnusedMachineLabel
         reassignSpeaker(splittingSlices: slices, to: label)
-        VoiceprintService.shared.setManualIdentification(clusterId: label, name: name)
+        voiceprints.setManualIdentification(clusterId: label, name: name)
         print("[Identify] Selection (\(slices.count) slice(s)) split into \(label) → \(name)")
     }
 
@@ -5223,7 +5237,7 @@ final class TranscriptionEngine: ObservableObject {
             // spellings.
             let knownNames = await MainActor.run {
                 Array(Set(self.speakerNames.values)
-                    .union(VoiceprintService.shared.sessionSpeakerHistory))
+                    .union(voiceprints.sessionSpeakerHistory))
             }
             let cleanupResult = try await TranscriptCleanupService.shared.cleanTranscript(
                 segments: snapshot,

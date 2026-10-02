@@ -139,7 +139,12 @@ struct SettingsView: View {
     /// Observed voiceprint service for the Voiceprints settings
     /// section. Surfaces template count, R2 refresh state, threshold
     /// sliders, and the master enable toggle.
-    @ObservedObject private var voiceprints = VoiceprintService.shared
+    /// Shared template bank (templates, load state, source URLs).
+    @ObservedObject private var voiceprints = VoiceprintLibrary.shared
+    /// The three UserDefaults-backed knobs (enabled, thresholds) live on the
+    /// per-session service as @AppStorage; any instance binds to the same
+    /// keys, so a private one serves as the Settings proxy.
+    @StateObject private var voiceprintSettings = VoiceprintService()
 
     /// Local state for the in-progress new-entry row. Empty strings
     /// mean the "+" button is disabled. Cleared after each successful
@@ -551,7 +556,7 @@ struct SettingsView: View {
     /// without clearing the registry — useful for A/B comparisons.
     private var voiceprintsHeaderRow: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("Enable speaker identification", isOn: $voiceprints.isEnabled)
+            Toggle("Enable speaker identification", isOn: $voiceprintSettings.isEnabled)
                 .font(.callout)
 
             HStack(spacing: 8) {
@@ -621,12 +626,12 @@ struct SettingsView: View {
                 Text("High confidence threshold")
                     .font(.callout)
                 Spacer()
-                Text(String(format: "%.2f", voiceprints.highConfidenceThreshold))
+                Text(String(format: "%.2f", voiceprintSettings.highConfidenceThreshold))
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
             Slider(
-                value: $voiceprints.highConfidenceThreshold,
+                value: $voiceprintSettings.highConfidenceThreshold,
                 in: 0.30...0.95,
                 step: 0.05
             )
@@ -635,12 +640,12 @@ struct SettingsView: View {
                 Text("Low confidence threshold")
                     .font(.callout)
                 Spacer()
-                Text(String(format: "%.2f", voiceprints.lowConfidenceThreshold))
+                Text(String(format: "%.2f", voiceprintSettings.lowConfidenceThreshold))
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
             Slider(
-                value: $voiceprints.lowConfidenceThreshold,
+                value: $voiceprintSettings.lowConfidenceThreshold,
                 in: 0.30...0.95,
                 step: 0.05
             )

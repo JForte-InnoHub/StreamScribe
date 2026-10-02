@@ -748,7 +748,7 @@ private struct SpeakerGroupView: View {
                     // cluster — no per-segment lookup exists anymore.
                     let isIdentified: Bool = {
                         if let cid = clusterId {
-                            return VoiceprintService.shared.displayInfo(forClusterId: cid).isIdentified
+                            return engine.voiceprints.displayInfo(forClusterId: cid).isIdentified
                         }
                         return false
                     }()
@@ -756,7 +756,7 @@ private struct SpeakerGroupView: View {
                         if let cid = clusterId {
                             let hasManualRename = engine.speakerNames[cid]?.isEmpty == false
                             if hasManualRename { return false }
-                            return VoiceprintService.shared.displayInfo(forClusterId: cid).isUncertain
+                            return engine.voiceprints.displayInfo(forClusterId: cid).isUncertain
                         }
                         return false
                     }()
@@ -972,12 +972,12 @@ private struct SpeakerGroupView: View {
             // menu below instead — it acts at the visible-group level.
             if let clusterId = groupClusterId {
                 Menu {
-                    let currentInfo = VoiceprintService.shared.displayInfo(forClusterId: clusterId)
-                    let sessionSpeakers = VoiceprintService.shared.sessionSpeakerHistory.sorted()
+                    let currentInfo = engine.voiceprints.displayInfo(forClusterId: clusterId)
+                    let sessionSpeakers = engine.voiceprints.sessionSpeakerHistory.sorted()
 
                     if currentInfo.isIdentified {
                         Button {
-                            VoiceprintService.shared.clearIdentification(clusterId: clusterId)
+                            engine.voiceprints.clearIdentification(clusterId: clusterId)
                         } label: {
                             Label("Clear current: \(currentInfo.name)",
                                   systemImage: "xmark.circle")
@@ -994,7 +994,7 @@ private struct SpeakerGroupView: View {
                     if !sessionSpeakers.isEmpty {
                         ForEach(sessionSpeakers, id: \.self) { name in
                             Button {
-                                VoiceprintService.shared.setManualIdentification(
+                                engine.voiceprints.setManualIdentification(
                                     clusterId: clusterId,
                                     name: name
                                 )
@@ -1026,7 +1026,7 @@ private struct SpeakerGroupView: View {
                         Label(sessionSpeakers.isEmpty ? "Choose speaker…" : "Other speaker…",
                               systemImage: "magnifyingglass")
                     }
-                    .disabled(VoiceprintService.shared.templates.isEmpty)
+                    .disabled(engine.voiceprints.templates.isEmpty)
                 } label: {
                     Label("Identify Speaker (entire cluster)", systemImage: "person.crop.circle.badge.checkmark")
                 }
@@ -1046,9 +1046,9 @@ private struct SpeakerGroupView: View {
             // priority over both automatic IDs and cluster IDs in
             // VoiceprintService's display precedence, the override
             // sticks.
-            if !VoiceprintService.shared.templates.isEmpty {
+            if !engine.voiceprints.templates.isEmpty {
                 Menu {
-                    let sessionSpeakers = VoiceprintService.shared.sessionSpeakerHistory.sorted()
+                    let sessionSpeakers = engine.voiceprints.sessionSpeakerHistory.sorted()
 
                     // Unified model (2026-07): identifying these
                     // segments SPLITS them into a freshly minted
@@ -1082,7 +1082,7 @@ private struct SpeakerGroupView: View {
                         Label(sessionSpeakers.isEmpty ? "Choose speaker…" : "Other speaker…",
                               systemImage: "magnifyingglass")
                     }
-                    .disabled(VoiceprintService.shared.templates.isEmpty)
+                    .disabled(engine.voiceprints.templates.isEmpty)
                 } label: {
                     Label("Identify These Segments", systemImage: "text.badge.checkmark")
                 }
@@ -1173,7 +1173,7 @@ private struct SpeakerGroupView: View {
                     switch identifyMode {
                     case .cluster:
                         if let cid = identifyClusterID {
-                            VoiceprintService.shared.setManualIdentification(
+                            engine.voiceprints.setManualIdentification(
                                 clusterId: cid,
                                 name: chosenName
                             )
@@ -1463,7 +1463,8 @@ struct IdentifySpeakerSheet: View {
 
     @State private var searchText: String = ""
     @FocusState private var searchFieldFocused: Bool
-    @ObservedObject private var voiceprints = VoiceprintService.shared
+    /// Template bank only — this sheet never touches session state.
+    @ObservedObject private var voiceprints = VoiceprintLibrary.shared
 
     var body: some View {
         VStack(spacing: 0) {

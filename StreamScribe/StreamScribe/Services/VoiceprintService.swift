@@ -33,27 +33,39 @@ import Combine
 /// CustomDictionary uses.
 @MainActor
 final class VoiceprintService: ObservableObject {
+    // PER-SESSION since 2026-10-02 (concurrent-sessions work). One of these
+    // lives on each TranscriptionEngine; the shared template bank moved to
+    // VoiceprintLibrary.shared. Before, this was a process-wide singleton
+    // whose resetForNewSession() ran at every Start — so a second session
+    // starting would have erased the first one's speaker identities.
 
-    static let shared = VoiceprintService()
+    typealias Voiceprint = VoiceprintLibrary.Voiceprint
+    typealias CategoryGroup = VoiceprintLibrary.CategoryGroup
+    typealias LoadState = VoiceprintLibrary.LoadState
+
+    let library: VoiceprintLibrary
+    private var libraryObservation: AnyCancellable?
+
+    init(library: VoiceprintLibrary = .shared) {
+        self.library = library
+        // Views observe a session; a template-bank refresh must still
+        // re-render them (pickers list the templates).
+        libraryObservation = library.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+    }
+
+    // Pass-throughs so existing call sites (and the identify loop) read
+    // the shared bank without caring where it lives.
+    var templates: [Voiceprint] { library.templates }
+    var categorizedTemplates: [CategoryGroup] { library.categorizedTemplates }
+    var loadState: LoadState { library.loadState }
+    var lastRefreshedAt: Date? { library.lastRefreshedAt }
+    var allTemplateNames: [String] { library.allTemplateNames }
+    func refreshFromRemote() async { await library.refreshFromRemote() }
+    static func l2Normalize(_ v: [Float]) -> [Float] { VoiceprintLibrary.l2Normalize(v) }
 
     // MARK: - Published state
-
-    /// Loaded voice templates from R2 or local cache. Empty until the
-    /// first successful load completes.
-    @Published private(set) var templates: [Voiceprint] = []
-
-    /// Templates grouped by source category, preserving the order of
-    /// the source URLs in `r2URLs`. Populated by `refreshFromRemote`;
-    /// empty when we've only loaded from cache (categories aren't
-    /// persisted in the cache — see the comment in `saveToLocalCache`
-    /// for why).
-    ///
-    /// The UI renders this as separate collapsible sections when
-    /// non-empty. When empty (cache-only mode, or first-load-still-
-    /// in-flight), the UI falls back to a flat list of `templates`
-    /// so users always see what's loaded regardless of whether a
-    /// live refresh has completed.
-    @Published private(set) var categorizedTemplates: [CategoryGroup] = []
 
     /// Per-session map of FluidAudio cluster ID → identified speaker.
     /// Populated by `setManualIdentification` (user-driven cluster-level
@@ -166,15 +178,6 @@ final class VoiceprintService: ObservableObject {
     /// names — which the transcript view then groups by effective
     /// name, visually splitting the merge.
 
-    /// State of the R2 refresh — drives the Settings UI to show
-    /// loading spinners, error messages, etc.
-    @Published private(set) var loadState: LoadState = .idle
-
-    /// Wall-clock time of the last successful R2 refresh. Nil before
-    /// the first refresh completes. Surfaced in Settings so users
-    /// can tell when templates are stale.
-    @Published private(set) var lastRefreshedAt: Date?
-
     // MARK: - User preferences
 
     /// Master toggle: when false, identification is skipped entirely.
@@ -199,154 +202,7 @@ final class VoiceprintService: ObservableObject {
     @AppStorage("voiceprint.lowConfidenceThreshold")
     var lowConfidenceThreshold: Double = 0.50
 
-    /// R2 URL for the combined voiceprints.json. Editable in Settings
-    /// in case the user moves the file or has a private mirror.
-    /// Default points at the production R2 bucket.
-    /// User-editable list of remote source URLs, ONE URL PER LINE.
-    /// Multi-line support was added so users can organize their
-    /// templates into separate JSON files by category (e.g.
-    /// `voiceprints-House.json`, `voiceprints-Senate.json`) and load
-    /// them all as a merged pool. Backward-compatible with the
-    /// original single-URL configuration: a value with no newlines
-    /// is treated as one URL.
-    ///
-    /// The AppStorage KEY stays `voiceprint.r2URL` (singular) even
-    /// though the value is now plural. Renaming the key would strand
-    /// existing users' customized value on upgrade. Existing single-
-    /// URL settings continue to work unchanged.
-    @AppStorage("voiceprint.r2URL")
-    var r2URLsRaw: String = """
-        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-House.json
-        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Senate.json
-        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Executive.json
-        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Governors.json
-        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Media.json
-        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Other.json
-        """
-
-    /// Parsed list of URLs from `r2URLsRaw`. Splits on newlines,
-    /// trims whitespace, drops empty lines, and drops entries that
-    /// don't parse as URLs. Called on every refresh so mid-session
-    /// edits in Settings take effect on the next refresh without
-    /// requiring an app restart.
-    var r2URLs: [URL] {
-        r2URLsRaw
-            .split(whereSeparator: { $0.isNewline })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .compactMap { URL(string: $0) }
-    }
-
     // MARK: - Types
-
-    enum LoadState: Equatable {
-        case idle
-        case loading
-        case loaded(count: Int)
-        case error(String)
-    }
-
-    /// A group of templates loaded from a single source URL.
-    /// The `name` derives from the URL filename: for a URL like
-    /// `.../voiceprints-House.json`, the category is "House".
-    /// Rendered as a collapsible section in the Settings UI.
-    struct CategoryGroup: Identifiable, Equatable {
-        var id: String { name }
-        let name: String
-        let templates: [Voiceprint]
-    }
-
-    /// Append a `?_ts=<epoch>` query parameter to force CDNs to
-    /// treat the request as a fresh URL, bypassing edge caches that
-    /// key on URL rather than headers. Used exclusively during
-    /// refresh — the resulting URL isn't stored, only requested.
-    ///
-    /// Cloudflare R2 (and most CDNs) fingerprint cached responses
-    /// by full URL including query string. Adding a unique timestamp
-    /// makes each refresh a cache miss at the edge, forcing R2 to
-    /// serve the latest object from origin. Trivial overhead —
-    /// milliseconds per request even on cache misses.
-    ///
-    /// If the URL already has query params, the timestamp gets
-    /// appended alongside. Never overwrites existing params.
-    private func bustCache(_ url: URL) -> URL {
-        var components = URLComponents(url: url, resolvingAgainstBaseURL: false) ?? URLComponents()
-        var items = components.queryItems ?? []
-        items.append(URLQueryItem(name: "_ts", value: String(Int(Date().timeIntervalSince1970))))
-        components.queryItems = items
-        return components.url ?? url
-    }
-
-    /// Derive a human-readable category name from a source URL.
-    ///
-    /// Recognized pattern: `voiceprints-<Category>.json` (or `_` in
-    /// place of `-`; case-insensitive on the `voiceprints` prefix).
-    /// Falls back to the URL's filename without extension for
-    /// URLs that don't fit the pattern — so users hosting their
-    /// files under different naming conventions still see something
-    /// meaningful.
-    ///
-    /// **Special case: `voiceprints.json` (no suffix).** Returns
-    /// "Uncategorized" so a single monolithic file doesn't produce
-    /// a section named "voiceprints" that looks like a bug.
-    static func categoryName(from url: URL) -> String {
-        let filename = url.lastPathComponent
-        let base = filename
-            .split(separator: ".")
-            .dropLast()
-            .joined(separator: ".")
-        guard !base.isEmpty else { return "Uncategorized" }
-
-        // Match the canonical pattern first.
-        let lowerBase = base.lowercased()
-        if lowerBase.hasPrefix("voiceprints") {
-            var suffix = String(base.dropFirst("voiceprints".count))
-            while let first = suffix.first, first == "-" || first == "_" || first == " " {
-                suffix.removeFirst()
-            }
-            if suffix.isEmpty {
-                return "Uncategorized"
-            }
-            return suffix
-        }
-        // Fallback for non-canonical filenames.
-        return base
-    }
-
-    /// One enrolled voice template. Matches the JSON shape produced
-    /// by the SpeakerEnroll CLI. Most metadata fields are optional
-    /// so partial / legacy JSONs still decode.
-    struct Voiceprint: Codable, Identifiable, Equatable {
-        var id: String { name }
-        let name: String
-        let embedding: [Float]
-        let nClips: Int?
-        let embeddingModel: String?
-        let createdAt: String?
-
-        enum CodingKeys: String, CodingKey {
-            case name, embedding
-            case nClips = "n_clips"
-            case embeddingModel = "embedding_model"
-            case createdAt = "created_at"
-        }
-    }
-
-    /// Top-level JSON envelope for the R2-hosted voiceprints file.
-    /// Versioned so a future schema change doesn't break old clients.
-    /// `templates` is the only required field; the rest are metadata.
-    struct VoiceprintsPayload: Codable {
-        let version: Int
-        let updatedAt: String?
-        let embeddingModel: String?
-        let templates: [Voiceprint]
-
-        enum CodingKeys: String, CodingKey {
-            case version, templates
-            case updatedAt = "updated_at"
-            case embeddingModel = "embedding_model"
-        }
-    }
 
     /// A single registry entry — one speaker cluster's identified
     /// name + confidence + provenance.
@@ -363,15 +219,6 @@ final class VoiceprintService: ObservableObject {
     }
 
     // MARK: - Init
-
-    private init() {
-        // Load local cache synchronously so the first session can
-        // start identifying speakers immediately even on a cold launch
-        // before R2 responds. R2 refresh runs in the background and
-        // overwrites the cache when it succeeds.
-        loadFromLocalCache()
-        Task { await refreshFromRemote() }
-    }
 
     // MARK: - Identification
 
@@ -749,26 +596,6 @@ final class VoiceprintService: ObservableObject {
         clusterEmbeddingsSinceLastMatch.removeAll()
     }
 
-    /// Look up display info using just a cluster ID. Used by callers
-    /// that don't have a segment UUID (legacy paths, exports).
-    /// Reflects cluster-level identifications only — for per-segment
-    /// detail, use `displayInfo(forSegmentId:clusterId:)`.
-    /// All distinct enrolled identity names from the loaded template
-    /// bank (~660 voiceprints from R2), sorted for display. This is
-    /// the catalog the user picks from when manually matching an
-    /// unknown speaker to a stored identity — the speaker-panel
-    /// "match to stored identity" workflow (2026-07-27). Empty until
-    /// the template bank finishes loading.
-    var allTemplateNames: [String] {
-        var seen = Set<String>()
-        var names: [String] = []
-        for t in templates where !seen.contains(t.name) {
-            seen.insert(t.name)
-            names.append(t.name)
-        }
-        return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-    }
-
     func displayInfo(forClusterId clusterId: String) -> (name: String, isIdentified: Bool, isUncertain: Bool) {
         guard let id = identifications[clusterId] else {
             return (clusterId, false, false)
@@ -779,6 +606,86 @@ final class VoiceprintService: ObservableObject {
     }
 
     // MARK: - R2 loading
+
+    // MARK: - Math
+
+    /// Cosine similarity between two L2-normalized embeddings reduces
+    /// to a dot product. Clamp to [-1, 1] for numerical safety —
+    /// float arithmetic can produce 1.0000003 etc.
+    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var dot: Float = 0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+        }
+        return Double(max(-1, min(1, dot)))
+    }
+
+    /// L2-normalize a vector so its magnitude equals 1. Defensive
+    /// against all-zero input (returns input unchanged) which would
+    /// otherwise produce NaN.
+}
+
+// MARK: - Shared template bank
+
+/// The enrolled voiceprint templates (~660 from R2) and their loading
+/// state. App-wide and read-only for sessions: identification STATE is
+/// per session in VoiceprintService.
+@MainActor
+final class VoiceprintLibrary: ObservableObject {
+    static let shared = VoiceprintLibrary()
+
+    enum LoadState: Equatable {
+        case idle
+        case loading
+        case loaded(count: Int)
+        case error(String)
+    }
+
+    /// A group of templates loaded from a single source URL.
+    /// The `name` derives from the URL filename: for a URL like
+    /// `.../voiceprints-House.json`, the category is "House".
+    /// Rendered as a collapsible section in the Settings UI.
+    struct CategoryGroup: Identifiable, Equatable {
+        var id: String { name }
+        let name: String
+        let templates: [Voiceprint]
+    }
+
+    /// One enrolled voice template. Matches the JSON shape produced
+    /// by the SpeakerEnroll CLI. Most metadata fields are optional
+    /// so partial / legacy JSONs still decode.
+    struct Voiceprint: Codable, Identifiable, Equatable {
+        var id: String { name }
+        let name: String
+        let embedding: [Float]
+        let nClips: Int?
+        let embeddingModel: String?
+        let createdAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case name, embedding
+            case nClips = "n_clips"
+            case embeddingModel = "embedding_model"
+            case createdAt = "created_at"
+        }
+    }
+
+    /// Top-level JSON envelope for the R2-hosted voiceprints file.
+    /// Versioned so a future schema change doesn't break old clients.
+    /// `templates` is the only required field; the rest are metadata.
+    struct VoiceprintsPayload: Codable {
+        let version: Int
+        let updatedAt: String?
+        let embeddingModel: String?
+        let templates: [Voiceprint]
+
+        enum CodingKeys: String, CodingKey {
+            case version, templates
+            case updatedAt = "updated_at"
+            case embeddingModel = "embedding_model"
+        }
+    }
 
     /// Fetch the latest voiceprints.json from R2. Updates `templates`
     /// and the local cache on success. On failure, leaves existing
@@ -957,26 +864,159 @@ final class VoiceprintService: ObservableObject {
             .appendingPathComponent("voiceprints.json")
     }
 
-    // MARK: - Math
-
-    /// Cosine similarity between two L2-normalized embeddings reduces
-    /// to a dot product. Clamp to [-1, 1] for numerical safety —
-    /// float arithmetic can produce 1.0000003 etc.
-    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Double {
-        guard a.count == b.count, !a.isEmpty else { return 0 }
-        var dot: Float = 0
-        for i in 0..<a.count {
-            dot += a[i] * b[i]
-        }
-        return Double(max(-1, min(1, dot)))
+    /// Append a `?_ts=<epoch>` query parameter to force CDNs to
+    /// treat the request as a fresh URL, bypassing edge caches that
+    /// key on URL rather than headers. Used exclusively during
+    /// refresh — the resulting URL isn't stored, only requested.
+    ///
+    /// Cloudflare R2 (and most CDNs) fingerprint cached responses
+    /// by full URL including query string. Adding a unique timestamp
+    /// makes each refresh a cache miss at the edge, forcing R2 to
+    /// serve the latest object from origin. Trivial overhead —
+    /// milliseconds per request even on cache misses.
+    ///
+    /// If the URL already has query params, the timestamp gets
+    /// appended alongside. Never overwrites existing params.
+    private func bustCache(_ url: URL) -> URL {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false) ?? URLComponents()
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "_ts", value: String(Int(Date().timeIntervalSince1970))))
+        components.queryItems = items
+        return components.url ?? url
     }
 
-    /// L2-normalize a vector so its magnitude equals 1. Defensive
-    /// against all-zero input (returns input unchanged) which would
-    /// otherwise produce NaN.
+    /// Derive a human-readable category name from a source URL.
+    ///
+    /// Recognized pattern: `voiceprints-<Category>.json` (or `_` in
+    /// place of `-`; case-insensitive on the `voiceprints` prefix).
+    /// Falls back to the URL's filename without extension for
+    /// URLs that don't fit the pattern — so users hosting their
+    /// files under different naming conventions still see something
+    /// meaningful.
+    ///
+    /// **Special case: `voiceprints.json` (no suffix).** Returns
+    /// "Uncategorized" so a single monolithic file doesn't produce
+    /// a section named "voiceprints" that looks like a bug.
+    static func categoryName(from url: URL) -> String {
+        let filename = url.lastPathComponent
+        let base = filename
+            .split(separator: ".")
+            .dropLast()
+            .joined(separator: ".")
+        guard !base.isEmpty else { return "Uncategorized" }
+
+        // Match the canonical pattern first.
+        let lowerBase = base.lowercased()
+        if lowerBase.hasPrefix("voiceprints") {
+            var suffix = String(base.dropFirst("voiceprints".count))
+            while let first = suffix.first, first == "-" || first == "_" || first == " " {
+                suffix.removeFirst()
+            }
+            if suffix.isEmpty {
+                return "Uncategorized"
+            }
+            return suffix
+        }
+        // Fallback for non-canonical filenames.
+        return base
+    }
+
+    /// Look up display info using just a cluster ID. Used by callers
+    /// that don't have a segment UUID (legacy paths, exports).
+    /// Reflects cluster-level identifications only — for per-segment
+    /// detail, use `displayInfo(forSegmentId:clusterId:)`.
+    /// All distinct enrolled identity names from the loaded template
+    /// bank (~660 voiceprints from R2), sorted for display. This is
+    /// the catalog the user picks from when manually matching an
+    /// unknown speaker to a stored identity — the speaker-panel
+    /// "match to stored identity" workflow (2026-07-27). Empty until
+    /// the template bank finishes loading.
+    var allTemplateNames: [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        for t in templates where !seen.contains(t.name) {
+            seen.insert(t.name)
+            names.append(t.name)
+        }
+        return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    /// Parsed list of URLs from `r2URLsRaw`. Splits on newlines,
+    /// trims whitespace, drops empty lines, and drops entries that
+    /// don't parse as URLs. Called on every refresh so mid-session
+    /// edits in Settings take effect on the next refresh without
+    /// requiring an app restart.
+    var r2URLs: [URL] {
+        r2URLsRaw
+            .split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .compactMap { URL(string: $0) }
+    }
+
+    /// Loaded voice templates from R2 or local cache. Empty until the
+    /// first successful load completes.
+    @Published private(set) var templates: [Voiceprint] = []
+
+    /// Templates grouped by source category, preserving the order of
+    /// the source URLs in `r2URLs`. Populated by `refreshFromRemote`;
+    /// empty when we've only loaded from cache (categories aren't
+    /// persisted in the cache — see the comment in `saveToLocalCache`
+    /// for why).
+    ///
+    /// The UI renders this as separate collapsible sections when
+    /// non-empty. When empty (cache-only mode, or first-load-still-
+    /// in-flight), the UI falls back to a flat list of `templates`
+    /// so users always see what's loaded regardless of whether a
+    /// live refresh has completed.
+    @Published private(set) var categorizedTemplates: [CategoryGroup] = []
+
+    /// State of the R2 refresh — drives the Settings UI to show
+    /// loading spinners, error messages, etc.
+    @Published private(set) var loadState: LoadState = .idle
+
+    /// Wall-clock time of the last successful R2 refresh. Nil before
+    /// the first refresh completes. Surfaced in Settings so users
+    /// can tell when templates are stale.
+    @Published private(set) var lastRefreshedAt: Date?
+
+    /// R2 URL for the combined voiceprints.json. Editable in Settings
+    /// in case the user moves the file or has a private mirror.
+    /// Default points at the production R2 bucket.
+    /// User-editable list of remote source URLs, ONE URL PER LINE.
+    /// Multi-line support was added so users can organize their
+    /// templates into separate JSON files by category (e.g.
+    /// `voiceprints-House.json`, `voiceprints-Senate.json`) and load
+    /// them all as a merged pool. Backward-compatible with the
+    /// original single-URL configuration: a value with no newlines
+    /// is treated as one URL.
+    ///
+    /// The AppStorage KEY stays `voiceprint.r2URL` (singular) even
+    /// though the value is now plural. Renaming the key would strand
+    /// existing users' customized value on upgrade. Existing single-
+    /// URL settings continue to work unchanged.
+    @AppStorage("voiceprint.r2URL")
+    var r2URLsRaw: String = """
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-House.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Senate.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Executive.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Governors.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Media.json
+        https://pub-201cda1156ec4d469157edb7a3ec216d.r2.dev/voiceprints-Other.json
+        """
+
     static func l2Normalize(_ v: [Float]) -> [Float] {
         let magnitude = sqrt(v.map { $0 * $0 }.reduce(0, +))
         guard magnitude > 0 else { return v }
         return v.map { $0 / magnitude }
+    }
+
+    private init() {
+        // Load local cache synchronously so the first session can
+        // start identifying speakers immediately even on a cold launch
+        // before R2 responds. R2 refresh runs in the background and
+        // overwrites the cache when it succeeds.
+        loadFromLocalCache()
+        Task { await refreshFromRemote() }
     }
 }

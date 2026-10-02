@@ -19,7 +19,7 @@ import Combine
 /// regression is one toggle away from escape.
 struct TranscriptDocumentPaneView: View {
     @EnvironmentObject private var engine: TranscriptionEngine
-    @ObservedObject private var voiceprints = VoiceprintService.shared
+    private var voiceprints: VoiceprintService { engine.voiceprints }
     @Environment(\.openWindow) private var openWindow
 
     /// Right-panel routing — same binding the classic pane drives, so
@@ -122,7 +122,7 @@ struct TranscriptDocumentPaneView: View {
                     switch identifyMode {
                     case .cluster:
                         if let cid = identifyClusterID {
-                            VoiceprintService.shared.setManualIdentification(
+                            engine.voiceprints.setManualIdentification(
                                 clusterId: cid, name: chosenName
                             )
                         }
@@ -568,7 +568,7 @@ struct TranscriptDocumentPaneView: View {
         }
 
         // Identify actions require templates + a cluster identity.
-        let voiceprints = VoiceprintService.shared
+        let voiceprints = engine.voiceprints
         if let clusterId, !voiceprints.templates.isEmpty {
             items.append(.separator())
 
