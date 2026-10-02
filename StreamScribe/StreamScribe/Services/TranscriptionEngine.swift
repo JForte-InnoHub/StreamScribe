@@ -719,7 +719,7 @@ final class TranscriptionEngine: ObservableObject {
     @MainActor
     private func publishBestPlaybackMedia() {
         let fm = FileManager.default
-        let video = MediaCacheManager.videoDownloadFileURL
+        let video = mediaCache.videoDownloadFileURL
         if fm.fileExists(atPath: video.path) {
             if playbackMediaURL != video {
                 playbackMediaURL = video
@@ -727,7 +727,7 @@ final class TranscriptionEngine: ObservableObject {
             }
             return
         }
-        let cache = MediaCacheManager.currentFileURL
+        let cache = mediaCache.currentFileURL
         if fm.fileExists(atPath: cache.path) {
             playbackMediaURL = cache
         }
@@ -1171,6 +1171,22 @@ final class TranscriptionEngine: ObservableObject {
     // MARK: - Internals
 
     private let extractor = AudioStreamExtractor()
+
+    /// This engine's media cache directory (per session, 2026-10-02). A
+    /// fresh one is made at every Start and the previous one is deleted
+    /// then — only THIS engine's, so another engine's running session is
+    /// never touched. Published because the portal watches it to tell
+    /// which engine a playback file belongs to.
+    @Published private(set) var mediaCache = MediaCacheManager.makeSessionCache()
+    /// Per-engine video download slot (was a process-wide singleton).
+    private let videoDownloader = VideoCacheDownloader()
+
+    /// Settings this engine's CURRENT session runs with — resolved from
+    /// UserDefaults at Start, plus `nextSessionOverrides` (which the web
+    /// portal sets right before calling start(); consumed there so it
+    /// never leaks into a later session). See SessionSettings.
+    @Published private(set) var activeSettings = SessionSettings.fromDefaults()
+    var nextSessionOverrides: SessionSettings.Overrides? = nil
     // Multi-pass live (Phase 3+) holds two transcription backends and two
     // diarization backends concurrently. The "raw" pair is the always-on
     // primary — for single-pass live mode and static mode it's the only pair
@@ -1520,8 +1536,13 @@ final class TranscriptionEngine: ObservableObject {
         // have its video download running; stop() is the only other place
         // that cancels it. Left alone, it lands after this session started
         // and republishes the OLD video as this session's playback media.
-        VideoCacheDownloader.shared.cancel()
-        MediaCacheManager.clearAll()
+        videoDownloader.cancel()
+        mediaCache.clear()
+        mediaCache = MediaCacheManager.makeSessionCache()
+
+        // Fix this session's settings now; nothing below reads UserDefaults.
+        activeSettings = SessionSettings.fromDefaults().applying(nextSessionOverrides)
+        nextSessionOverrides = nil
 
         // Per-session silence diagnostics — these are app-lifetime
         // properties, so without this a second session would inherit
@@ -1974,7 +1995,7 @@ final class TranscriptionEngine: ObservableObject {
         userInitiatedStop = graceful
 
         // Split-stream: a video cache download may be in flight.
-        VideoCacheDownloader.shared.cancel()
+        videoDownloader.cancel()
         Task { await extractor.stop() }
 
         if graceful {
@@ -2571,8 +2592,7 @@ final class TranscriptionEngine: ObservableObject {
             // change the in-flight run's behavior — the user gets what
             // they asked for when they hit Start. Default to true if the
             // key has never been written.
-            let wantsVideo = UserDefaults.standard.object(forKey: mediaCacheIncludeVideoKey) as? Bool
-                ?? mediaCacheIncludeVideoDefault
+            let wantsVideo = activeSettings.cacheVideo
 
             // SPLIT-STREAM COMPLETION (2026-08-12). The block below
             // gives STATIC sessions their miniplayer video from a
@@ -2612,7 +2632,9 @@ final class TranscriptionEngine: ObservableObject {
                 // that writes an mp4 file there in parallel with PCM
                 // going to transcription. Local files skip this — the
                 // original file is already playable.
-                cacheOutputPath: source != .localFile ? try? MediaCacheManager.prepareForRecording().path : nil,
+                cacheOutputPath: source != .localFile ? try? mediaCache.prepareForRecording().path : nil,
+                liveFromStart: activeSettings.liveFromStart,
+                audioNormalization: activeSettings.audioNormalization,
                 // Honor the user's video-or-audio-only preference for the
                 // cache output. When false, yt-dlp downloads audio-only
                 // (bandwidth/disk save) and ffmpeg writes an audio-only
@@ -2632,8 +2654,10 @@ final class TranscriptionEngine: ObservableObject {
             // See `publishBestPlaybackMedia()` for why the finalize
             // paths must not blindly overwrite what this publishes.
             if useFastDownload && wantsVideo && source != .localFile {
+                let sessionCache = mediaCache
+                let downloader = videoDownloader
                 Task { [weak self] in
-                    let ok = await VideoCacheDownloader.shared.run(url: url)
+                    let ok = await downloader.run(url: url, into: sessionCache)
                     guard ok, let self else { return }
                     await MainActor.run {
                         // Guard on the FILE, not engine state: sessions
@@ -2645,8 +2669,9 @@ final class TranscriptionEngine: ObservableObject {
                         // it's still this session's video. (A manual Stop
                         // cancels the download before it succeeds, so
                         // that path never reaches here.)
-                        guard FileManager.default.fileExists(atPath: MediaCacheManager.videoDownloadFileURL.path) else { return }
-                        self.playbackMediaURL = MediaCacheManager.videoDownloadFileURL
+                        guard self.mediaCache == sessionCache,
+                              FileManager.default.fileExists(atPath: sessionCache.videoDownloadFileURL.path) else { return }
+                        self.playbackMediaURL = sessionCache.videoDownloadFileURL
                         print("[Pipeline] Miniplayer switched to downloaded video cache.")
                     }
                 }
@@ -2787,7 +2812,7 @@ final class TranscriptionEngine: ObservableObject {
             // refinement, rediarize, cache publish — so it edits the
             // best available text. Failures never fail the session;
             // affected segments simply keep verbatim text.
-            if UserDefaults.standard.bool(forKey: TranscriptCleanupService.enabledKey) {
+            if activeSettings.cleanupEnabled {
                 await runTranscriptCleanupPass()
             }
 
@@ -4039,7 +4064,7 @@ final class TranscriptionEngine: ObservableObject {
         }
 
         // Phase 2 — expected-count constrained centroid merging.
-        let expected = Self.expectedSpeakerCount
+        let expected = activeSettings.expectedSpeakerCount
         if expected > 0 {
             let similarityFloor: Float = 0.60
             while counts.count > expected {
@@ -8134,7 +8159,7 @@ final class TranscriptionEngine: ObservableObject {
         // live-edge session is at the edge from its first sample.
         guard livePhase != .atLiveEdge else { return }
         guard sessionMode != .static,
-              AudioStreamExtractor.liveFromStartEnabled else {
+              activeSettings.liveFromStart else {
             if livePhase != nil { livePhase = nil }
             return
         }

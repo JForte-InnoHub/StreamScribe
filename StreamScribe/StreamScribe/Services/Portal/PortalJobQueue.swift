@@ -477,6 +477,9 @@ final class PortalJobQueue: ObservableObject {
 
     private func restoreSettings() {
         engine?.portalEngineChoiceActive = false
+        // start() consumes the overrides; if it never ran (requeue, early
+        // failure) they must not carry into a session someone starts on the Mac.
+        engine?.nextSessionOverrides = nil
         guard !restoreItems.isEmpty else { return }
         PortalSettingsApplier.restore(restoreItems, engine: engine)
         restoreItems = []
@@ -491,15 +494,28 @@ final class PortalJobQueue: ObservableObject {
         }
     }
 
-    /// If the app quit mid-job, the UserDefaults-backed settings the job changed
-    /// (cleanup, backlog-from-start, expected speakers) are still changed. Put
-    /// them back before anything reads them.
+    /// Older builds applied some per-job settings by rewriting UserDefaults
+    /// and saved a restore list in case the app quit mid-job. Those settings
+    /// are now per-session overrides, so there is nothing to restore; put
+    /// back whatever an older build left behind, then drop the key.
     private func restorePendingSettingsFromLastLaunch() {
-        guard let data = UserDefaults.standard.data(forKey: Self.pendingRestoreKey),
+        let d = UserDefaults.standard
+        guard let data = d.data(forKey: Self.pendingRestoreKey),
               let items = try? JSONDecoder().decode([PortalRestoreItem].self, from: data) else { return }
-        print("[Portal] Restoring \(items.count) setting(s) left over from an interrupted job.")
-        PortalSettingsApplier.restore(items, engine: nil)
-        UserDefaults.standard.removeObject(forKey: Self.pendingRestoreKey)
+        for item in items.reversed() {
+            let key: String
+            let isBool: Bool
+            if item.key.hasPrefix("ud.bool:") { key = String(item.key.dropFirst(8)); isBool = true }
+            else if item.key.hasPrefix("ud.int:") { key = String(item.key.dropFirst(7)); isBool = false }
+            else { continue }
+            if let before = item.before {
+                if isBool { d.set(before == "true", forKey: key) } else { d.set(Int(before) ?? 0, forKey: key) }
+            } else {
+                d.removeObject(forKey: key)
+            }
+        }
+        print("[Portal] Restored \(items.count) setting(s) left over from an older build's interrupted job.")
+        d.removeObject(forKey: Self.pendingRestoreKey)
     }
 
     // MARK: - Job storage
@@ -1381,7 +1397,7 @@ final class PortalJobQueue: ObservableObject {
     private static let browserReadyExtensions: Set<String> = ["mp4", "m4a", "mp3", "aac"]
 
     private func handlePlaybackMediaChange(_ url: URL?) {
-        guard let url, url == MediaCacheManager.videoDownloadFileURL,
+        guard let url, MediaCacheManager.isVideoCacheFile(url),
               let id = attachedJobID, let job = job(id), job.status.isTerminal, !job.isUpload else { return }
         snapshotEngineMedia(id)
     }
@@ -1400,7 +1416,7 @@ final class PortalJobQueue: ObservableObject {
             }
             return
         }
-        let isVideoCache = (src == MediaCacheManager.videoDownloadFileURL)
+        let isVideoCache = MediaCacheManager.isVideoCacheFile(src)
         let folder = Self.mediaFolder(id)
         let clone = folder.appendingPathComponent((isVideoCache ? "video" : "session") + "-source." + (src.pathExtension.isEmpty ? "mp4" : src.pathExtension))
         // Already have the video (the engine re-publishes the same URL at

@@ -71,8 +71,65 @@ enum MediaCacheManager {
     /// only one transcription runs at a time, so there's no conflict.
     /// `.mp4` for native AVPlayer/QuickTime compatibility on macOS;
     /// see the class doc for rationale.
+    /// Per-session cache (2026-10-02, concurrent-sessions work). Each
+    /// TranscriptionEngine gets its own subdirectory, so a second session
+    /// starting no longer deletes the first one's media mid-run. The file
+    /// NAMES inside are unchanged (current.mp4 / session-video.mp4), so
+    /// consumers that key on them (miniplayer live-asset detection, the
+    /// portal's media snapshot) keep working by last path component.
+    struct SessionCache: Sendable, Equatable {
+        let directory: URL
+
+        var currentFileURL: URL { directory.appendingPathComponent(MediaCacheManager.currentFileName) }
+        var videoDownloadFileURL: URL { directory.appendingPathComponent(MediaCacheManager.videoFileName) }
+        var videoRawFileURL: URL { directory.appendingPathComponent("session-video-raw.mp4") }
+
+        /// Create the directory and remove any stale pipe output.
+        func prepareForRecording() throws -> URL {
+            let fm = FileManager.default
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? fm.removeItem(at: currentFileURL)
+            return currentFileURL
+        }
+
+        /// Delete this session's directory and everything in it.
+        func clear() {
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: directory.path) else { return }
+            do {
+                try fm.removeItem(at: directory)
+                print("[MediaCache] Cleared session cache \(directory.lastPathComponent).")
+            } catch {
+                print("[MediaCache] Failed to clear \(directory.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    static let currentFileName = "current.mp4"
+    static let videoFileName = "session-video.mp4"
+
+    /// A fresh per-session cache under `<cache>/sessions/<id>/`.
+    static func makeSessionCache(id: UUID = UUID()) -> SessionCache {
+        SessionCache(directory: cacheDirectory
+            .appendingPathComponent("sessions")
+            .appendingPathComponent(id.uuidString))
+    }
+
+    /// True for the growing pipe output of ANY session (the miniplayer
+    /// loads it as a fragmented asset).
+    static func isLiveCacheFile(_ url: URL) -> Bool {
+        url.isFileURL && url.lastPathComponent == currentFileName && url.path.hasPrefix(cacheDirectory.path)
+    }
+
+    /// True for a downloaded session video of ANY session.
+    static func isVideoCacheFile(_ url: URL) -> Bool {
+        url.isFileURL && url.lastPathComponent == videoFileName && url.path.hasPrefix(cacheDirectory.path)
+    }
+
+    /// Legacy single-slot paths (pre-2026-10-02), kept only so clearAll()
+    /// still covers files written by older builds.
     static var currentFileURL: URL {
-        cacheDirectory.appendingPathComponent("current.mp4")
+        cacheDirectory.appendingPathComponent(currentFileName)
     }
 
     /// Split-stream video cache (2026-07). For STATIC sessions the
@@ -86,22 +143,9 @@ enum MediaCacheManager {
     /// to a .part file and renames on success, so a partial download
     /// can never be mistaken for a playable file.
     static var videoDownloadFileURL: URL {
-        cacheDirectory.appendingPathComponent("session-video.mp4")
+        cacheDirectory.appendingPathComponent(videoFileName)
     }
 
-    /// Ensure the cache directory exists, returning the path that
-    /// ffmpeg should write to. Called by `TranscriptionEngine` before
-    /// starting the extractor. Throws if directory creation fails —
-    /// rare (would need a permissions issue or full disk).
-    static func prepareForRecording() throws -> URL {
-        let fm = FileManager.default
-        try fm.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        // Wipe any leftover from a previous run so partial mkv data
-        // can't confuse the miniplayer if the new recording fails
-        // before producing usable output.
-        try? fm.removeItem(at: currentFileURL)
-        return currentFileURL
-    }
 
     /// Remove every file under the cache directory. Called on app
     /// launch (catches files from a crashed prior session), on each new
@@ -156,7 +200,8 @@ enum MediaCacheManager {
 /// pre-split behavior. Lives in this file so no new Xcode file
 /// membership is needed.
 final class VideoCacheDownloader: @unchecked Sendable {
-    static let shared = VideoCacheDownloader()
+    /// One instance per TranscriptionEngine (2026-10-02): a single shared
+    /// slot meant one session's cancel() killed another session's download.
 
     private let lock = NSLock()
     private var process: Process?
@@ -165,9 +210,10 @@ final class VideoCacheDownloader: @unchecked Sendable {
     /// `MediaCacheManager.videoDownloadFileURL`. Returns true when the
     /// completed file exists at the final path. Safe to call from any
     /// task; cancellation via `cancel()`.
-    func run(url: URL) async -> Bool {
+    func run(url: URL, into cache: MediaCacheManager.SessionCache) async -> Bool {
         cancel()
-        let dest = MediaCacheManager.videoDownloadFileURL
+        let dest = cache.videoDownloadFileURL
+        try? FileManager.default.createDirectory(at: cache.directory, withIntermediateDirectories: true)
         // Raw download target. FIELD BUG (2026-07-21, VRP err=-12852,
         // Fox Business): source bitstreams can be AVFoundation-hostile
         // — this one had malformed SEI NAL units that ffmpeg merely
@@ -177,8 +223,7 @@ final class VideoCacheDownloader: @unchecked Sendable {
         // So the raw download is a STAGING file; the published
         // session-video.mp4 is always the laundered transcode below —
         // same codec-proof guarantee as the cache path.
-        let rawDest = MediaCacheManager.cacheDirectory
-            .appendingPathComponent("session-video-raw.mp4")
+        let rawDest = cache.videoRawFileURL
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.removeItem(at: rawDest)
 
@@ -190,7 +235,7 @@ final class VideoCacheDownloader: @unchecked Sendable {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: tools.ytDlpPath)
         if let env = tools.childEnvironment { proc.environment = env }
-        proc.currentDirectoryURL = MediaCacheManager.cacheDirectory
+        proc.currentDirectoryURL = cache.directory
 
         var args: [String] = ["--ignore-config", "--no-mark-watched"]
         if let denoPath = tools.denoPath {
@@ -264,7 +309,7 @@ final class VideoCacheDownloader: @unchecked Sendable {
         // here (unlike the fragmented cache): this is a complete
         // offline file, and moov-up-front makes the miniplayer open it
         // instantly.
-        let ok = await transcode(rawDest: rawDest, dest: dest)
+        let ok = await transcode(rawDest: rawDest, dest: dest, workingDirectory: cache.directory)
         try? FileManager.default.removeItem(at: rawDest)
         if ok {
             print("[VideoCache] Video cache ready (\(sizeMB(dest))).")
@@ -283,14 +328,14 @@ final class VideoCacheDownloader: @unchecked Sendable {
     /// ffmpeg launder pass: raw download → AVPlayer-safe mp4. Runs
     /// under the same cancellation regime as the download (cancel()
     /// terminates whichever process is current).
-    private func transcode(rawDest: URL, dest: URL) async -> Bool {
+    private func transcode(rawDest: URL, dest: URL, workingDirectory: URL) async -> Bool {
         guard let ffmpeg = ToolManager.shared.ffmpegPath else {
             print("[VideoCache] ffmpeg unavailable for transcode.")
             return false
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: ffmpeg)
-        proc.currentDirectoryURL = MediaCacheManager.cacheDirectory
+        proc.currentDirectoryURL = workingDirectory
         proc.arguments = [
             "-hide_banner", "-loglevel", "warning",
             "-i", rawDest.path,

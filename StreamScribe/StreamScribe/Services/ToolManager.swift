@@ -316,10 +316,10 @@ final class ToolManager: ObservableObject {
     /// at building scale; Jamie's VPN test proved recovery is
     /// instant on a fresh egress). nil = use the configured primary
     /// proxy or direct. Cleared by the extractor at session end.
-    /// Static because proxyArguments() is static and consumed at all
-    /// six spawn sites — the override propagates to probe, pipe,
-    /// downloader, and cache alike.
-    static var sessionProxyOverride: String?
+    /// Per-extractor since 2026-10-02 (`AudioStreamExtractor
+    /// .sessionProxyOverride`), passed into `proxyArguments(sessionOverride:)`
+    /// by the extractor's own spawn sites; a static here would have made
+    /// one session's rotation redirect every other session's processes.
 
     /// Parsed fallback proxy list: one URL per line (commas also
     /// accepted), blanks dropped.
@@ -564,9 +564,9 @@ final class ToolManager: ObservableObject {
     /// `--proxy` arguments from the sidebar setting; [] when unset.
     /// Thread-safe (reads UserDefaults directly) for the same reasons
     /// as `youtubePlayerClientArguments`.
-    static func proxyArguments() -> [String] {
+    static func proxyArguments(sessionOverride: String? = nil) -> [String] {
         // Rotation override wins over the configured primary.
-        let value = (sessionProxyOverride
+        let value = (sessionOverride
             ?? UserDefaults.standard.string(forKey: proxyURLDefaultsKey)
             ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)

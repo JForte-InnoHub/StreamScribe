@@ -515,6 +515,13 @@ actor AudioStreamExtractor {
     /// Index of the NEXT fallback proxy to try (0 = none tried yet;
     /// the session starts on the configured primary proxy or direct).
     private var proxyRotationIndex = 0
+    /// Egress override from this session's proxy rotation (nil = the
+    /// configured primary proxy or direct). Per extractor, see ToolManager.
+    private var sessionProxyOverride: String?
+    /// Session settings snapshot, set in start(). Defaults mirror the
+    /// UserDefaults values for callers that haven't been updated.
+    private var sessionLiveFromStart: Bool = AudioStreamExtractor.liveFromStartEnabled
+    private var sessionAudioNormalization: Bool = UserDefaults.standard.bool(forKey: "extractor.audioNormalizationEnabled")
     private var currentRateStats: AudioRateStats?
     private var liveEscalationContext: (url: URL, source: StreamSource, sourceLabel: String, ffmpegPath: String, cacheOutputPath: String?)?
 
@@ -566,7 +573,9 @@ actor AudioStreamExtractor {
         useFastDownload: Bool = false,
         progressCallback: (@Sendable (Double, String) -> Void)? = nil,
         cacheOutputPath: String? = nil,
-        wantsVideoInCache: Bool = true
+        wantsVideoInCache: Bool = true,
+        liveFromStart: Bool = AudioStreamExtractor.liveFromStartEnabled,
+        audioNormalization: Bool = UserDefaults.standard.bool(forKey: "extractor.audioNormalizationEnabled")
     ) async throws -> AsyncStream<[Float]> {
         // Resolve ffmpeg path once up-front; cleaner error path if missing.
         let ffmpeg = try Self.requireFFmpegPath()
@@ -576,6 +585,10 @@ actor AudioStreamExtractor {
         // through every parameter.
         self.downloadProgressCallback = progressCallback
         self.wantsVideoInCacheFlag = wantsVideoInCache
+        // Session settings snapshot (2026-10-02): read once here, not from
+        // UserDefaults mid-run, so two concurrent sessions can differ.
+        self.sessionLiveFromStart = liveFromStart
+        self.sessionAudioNormalization = audioNormalization
 
         let inputURL: String
         let inputIsLocalFile: Bool
@@ -751,7 +764,7 @@ actor AudioStreamExtractor {
         botWallDetected = false
         current403Counter = nil
         proxyRotationIndex = 0
-        ToolManager.sessionProxyOverride = nil
+        sessionProxyOverride = nil
         if let p = ffmpegProcess, p.isRunning {
             p.terminate()
         }
@@ -868,7 +881,7 @@ actor AudioStreamExtractor {
         guard proxyRotationIndex < fallbacks.count else { return false }
         let next = fallbacks[proxyRotationIndex]
         proxyRotationIndex += 1
-        ToolManager.sessionProxyOverride = next
+        sessionProxyOverride = next
         print("[Egress] \(reason) — rotating to fallback proxy \(proxyRotationIndex)/\(fallbacks.count): \(Self.redactProxyCredentials(next))")
         botWallDetected = false
         escalationAttempt = 0
@@ -1136,7 +1149,7 @@ actor AudioStreamExtractor {
         // WeSpeaker normalizes internally so impact should be nil, but
         // that's an empirical question the toggle exists to answer,
         // not an assumption to bake in silently.
-        if UserDefaults.standard.bool(forKey: "extractor.audioNormalizationEnabled") {
+        if sessionAudioNormalization {
             args.append(contentsOf: ["-af", "dynaudnorm=f=250:g=15"])
         }
         args.append(contentsOf: [
@@ -1605,7 +1618,7 @@ actor AudioStreamExtractor {
             // ToolManager.youtubePlayerClientArguments — web-family
             // client so the PO-token provider (WebPO-only) applies.
             args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
-            args.append(contentsOf: ToolManager.proxyArguments())
+            args.append(contentsOf: ToolManager.proxyArguments(sessionOverride: sessionProxyOverride))
             // Format selector chosen by the user's miniplayer-cache
             // preference. The selectors below are stacked in priority
             // order; yt-dlp tries each and picks the first that
@@ -1968,7 +1981,7 @@ actor AudioStreamExtractor {
             // 30 s before the watchdog escalated its way to the live edge.
             // Joining the edge is now the default and the backlog is
             // opt-in; see `liveFromStartEnabled`.
-            useLiveFromStart: !isStaticSession && Self.liveFromStartEnabled,
+            useLiveFromStart: !isStaticSession && sessionLiveFromStart,
             useCookies: true
         )
 
@@ -2001,7 +2014,7 @@ actor AudioStreamExtractor {
         // time on every successful backlog drain, delaying the ffmpeg spawn
         // for no benefit. A drain announces itself immediately — bytes at
         // ~10x realtime — and the stalling case is caught by the watchdog.
-        let usedLiveFromStart = !isStaticSession && Self.liveFromStartEnabled
+        let usedLiveFromStart = !isStaticSession && sessionLiveFromStart
         let failedWithKnownBug = await waitForEarlyFailure(
             timeout: 20.0,
             errorPatterns: usedLiveFromStart
@@ -2164,7 +2177,7 @@ actor AudioStreamExtractor {
         }
         // User-configured proxy (sidebar). The in-app answer to
         // IP-level walls; empty = direct.
-        args.append(contentsOf: ToolManager.proxyArguments())
+        args.append(contentsOf: ToolManager.proxyArguments(sessionOverride: sessionProxyOverride))
         // Format selector: with video, a single muxed format yt-dlp
         // can stream on stdout (it can't merge separate streams when
         // piping). Without video, plain bestaudio — audio-only.
@@ -2790,7 +2803,7 @@ actor AudioStreamExtractor {
             // ToolManager.youtubePlayerClientArguments — web-family
             // client so the PO-token provider (WebPO-only) applies.
             args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
-            args.append(contentsOf: ToolManager.proxyArguments())
+            args.append(contentsOf: ToolManager.proxyArguments(sessionOverride: sessionProxyOverride))
             // Mirrors the live-pipe format selector — single muxed
             // container at ≤480p with audio-only fallback when video
             // is wanted, plain bestaudio when not. -g returns the

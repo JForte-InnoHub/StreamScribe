@@ -512,7 +512,7 @@ final class MiniplayerController: ObservableObject {
         fragmentMinder = nil
         fragmentedAsset = nil
         let item: AVPlayerItem
-        if url.path == MediaCacheManager.currentFileURL.path {
+        if MediaCacheManager.isLiveCacheFile(url) {
             let fragged = AVFragmentedAsset(url: url)
             fragmentedAsset = fragged
             fragmentMinder = AVFragmentedAssetMinder(asset: fragged, mindingInterval: 2.0)

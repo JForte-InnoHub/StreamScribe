@@ -233,8 +233,6 @@ enum PortalSettingsApplier {
     private static let languageKey = "engine.language"
     private static let whisperModelKey = "engine.whisperModel"
     private static let parakeetModelKey = "engine.parakeetModel"
-    private static let udBoolPrefix = "ud.bool:"
-    private static let udIntPrefix = "ud.int:"
 
     /// Apply `settings`. `resolvedStatic` is the probe's verdict (true = finite
     /// recording, false = live, nil = unknown) and only matters for engine "auto".
@@ -294,15 +292,11 @@ enum PortalSettingsApplier {
             change(languageKey, to: settings.language)   // "auto" → nil in set()
         }
 
-        if let n = settings.expectedSpeakers {
-            change(udIntPrefix + TranscriptionEngine.expectedSpeakerCountDefaultsKey, to: String(max(0, n)))
-        }
-        if let b = settings.liveFromStart {
-            change(udBoolPrefix + liveFromStartDefaultsKey, to: b ? "true" : "false")
-        }
-        if let b = settings.cleanup {
-            change(udBoolPrefix + TranscriptCleanupService.enabledKey, to: b ? "true" : "false")
-        }
+        // Expected speakers, backlog-from-start and cleanup are not engine
+        // properties: they ride along as a SessionSettings override that
+        // start() consumes (2026-10-02), so they never touch the Mac's own
+        // settings and can differ between concurrent sessions.
+        engine.nextSessionOverrides = sessionOverrides(settings)
 
         if !items.isEmpty {
             print("[Portal] Applied job settings: " + items.map { "\($0.key)=\($0.applied)" }.joined(separator: ", "))
@@ -310,13 +304,19 @@ enum PortalSettingsApplier {
         return items
     }
 
+    static func sessionOverrides(_ settings: PortalJobSettings) -> SessionSettings.Overrides? {
+        var o = SessionSettings.Overrides()
+        o.expectedSpeakerCount = settings.expectedSpeakers
+        o.liveFromStart = settings.liveFromStart
+        o.cleanupEnabled = settings.cleanup
+        return o == SessionSettings.Overrides() ? nil : o
+    }
+
     /// Put back every value the portal changed, newest first, but only where the
-    /// value is still what the portal set. `engine` nil = restore UserDefaults
-    /// items only (used at launch, when engine properties are fresh anyway).
+    /// value is still what the portal set.
     static func restore(_ items: [PortalRestoreItem], engine: TranscriptionEngine?) {
+        guard let engine else { return }
         for item in items.reversed() {
-            let isDefaults = item.key.hasPrefix(udBoolPrefix) || item.key.hasPrefix(udIntPrefix)
-            if !isDefaults && engine == nil { continue }
             guard current(item.key, engine: engine) == item.applied else {
                 print("[Portal] Not restoring \(item.key): changed on the Mac since the job applied it.")
                 continue
@@ -326,17 +326,6 @@ enum PortalSettingsApplier {
     }
 
     private static func current(_ key: String, engine: TranscriptionEngine?) -> String? {
-        let d = UserDefaults.standard
-        if key.hasPrefix(udBoolPrefix) {
-            let k = String(key.dropFirst(udBoolPrefix.count))
-            guard d.object(forKey: k) != nil else { return nil }
-            return d.bool(forKey: k) ? "true" : "false"
-        }
-        if key.hasPrefix(udIntPrefix) {
-            let k = String(key.dropFirst(udIntPrefix.count))
-            guard d.object(forKey: k) != nil else { return nil }
-            return String(d.integer(forKey: k))
-        }
         guard let engine else { return nil }
         switch key {
         case sessionModeKey: return engine.sessionMode.rawValue
@@ -350,17 +339,6 @@ enum PortalSettingsApplier {
     }
 
     private static func set(_ key: String, _ value: String?, engine: TranscriptionEngine?) {
-        let d = UserDefaults.standard
-        if key.hasPrefix(udBoolPrefix) {
-            let k = String(key.dropFirst(udBoolPrefix.count))
-            if let value { d.set(value == "true", forKey: k) } else { d.removeObject(forKey: k) }
-            return
-        }
-        if key.hasPrefix(udIntPrefix) {
-            let k = String(key.dropFirst(udIntPrefix.count))
-            if let value, let n = Int(value) { d.set(n, forKey: k) } else { d.removeObject(forKey: k) }
-            return
-        }
         guard let engine, let value else { return }
         switch key {
         case sessionModeKey:

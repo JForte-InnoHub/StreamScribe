@@ -825,3 +825,53 @@ enum SessionMode: String, CaseIterable, Identifiable {
         }
     }
 }
+
+// MARK: - Per-session settings snapshot (2026-10-02)
+
+/// The settings a session runs with, fixed at Start. The pipeline used to
+/// read these from UserDefaults while running, which (a) let a Settings
+/// change mid-run alter the in-flight session and (b) made the web
+/// portal's per-job settings work by rewriting the app's shared settings
+/// for the length of a job — impossible once two sessions run at once.
+/// Now each engine resolves `fromDefaults()`, applies any `Overrides` the
+/// portal attached to that one job, and reads only its own copy.
+struct SessionSettings: Equatable, Sendable {
+    /// 0 = unconstrained.
+    var expectedSpeakerCount: Int
+    var cleanupEnabled: Bool
+    /// Live streams: ask yt-dlp for the DVR backlog from the start.
+    var liveFromStart: Bool
+    /// Keep video (not just audio) in the miniplayer cache.
+    var cacheVideo: Bool
+    /// Opt-in dynaudnorm for hot broadcast masters.
+    var audioNormalization: Bool
+
+    struct Overrides: Equatable, Sendable {
+        var expectedSpeakerCount: Int? = nil
+        var cleanupEnabled: Bool? = nil
+        var liveFromStart: Bool? = nil
+        var cacheVideo: Bool? = nil
+        var audioNormalization: Bool? = nil
+    }
+
+    static func fromDefaults() -> SessionSettings {
+        let d = UserDefaults.standard
+        return SessionSettings(
+            expectedSpeakerCount: TranscriptionEngine.expectedSpeakerCount,
+            cleanupEnabled: d.bool(forKey: TranscriptCleanupService.enabledKey),
+            liveFromStart: AudioStreamExtractor.liveFromStartEnabled,
+            cacheVideo: (d.object(forKey: mediaCacheIncludeVideoKey) as? Bool) ?? mediaCacheIncludeVideoDefault,
+            audioNormalization: d.bool(forKey: "extractor.audioNormalizationEnabled"))
+    }
+
+    func applying(_ o: Overrides?) -> SessionSettings {
+        guard let o else { return self }
+        var r = self
+        if let v = o.expectedSpeakerCount { r.expectedSpeakerCount = max(0, v) }
+        if let v = o.cleanupEnabled { r.cleanupEnabled = v }
+        if let v = o.liveFromStart { r.liveFromStart = v }
+        if let v = o.cacheVideo { r.cacheVideo = v }
+        if let v = o.audioNormalization { r.audioNormalization = v }
+        return r
+    }
+}
