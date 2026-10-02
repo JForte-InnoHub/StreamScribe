@@ -406,7 +406,15 @@ struct PortalTranscriptIndex {
     func revision(of id: UUID) -> Int { segmentRevs[id]?.rev ?? 0 }
 
     static func signature(_ s: TranscriptSegment) -> String {
-        "\(s.text)\u{1F}\(s.start)\u{1F}\(s.end)\u{1F}\(s.speaker ?? "")\u{1F}\(s.needsReview ?? false)\u{1F}\(s.userEdited ?? false)"
+        "\(s.text)\u{1F}\(s.start)\u{1F}\(s.end)\u{1F}\(s.speaker ?? "")\u{1F}\(s.needsReview ?? false)\u{1F}\(s.userEdited ?? false)\u{1F}\(s.rawText ?? "")"
+    }
+}
+
+extension TranscriptSegment {
+    /// Whether "Restore verbatim" would change anything.
+    var portalRestorable: Bool {
+        guard let raw = rawText, !raw.isEmpty else { return false }
+        return raw != text
     }
 }
 
@@ -433,14 +441,31 @@ struct PortalSegmentDTO: Encodable {
     let speaker: String?
     let review: Bool
     let edited: Bool
+    /// The verbatim ASR text differs from what is shown (cleanup, refinement
+    /// or a web/Mac edit replaced it), so "Restore verbatim" has something to do.
+    let restorable: Bool
 }
 
 struct PortalSpeakerDTO: Encodable {
     let label: String
     let name: String
-    /// rename | voiceprint | machine
+    /// rename | voiceprint | machine — what `name` comes from.
     let source: String
     let count: Int
+    /// The voiceprint identity on this speaker, if any — present even when a
+    /// rename is what's displayed, so the page can offer to clear it.
+    let identity: String?
+}
+
+/// Names a speaker can be identified as: people already in this transcript
+/// first, then the whole enrolled catalog.
+struct PortalIdentitiesDTO: Encodable {
+    struct Group: Encodable { let name: String; let names: [String] }
+    let session: [String]
+    /// The enrolled catalog, grouped as the Mac's identify sheet shows it.
+    let library: [Group]
+    /// False while the template bank is still loading (or failed) on the Mac.
+    let libraryLoaded: Bool
 }
 
 struct PortalPinDTO: Encodable {
@@ -575,6 +600,31 @@ struct PortalRenameBody: Decodable {
 
 struct PortalPinBody: Decodable {
     let segmentId: String
+}
+
+/// Identify a whole speaker (cluster) as a stored identity; empty name clears.
+struct PortalIdentifyBody: Decodable {
+    let label: String
+    let name: String
+}
+
+/// Move segments to another speaker. `speaker` is an existing machine label;
+/// `newSpeaker: true` mints a fresh "Speaker N" instead (diarizer merged two
+/// people). Optional `name` identifies that target in the same step.
+struct PortalReassignBody: Decodable {
+    let segmentIds: [String]
+    let speaker: String?
+    let newSpeaker: Bool?
+    let name: String?
+}
+
+struct PortalSegmentTextBody: Decodable {
+    let segmentId: String
+    let text: String
+}
+
+struct PortalSegmentIDsBody: Decodable {
+    let segmentIds: [String]
 }
 
 struct PortalProbeBody: Decodable {

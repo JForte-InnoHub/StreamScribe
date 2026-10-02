@@ -915,8 +915,20 @@ final class PortalJobQueue: ObservableObject {
             return retryJob(job, who)
         case ("POST", "delete"):
             return deleteJob(job, who)
-        case ("POST", "speakers"):
+        case ("POST", "speakers") where r.count == 3:
             return renameSpeaker(job, request, who)
+        case ("POST", "speakers") where r.count == 4 && r[3] == "identify":
+            return identifySpeaker(job, request, who)
+        case ("GET", "identities"):
+            return .dto(identitiesDTO(job))
+        case ("POST", "segments") where r.count == 4:
+            switch r[3] {
+            case "reassign": return reassignSegments(job, request, who)
+            case "text": return editSegmentText(job, request, who)
+            case "delete": return deleteSegments(job, request, who)
+            case "restore": return restoreSegments(job, request, who)
+            default: return .error(404, "Not found")
+            }
         case ("POST", "pins") where r.count == 3:
             return addPin(job, request, who)
         case ("POST", "pins") where r.count == 5 && r[4] == "delete":
@@ -1363,6 +1375,232 @@ final class PortalJobQueue: ObservableObject {
         return .ok()
     }
 
+    // MARK: - Endpoints: speaker identity + transcript edits
+    //
+    // Same two-way model as renames and pins: while the engine still holds the
+    // session the edit goes to the engine (the Mac window shows it at once and
+    // the next sync copies it back into the job); afterwards it is applied to
+    // the saved snapshot. Each path mirrors the engine's own edit method so a
+    // transcript edited from the web ends up the same as one edited on the Mac.
+
+    /// Apply `edit` to the saved transcript and republish it to pollers.
+    /// `meta` says the speaker list or pins may have changed too.
+    private func editSnapshot(_ job: PortalJob, meta: Bool = true, _ edit: (inout PortalJob) -> Void) {
+        var j = self.job(job.id) ?? job
+        edit(&j)
+        var index = indexFor(j)
+        index.update(j.segments)
+        if meta { index.bumpMeta() }
+        indexes[j.id] = index
+        update(j, saveNow: true)
+    }
+
+    /// Parse and bound a request's segment ids (nil = bad request).
+    private static func segmentIDs(_ raw: [String]) -> Set<UUID>? {
+        guard !raw.isEmpty, raw.count <= 5_000 else { return nil }
+        var ids = Set<UUID>()
+        for s in raw {
+            guard let id = UUID(uuidString: s) else { return nil }
+            ids.insert(id)
+        }
+        return ids
+    }
+
+    /// The freshest copy of the job for validating an edit: pull the engine's
+    /// latest segments first when it still holds the session, so a speaker
+    /// or sentence that appeared since the last throttled sync is known.
+    private func latest(_ job: PortalJob) -> PortalJob {
+        syncIfAttached(job)
+        return self.job(job.id) ?? job
+    }
+
+    /// Same numbering rule as `TranscriptionEngine.nextUnusedMachineLabel`.
+    private static func nextUnusedMachineLabel(in segments: [TranscriptSegment]) -> String {
+        var maxN = 0
+        for seg in segments {
+            if let label = seg.speaker, label.hasPrefix("Speaker "),
+               let n = Int(label.dropFirst("Speaker ".count)) {
+                maxN = max(maxN, n)
+            }
+        }
+        return "Speaker \(maxN + 1)"
+    }
+
+    private func identitiesDTO(_ job: PortalJob) -> PortalIdentitiesDTO {
+        var session = Set(job.voiceprintNames.values)
+        if let engine = attachedEngine(job) {
+            session.formUnion(engine.voiceprints.sessionSpeakerHistory)
+        }
+        let library = VoiceprintLibrary.shared
+        // Templates served from the on-disk cache leave loadState at .idle.
+        var loaded = !library.templates.isEmpty
+        if case .loaded = library.loadState { loaded = true }
+        var groups = library.categorizedTemplates.map { group in
+            var seen = Set<String>()
+            return PortalIdentitiesDTO.Group(name: group.name,
+                                             names: group.templates.map(\.name).filter { seen.insert($0).inserted })
+        }
+        if groups.isEmpty && !library.templates.isEmpty {
+            groups = [PortalIdentitiesDTO.Group(name: "All", names: library.allTemplateNames)]
+        }
+        return PortalIdentitiesDTO(session: session.sorted(), library: groups, libraryLoaded: loaded)
+    }
+
+    /// Identify a whole speaker as a stored identity (or clear it). Mirrors the
+    /// Mac's Speakers panel: identity sits on the cluster, so every segment of
+    /// that speaker — past and future this session — takes the name.
+    private func identifySpeaker(_ job: PortalJob, _ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalIdentifyBody.self), !body.label.isEmpty else {
+            return .error(400, "Expected {\"label\": \"Speaker 1\", \"name\": \"…\"}")
+        }
+        let name = body.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name.count <= 120 else { return .error(422, "Name is too long") }
+        guard latest(job).segments.contains(where: { $0.speaker == body.label }) else {
+            return .error(404, "No speaker '\(body.label)' in this transcript")
+        }
+        if let engine = attachedEngine(job) {
+            if name.isEmpty {
+                engine.voiceprints.clearIdentification(clusterId: body.label)
+            } else {
+                engine.voiceprints.setManualIdentification(clusterId: body.label, name: name)
+            }
+            syncIfAttached(job)
+        } else {
+            editSnapshot(job) { j in
+                if name.isEmpty { j.voiceprintNames.removeValue(forKey: body.label) }
+                else { j.voiceprintNames[body.label] = name }
+            }
+        }
+        return .ok()
+    }
+
+    /// Move segments to an existing speaker or a new one, optionally naming
+    /// the target — the web form of the Mac's "Reassign Selection To" menu and
+    /// "Identify These Segments…" (which is a split into a new speaker + name).
+    private func reassignSegments(_ job: PortalJob, _ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalReassignBody.self), let ids = Self.segmentIDs(body.segmentIds) else {
+            return .error(400, "Expected {\"segmentIds\": [\"…\"], \"speaker\": \"Speaker 2\"} or {\"segmentIds\": […], \"newSpeaker\": true}")
+        }
+        let name = body.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard name.count <= 120 else { return .error(422, "Name is too long") }
+        let wantsNew = body.newSpeaker == true
+        let target = body.speaker?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard wantsNew || !target.isEmpty else { return .error(400, "Choose a speaker or ask for a new one") }
+        guard target.count <= 60 else { return .error(422, "Speaker label is too long") }
+        let current = latest(job)
+        guard ids.isSubset(of: Set(current.segments.map(\.id))) else {
+            return .error(404, "Some of those sentences no longer exist")
+        }
+        if !wantsNew && !current.segments.contains(where: { $0.speaker == target }) {
+            return .error(404, "No speaker '\(target)' in this transcript")
+        }
+
+        if let engine = attachedEngine(job) {
+            let label = wantsNew ? engine.nextUnusedMachineLabel : target
+            engine.reassignSpeaker(segmentIDs: ids, to: label)
+            if !name.isEmpty { engine.voiceprints.setManualIdentification(clusterId: label, name: name) }
+            syncIfAttached(job)
+        } else {
+            editSnapshot(job) { j in
+                let label = wantsNew ? Self.nextUnusedMachineLabel(in: j.segments) : target
+                for i in j.segments.indices where ids.contains(j.segments[i].id) {
+                    j.segments[i].speaker = label
+                }
+                // Pins snapshot the speaker they were taken from; keep them in step.
+                for i in j.pins.indices {
+                    if let sid = j.pins[i].sourceSegmentID, ids.contains(sid) { j.pins[i].speaker = label }
+                }
+                if !name.isEmpty { j.voiceprintNames[label] = name }
+            }
+        }
+        return .ok()
+    }
+
+    /// Replace a segment's text. Verbatim ASR text is kept in `rawText` the
+    /// first time, word timings are dropped and the segment is marked as a
+    /// human edit so cleanup and refinement leave it alone — exactly what the
+    /// engine does. Empty text deletes the segment.
+    private func editSegmentText(_ job: PortalJob, _ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalSegmentTextBody.self), let id = UUID(uuidString: body.segmentId) else {
+            return .error(400, "Expected {\"segmentId\": \"…\", \"text\": \"…\"}")
+        }
+        let text = body.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count <= 20_000 else { return .error(422, "Text is too long") }
+        guard latest(job).segments.contains(where: { $0.id == id }) else { return .error(404, "Sentence not found") }
+        if text.isEmpty && !canManage(job, who) {
+            return .error(403, "Only the person who submitted this transcript (or an admin) can delete sentences")
+        }
+        if let engine = attachedEngine(job) {
+            engine.updateSegmentText(id: id, newText: text)
+            syncIfAttached(job)
+        } else {
+            editSnapshot(job, meta: text.isEmpty) { j in
+                guard let idx = j.segments.firstIndex(where: { $0.id == id }) else { return }
+                if text.isEmpty {
+                    j.segments.remove(at: idx)
+                    return
+                }
+                var seg = j.segments[idx]
+                if seg.rawText == nil { seg.rawText = seg.text }
+                seg.text = text
+                seg.words = nil
+                seg.userEdited = true
+                j.segments[idx] = seg
+            }
+        }
+        return .ok()
+    }
+
+    /// Remove whole segments. Pins keep their own text and fall back to
+    /// time-based jumping, as on the Mac.
+    private func deleteSegments(_ job: PortalJob, _ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalSegmentIDsBody.self), let ids = Self.segmentIDs(body.segmentIds) else {
+            return .error(400, "Expected {\"segmentIds\": [\"…\"]}")
+        }
+        // Deleting is the one edit with nothing to restore from, so it is
+        // limited to the job's owner and admins (like stopping or deleting the job).
+        guard canManage(job, who) else {
+            return .error(403, "Only the person who submitted this transcript (or an admin) can delete sentences")
+        }
+        guard ids.isSubset(of: Set(latest(job).segments.map(\.id))) else {
+            return .error(404, "Some of those sentences no longer exist")
+        }
+        if let engine = attachedEngine(job) {
+            engine.deleteSegments(ids: ids)
+            syncIfAttached(job)
+        } else {
+            editSnapshot(job) { j in j.segments.removeAll { ids.contains($0.id) } }
+        }
+        return .ok()
+    }
+
+    /// Put the verbatim ASR text back on segments that cleanup, refinement or
+    /// an edit rewrote. Marked as a human edit so the next cleanup pass
+    /// doesn't undo the restore (engine semantics).
+    private func restoreSegments(_ job: PortalJob, _ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalSegmentIDsBody.self), let ids = Self.segmentIDs(body.segmentIds) else {
+            return .error(400, "Expected {\"segmentIds\": [\"…\"]}")
+        }
+        guard ids.isSubset(of: Set(latest(job).segments.map(\.id))) else {
+            return .error(404, "Some of those sentences no longer exist")
+        }
+        if let engine = attachedEngine(job) {
+            engine.restoreVerbatim(ids: ids)
+            syncIfAttached(job)
+        } else {
+            editSnapshot(job, meta: false) { j in
+                for i in j.segments.indices where ids.contains(j.segments[i].id) {
+                    guard let raw = j.segments[i].rawText, !raw.isEmpty else { continue }
+                    j.segments[i].text = raw
+                    j.segments[i].rawText = nil
+                    j.segments[i].needsReview = nil
+                    j.segments[i].userEdited = true
+                }
+            }
+        }
+        return .ok()
+    }
+
     // MARK: - Endpoints: transcript + export
 
     private func transcriptResponse(_ job: PortalJob, since: Int, clientEpoch: String,
@@ -1376,7 +1614,7 @@ final class PortalJobQueue: ObservableObject {
             guard full || index.revision(of: seg.id) > since else { return nil }
             return PortalSegmentDTO(id: seg.id.uuidString, start: seg.start, end: seg.end, text: seg.text,
                                     speaker: seg.speaker, review: seg.needsReview ?? false,
-                                    edited: seg.userEdited ?? false)
+                                    edited: seg.userEdited ?? false, restorable: seg.portalRestorable)
         }
         let order: [String]? = (full || index.orderRev > since) ? current.segments.map { $0.id.uuidString } : nil
 
@@ -1400,7 +1638,8 @@ final class PortalJobQueue: ObservableObject {
                 else if current.voiceprintNames[label] != nil { source = "voiceprint" }
                 else { source = "machine" }
                 return PortalSpeakerDTO(label: label, name: current.displayName(for: label) ?? label,
-                                        source: source, count: counts[label] ?? 0)
+                                        source: source, count: counts[label] ?? 0,
+                                        identity: current.voiceprintNames[label])
             }
             pins = current.pins.map {
                 PortalPinDTO(id: $0.id.uuidString, text: $0.text, speaker: $0.speaker, start: $0.start,

@@ -237,6 +237,59 @@ select:disabled { opacity: .6; }
 }
 .actionbar span { font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .actionbar .btn { background: var(--bg); color: var(--text); border-color: transparent; }
+.actionbar .btn.on { outline: 2px solid var(--accent); }
+.actionbar .btn .ico { display: none; }
+.actionbar .btn .lbl { font-size: inherit; }
+
+/* Popover menu (speaker / more) and modal dialogs (edit text, identify). */
+.menu {
+  position: fixed; z-index: 45; min-width: 200px; max-width: min(340px, calc(100vw - 16px));
+  background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.28); padding: 5px; max-height: 60vh; overflow: auto;
+}
+.menu button {
+  display: flex; width: 100%; align-items: center; gap: 8px; text-align: left; border: 0; background: none;
+  padding: 8px 10px; border-radius: 7px; font-size: 14px; cursor: pointer; color: inherit;
+}
+.menu button:hover, .menu button:focus { background: var(--panel-2); outline: none; }
+.menu button:disabled { opacity: .45; cursor: default; }
+.menu button.danger { color: var(--bad); }
+.menu button .chk { width: 14px; flex: none; color: var(--accent); font-weight: 700; }
+.menu button .sub { margin-left: auto; font-size: 12px; color: var(--faint); padding-left: 10px; }
+.menu button .sw { width: 9px; height: 9px; border-radius: 50%; background: var(--spk); flex: none; }
+.menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
+.menu .mh { font-size: 11.5px; font-weight: 700; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; padding: 6px 10px 2px; }
+.overlay { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.42); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.dlg {
+  background: var(--panel); color: var(--text); border-radius: 12px; box-shadow: 0 16px 48px rgba(0,0,0,.35);
+  width: 100%; max-width: 460px; max-height: min(84vh, 640px); display: flex; flex-direction: column; overflow: hidden;
+}
+.dlg .dh { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); }
+.dlg .dh h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.dlg .dh .hint { margin-top: 2px; }
+.dlg .db { padding: 12px 16px; overflow: auto; flex: 1 1 auto; min-height: 0; }
+.dlg .df { padding: 10px 16px 14px; display: flex; gap: 8px; justify-content: flex-end; align-items: center; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.dlg .df .grow { flex: 1; }
+.dlg textarea {
+  width: 100%; min-height: 120px; max-height: 40vh; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel); color: inherit; font: inherit; line-height: 1.5; resize: vertical;
+}
+.dlg textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.dlg .orig { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.dlg .orig b { color: var(--text); font-weight: 600; }
+.idlist { margin: 0 -6px; }
+.idlist .mh { font-size: 11.5px; font-weight: 700; color: var(--faint); text-transform: uppercase; letter-spacing: .04em; padding: 10px 10px 2px; }
+.idlist button {
+  display: flex; width: 100%; align-items: center; gap: 8px; text-align: left; border: 0; background: none;
+  padding: 8px 10px; border-radius: 7px; font-size: 14px; cursor: pointer; color: inherit;
+}
+.idlist button:hover, .idlist button:focus, .idlist button.first { background: var(--panel-2); outline: none; }
+.idlist button .chk { margin-left: auto; color: var(--accent); font-weight: 700; }
+.idlist .none { padding: 14px 10px; color: var(--faint); font-size: 13.5px; }
+.spk .src button { border: 0; background: none; padding: 0 0 0 6px; color: var(--accent); cursor: pointer; font-size: 11.5px; font-weight: 600; }
+.spk .src button.danger { color: var(--bad); }
+.seg.edited { text-decoration-line: underline; text-decoration-style: dotted; text-decoration-color: var(--faint); text-underline-offset: 3px; }
+.seg.review { text-decoration-color: var(--warn); }
 .toast {
   position: fixed; right: 18px; bottom: 18px; z-index: 40;
   background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 10px;
@@ -294,7 +347,11 @@ select:disabled { opacity: .6; }
   .brand small { display: none; }
   .row2 { grid-template-columns: 1fr; }
   .actionbar #actionText { display: none; }
-  .actionbar { padding: 8px; gap: 6px; }
+  .actionbar { padding: 8px; gap: 5px; }
+  .actionbar .btn { padding: 5px 8px; }
+  .actionbar .btn .ico { display: inline; }
+  .actionbar .btn .ico + .lbl, .actionbar #spkSelBtn .lbl { display: none; }
+  .actionbar #clipSelBtn { display: none !important; }
   .transcript { padding: 4px 12px 14px; }
 }
 </style>
@@ -312,11 +369,15 @@ select:disabled { opacity: .6; }
   <div id="view"></div>
 </main>
 <div class="actionbar hidden" id="actionbar">
-  <span id="actionText">1 segment selected</span>
-  <button class="btn sm hidden" id="playSelBtn">Play from here</button>
+  <span id="actionText">1 sentence selected</span>
+  <button class="btn sm hidden" id="playSelBtn" title="Play from here"><span class="ico">▶</span><span class="lbl">Play</span></button>
   <button class="btn sm" id="pinSelBtn">Pin quote</button>
+  <button class="btn sm" id="spkSelBtn" title="Move to another speaker">Speaker<span class="lbl"> ▾</span></button>
+  <button class="btn sm" id="editSelBtn" title="Edit the text">Edit</button>
   <button class="btn sm hidden" id="clipSelBtn">Clip</button>
-  <button class="btn sm" id="clearSelBtn">Cancel</button>
+  <button class="btn sm" id="moreSelBtn" title="More"><span class="ico">⋯</span><span class="lbl">More ▾</span></button>
+  <button class="btn sm" id="multiSelBtn" title="Select more sentences (or shift-click / ctrl-click)">+</button>
+  <button class="btn sm" id="clearSelBtn" title="Clear selection"><span class="ico">✕</span><span class="lbl">Cancel</span></button>
 </div>
 <div class="toast hidden" id="toast"></div>
 <script>
@@ -339,7 +400,10 @@ const S = {
   speakers: [],
   pins: [],
   follow: true,
-  selected: null,
+  sel: new Set(),       // selected segment ids
+  selAnchor: null,      // last plain-clicked segment, for shift-click ranges
+  multi: false,         // "+" mode: taps add/remove instead of replacing
+  identities: null,     // {session, library, libraryLoaded} for the open job
   pollTimer: null,
   jobTimer: null,
   lastRenderKey: "",
@@ -551,7 +615,8 @@ $("pauseBtn").addEventListener("click", async function () {
 function route() {
   const m = location.hash.match(/^#\/job\/([0-9A-Fa-f-]{36})$/);
   stopJobPolling();
-  S.selected = null;
+  closePopups();
+  S.sel = new Set(); S.selAnchor = null; S.multi = false; S.identities = null;
   updateActionbar();
   if (m) {
     S.view = "job";
@@ -1164,7 +1229,8 @@ function applyTranscript(r) {
   S.job = r.job;
   renderJobHead();
   if (metaChanged || r.full) { renderSpeakers(); renderPins(); }
-  if (transcriptChanged) renderTranscript(r.full);
+  if (transcriptChanged) { renderTranscript(r.full); if (S.sel.size) updateActionbar(); }
+  if (metaChanged) S.identities = null;  // a new identity may have been added
 }
 
 function nameFor(label) {
@@ -1450,14 +1516,15 @@ function renderTranscript(firstLoad) {
     }
     let cls = "seg";
     if (pinned.has(s.id)) cls += " pinned";
-    if (S.selected === s.id) cls += " sel";
+    if (S.sel.has(s.id)) cls += " sel";
     if (s.review) cls += " review";
+    if (s.edited) cls += " edited";
     if (S.nowSeg === s.id) cls += " now";
-    para.appendChild(h("span", {
-      class: cls, "data-id": s.id,
-      title: fmtTime(s.start) + (s.review ? " · flagged for review (too garbled to clean up)" : ""),
-      text: s.text
-    }));
+    let title = fmtTime(s.start);
+    if (s.review) title += " · flagged for review (too garbled to clean up)";
+    if (s.edited) title += " · edited";
+    if (s.restorable) title += " · original wording available (More ▸ Restore verbatim)";
+    para.appendChild(h("span", { class: cls, "data-id": s.id, title: title, text: s.text }));
   }
   box.appendChild(frag);
   // Opening a live job lands at the live edge; after that, follow only while
@@ -1473,42 +1540,88 @@ document.addEventListener("click", function (e) {
   const seg = e.target.closest ? e.target.closest(".seg") : null;
   if (!seg || S.view !== "job") return;
   const id = seg.getAttribute("data-id");
-  S.selected = (S.selected === id) ? null : id;
-  document.querySelectorAll(".seg.sel").forEach(function (n) { n.classList.remove("sel"); });
-  if (S.selected) seg.classList.add("sel");
+  if (e.shiftKey && S.selAnchor && S.segs.has(S.selAnchor)) {
+    // Range: everything between the anchor and this sentence, in transcript order.
+    const a = S.order.indexOf(S.selAnchor), b = S.order.indexOf(id);
+    if (a >= 0 && b >= 0) {
+      for (let i = Math.min(a, b); i <= Math.max(a, b); i++) S.sel.add(S.order[i]);
+    } else {
+      S.sel.add(id);
+    }
+  } else if (e.ctrlKey || e.metaKey || S.multi) {
+    if (S.sel.has(id)) S.sel.delete(id); else S.sel.add(id);
+    S.selAnchor = id;
+  } else {
+    const only = S.sel.size === 1 && S.sel.has(id);
+    S.sel = new Set(only ? [] : [id]);
+    S.selAnchor = only ? null : id;
+  }
+  if (window.getSelection && (e.shiftKey)) { try { window.getSelection().removeAllRanges(); } catch (x) {} }
+  paintSelection();
   updateActionbar();
 });
 
+function paintSelection() {
+  document.querySelectorAll(".seg").forEach(function (n) {
+    n.classList.toggle("sel", S.sel.has(n.getAttribute("data-id")));
+  });
+}
+
+function clearSelection() {
+  S.sel = new Set();
+  S.selAnchor = null;
+  S.multi = false;
+  paintSelection();
+  updateActionbar();
+}
+
+/// Selected segments in transcript order (ids that vanished are dropped).
+function selectedSegs() {
+  const out = [];
+  for (const id of S.order) if (S.sel.has(id) && S.segs.has(id)) out.push(S.segs.get(id));
+  return out;
+}
+
 function updateActionbar() {
   const bar = $("actionbar");
-  if (!S.selected || S.view !== "job") { bar.classList.add("hidden"); return; }
-  const s = S.segs.get(S.selected);
-  const isPinned = S.pins.some(function (p) { return p.segmentId === S.selected; });
-  $("actionText").textContent = s ? (nameFor(s.speaker) + " · " + fmtTime(s.start)) : "Selected";
+  // Drop ids that no longer exist (deleted, or a full reload).
+  for (const id of Array.from(S.sel)) if (!S.segs.has(id)) S.sel.delete(id);
+  const segs = selectedSegs();
+  if (!segs.length || S.view !== "job") { bar.classList.add("hidden"); closeMenus(); return; }
+  const one = segs.length === 1 ? segs[0] : null;
+  const isPinned = one ? S.pins.some(function (p) { return p.segmentId === one.id; }) : false;
+  $("actionText").textContent = one ? (nameFor(one.speaker) + " · " + fmtTime(one.start))
+    : (segs.length + " sentences · " + fmtTime(segs[0].start) + "–" + fmtTime(segs[segs.length - 1].end));
   $("pinSelBtn").textContent = isPinned ? "Unpin" : "Pin quote";
+  $("pinSelBtn").classList.toggle("hidden", !one);
+  $("editSelBtn").classList.toggle("hidden", !one);
   $("playSelBtn").classList.toggle("hidden", !playerReady());
   $("clipSelBtn").classList.toggle("hidden", !playerReady());
+  $("multiSelBtn").classList.toggle("on", S.multi);
   bar.classList.remove("hidden");
 }
 
 $("playSelBtn").addEventListener("click", function () {
-  const s = S.segs.get(S.selected);
-  if (s) playFrom(s.start);
+  const segs = selectedSegs();
+  if (segs.length) playFrom(segs[0].start);
 });
-$("clipSelBtn").addEventListener("click", function () {
-  const s = S.segs.get(S.selected);
-  if (s) downloadClip(s.start, s.end);
+$("clipSelBtn").addEventListener("click", function () { clipSelection(); });
+$("clearSelBtn").addEventListener("click", clearSelection);
+$("multiSelBtn").addEventListener("click", function () {
+  S.multi = !S.multi;
+  $("multiSelBtn").classList.toggle("on", S.multi);
+  if (S.multi) toast("Tap more sentences to add them to the selection.");
 });
 
-$("clearSelBtn").addEventListener("click", function () {
-  S.selected = null;
-  document.querySelectorAll(".seg.sel").forEach(function (n) { n.classList.remove("sel"); });
-  updateActionbar();
-});
+function clipSelection() {
+  const segs = selectedSegs();
+  if (segs.length) downloadClip(segs[0].start, segs[segs.length - 1].end);
+}
 
 $("pinSelBtn").addEventListener("click", async function () {
-  const id = S.selected;
-  if (!id || !S.jobId) return;
+  const segs = selectedSegs();
+  if (segs.length !== 1 || !S.jobId) return;
+  const id = segs[0].id;
   const existing = S.pins.find(function (p) { return p.segmentId === id; });
   try {
     if (existing) {
@@ -1517,11 +1630,247 @@ $("pinSelBtn").addEventListener("click", async function () {
       await api("/api/jobs/" + S.jobId + "/pins", { method: "POST", json: { segmentId: id } });
       toast("Pinned.");
     }
-    S.selected = null;
-    updateActionbar();
+    clearSelection();
     refreshNow();
   } catch (e) { toast(e.message); }
 });
+
+// ---------- transcript editing (speaker reassignment, text, delete, restore) ----------
+//
+// Mirrors the Mac's transcript context menu. Every action posts to the Mini,
+// which applies it to the live engine (so the Mac window changes too) or to
+// the saved transcript, then the next poll redraws.
+
+async function editCall(path, body, okMsg) {
+  try {
+    await api("/api/jobs/" + S.jobId + "/" + path, { method: "POST", json: body });
+    if (okMsg) toast(okMsg);
+    clearSelection();
+    refreshNow();
+    return true;
+  } catch (e) { toast(e.message); return false; }
+}
+
+$("spkSelBtn").addEventListener("click", function (e) {
+  const segs = selectedSegs();
+  if (!segs.length) return;
+  const ids = segs.map(function (s) { return s.id; });
+  const labels = new Set(segs.map(function (s) { return s.speaker || ""; }));
+  const uniform = labels.size === 1 ? Array.from(labels)[0] : null;
+  const items = [{ header: segs.length === 1 ? "Move this sentence to" : "Move " + segs.length + " sentences to" }];
+  for (const sp of S.speakers) {
+    items.push({
+      label: sp.name, sub: sp.name === sp.label ? null : sp.label, swatch: sp.label, checked: sp.label === uniform,
+      onclick: function () {
+        if (sp.label === uniform) return;
+        editCall("segments/reassign", { segmentIds: ids, speaker: sp.label }, "Moved to " + sp.name + ".");
+      }
+    });
+  }
+  items.push("-");
+  items.push({ label: "New speaker", sub: "split off as its own speaker", onclick: function () {
+    editCall("segments/reassign", { segmentIds: ids, newSpeaker: true }, "Moved to a new speaker.");
+  } });
+  items.push({ label: "Identify as someone…", sub: "new speaker + name", onclick: function () {
+    openIdentityPicker({
+      title: segs.length === 1 ? "Identify this sentence" : "Identify " + segs.length + " sentences",
+      hint: "The selection becomes its own speaker with this name — the same as the Mac's “Identify These Segments”.",
+      onPick: function (name) { editCall("segments/reassign", { segmentIds: ids, newSpeaker: true, name: name }, "Identified as " + name + "."); }
+    });
+  } });
+  showMenu(e.currentTarget, items);
+});
+
+$("editSelBtn").addEventListener("click", function () {
+  const segs = selectedSegs();
+  if (segs.length !== 1) return;
+  openEditDialog(segs[0]);
+});
+
+$("moreSelBtn").addEventListener("click", function (e) {
+  const segs = selectedSegs();
+  if (!segs.length) return;
+  const ids = segs.map(function (s) { return s.id; });
+  const n = segs.length, noun = n === 1 ? "sentence" : "sentences";
+  const restorable = segs.some(function (s) { return s.restorable; });
+  const items = [];
+  if (playerReady()) items.push({ label: "Download clip", sub: fmtTime(segs[0].start) + "–" + fmtTime(segs[n - 1].end), onclick: clipSelection });
+  items.push({ label: "Restore verbatim", sub: restorable ? "undo cleanup / edits" : "nothing to restore", disabled: !restorable, onclick: function () {
+    editCall("segments/restore", { segmentIds: ids }, "Original wording restored.");
+  } });
+  items.push("-");
+  const mayDelete = !!(S.job && S.job.canManage);
+  items.push({ label: "Delete " + (n === 1 ? "this sentence" : n + " sentences") + "…", danger: true, disabled: !mayDelete,
+    sub: mayDelete ? null : "owner or admin only", onclick: function () {
+    if (!confirm("Delete " + n + " " + noun + " from the transcript? This also changes the transcript on the Mac Mini and cannot be undone.")) return;
+    editCall("segments/delete", { segmentIds: ids }, (n === 1 ? "Sentence" : n + " sentences") + " deleted.");
+  } });
+  showMenu(e.currentTarget, items);
+});
+
+function openEditDialog(seg) {
+  const ta = h("textarea", { "aria-label": "Sentence text" });
+  ta.value = seg.text;
+  const dlg = showModal({
+    title: "Edit text",
+    hint: nameFor(seg.speaker) + " · " + fmtTime(seg.start) + ". The original wording is kept and can be restored later.",
+    body: [ta],
+    buttons: [
+      h("button", { class: "btn", type: "button", text: "Cancel", onclick: function () { dlg.close(); } }),
+      h("button", { class: "btn primary", type: "button", text: "Save", onclick: save })
+    ]
+  });
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  ta.addEventListener("keydown", function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); save(); }
+  });
+  async function save() {
+    const text = ta.value.trim();
+    if (text === seg.text.trim()) { dlg.close(); return; }
+    if (!text && !(S.job && S.job.canManage)) { toast("Only the person who submitted this transcript (or an admin) can delete sentences."); return; }
+    if (!text && !confirm("Empty text deletes this sentence. Delete it?")) return;
+    dlg.close();
+    editCall("segments/text", { segmentId: seg.id, text: text }, text ? "Saved." : "Sentence deleted.");
+  }
+}
+
+// Speaker identity (voiceprint) — the Speakers panel's Identify / Clear.
+async function identifySpeaker(label, name) {
+  try {
+    await api("/api/jobs/" + S.jobId + "/speakers/identify", { method: "POST", json: { label: label, name: name } });
+    toast(name ? "Identified as " + name + "." : "Identity cleared.");
+    refreshNow();
+  } catch (e) { toast(e.message); }
+}
+
+/// opts: {title, hint, current, onPick(name), onClear}
+function openIdentityPicker(opts) {
+  const search = h("input", { type: "text", placeholder: "Search names…", "aria-label": "Search names", autocomplete: "off" });
+  const list = h("div", { class: "idlist" }, h("div", { class: "none", text: "Loading names…" }));
+  const buttons = [];
+  if (opts.onClear) {
+    buttons.push(h("button", { class: "btn danger", type: "button", text: "Clear identity", onclick: function () { dlg.close(); opts.onClear(); } }));
+  }
+  buttons.push(h("span", { class: "grow" }));
+  buttons.push(h("button", { class: "btn", type: "button", text: "Cancel", onclick: function () { dlg.close(); } }));
+  const dlg = showModal({ title: opts.title, hint: opts.hint, body: [search, list], buttons: buttons });
+  // On a phone, focusing would raise the keyboard over the list; let them scroll first.
+  if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) search.focus();
+  let first = null;
+  function pick(name) { dlg.close(); opts.onPick(name); }
+  function render() {
+    const q = search.value.trim().toLowerCase();
+    const ids = S.identities;
+    list.textContent = "";
+    first = null;
+    if (!ids) { list.appendChild(h("div", { class: "none", text: "Loading names…" })); return; }
+    let shown = 0;
+    const seen = new Set();
+    function section(name, names) {
+      const hits = names.filter(function (n) { return !seen.has(n) && (!q || n.toLowerCase().includes(q)); });
+      if (!hits.length) return;
+      list.appendChild(h("div", { class: "mh", text: name }));
+      for (const n of hits) {
+        seen.add(n);
+        const b = h("button", { type: "button", onclick: function () { pick(n); } }, [
+          h("span", { text: n }),
+          n === opts.current ? h("span", { class: "chk", text: "✓" }) : null
+        ]);
+        if (!first) { first = n; b.classList.add("first"); }
+        list.appendChild(b);
+        shown++;
+        if (shown >= 400) return;
+      }
+    }
+    if (ids.session.length) section("In this transcript", ids.session);
+    for (const g of ids.library) { if (shown >= 400) break; section(g.name, g.names); }
+    if (q && !seen.has(search.value.trim())) {
+      list.appendChild(h("div", { class: "mh", text: shown ? "Or" : "No matching enrolled voice" }));
+      const custom = search.value.trim();
+      const b = h("button", { type: "button", onclick: function () { pick(custom); } }, h("span", { text: "Use “" + custom + "”" }));
+      if (!first) { first = custom; b.classList.add("first"); }
+      list.appendChild(b);
+    } else if (!shown) {
+      list.appendChild(h("div", { class: "none", text: ids.libraryLoaded ? "No enrolled voices." : "The enrolled voices haven't loaded on the Mac Mini yet — type a name to use it anyway." }));
+    }
+  }
+  search.addEventListener("input", render);
+  search.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && first) { e.preventDefault(); pick(first); }
+  });
+  render();
+  if (!S.identities) {
+    api("/api/jobs/" + S.jobId + "/identities").then(function (r) {
+      S.identities = r;
+      if (dlg.isOpen()) render();
+    }).catch(function (e) {
+      S.identities = { session: [], library: [], libraryLoaded: false };
+      if (dlg.isOpen()) render();
+      toast(e.message);
+    });
+  }
+}
+
+// ---------- popover menu + modal ----------
+function closePopups() {
+  document.querySelectorAll(".menu, .overlay").forEach(function (n) { n.remove(); });
+  document.removeEventListener("keydown", popupKeys);
+}
+function closeMenus() {
+  document.querySelectorAll(".menu").forEach(function (n) { n.remove(); });
+}
+function popupKeys(e) { if (e.key === "Escape") closePopups(); }
+
+/// items: {label, sub, swatch, checked, danger, disabled, onclick} | {header} | "-"
+function showMenu(anchor, items) {
+  closePopups();
+  const menu = h("div", { class: "menu", role: "menu" });
+  for (const it of items) {
+    if (it === "-") { menu.appendChild(h("hr")); continue; }
+    if (it.header) { menu.appendChild(h("div", { class: "mh", text: it.header })); continue; }
+    menu.appendChild(h("button", {
+      type: "button", class: it.danger ? "danger" : null, disabled: !!it.disabled, role: "menuitem",
+      onclick: function () { closePopups(); if (it.onclick) it.onclick(); }
+    }, [
+      it.swatch !== undefined ? h("span", { class: "sw " + speakerClass(it.swatch) }) : null,
+      h("span", { text: it.label }),
+      it.checked ? h("span", { class: "chk", text: "✓" }) : null,
+      it.sub ? h("span", { class: "sub", text: it.sub }) : null
+    ]));
+  }
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  menu.style.bottom = Math.max(8, window.innerHeight - r.top + 8) + "px";
+  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + "px";
+  const f = menu.querySelector("button:not(:disabled)");
+  if (f) f.focus();
+  setTimeout(function () {
+    document.addEventListener("click", function outside(e) {
+      if (!menu.contains(e.target)) { closeMenus(); }
+      document.removeEventListener("click", outside);
+    });
+  }, 0);
+  document.addEventListener("keydown", popupKeys);
+}
+
+/// opts: {title, hint, body: [nodes], buttons: [nodes]}
+function showModal(opts) {
+  closePopups();
+  const card = h("div", { class: "dlg", role: "dialog", "aria-modal": "true" }, [
+    h("div", { class: "dh" }, [h("h3", { text: opts.title }), opts.hint ? h("div", { class: "hint", text: opts.hint }) : null]),
+    h("div", { class: "db" }, opts.body),
+    opts.buttons && opts.buttons.length ? h("div", { class: "df" }, opts.buttons) : null
+  ]);
+  const overlay = h("div", { class: "overlay", onclick: function (e) { if (e.target === overlay) closePopups(); } }, card);
+  document.body.appendChild(overlay);
+  document.addEventListener("keydown", popupKeys);
+  return {
+    close: function () { overlay.remove(); document.removeEventListener("keydown", popupKeys); },
+    isOpen: function () { return overlay.isConnected; }
+  };
+}
 
 function refreshNow() {
   stopJobPolling();
@@ -1547,15 +1896,32 @@ function renderSpeakers() {
       onchange: function (e) { renameSpeaker(sp.label, e.target.value); }
     });
     let src = sp.label;
-    if (sp.source === "voiceprint") src = sp.label + " · identified by voiceprint";
-    if (sp.source === "rename") src = sp.label + " · renamed";
+    if (sp.identity && sp.source === "rename") src = sp.label + " · renamed · voice: " + sp.identity;
+    else if (sp.identity) src = sp.label + " · identified by voice";
+    else if (sp.source === "rename") src = sp.label + " · renamed";
     box.appendChild(h("div", { class: "spk" }, [
       h("span", { class: "sw " + speakerClass(sp.label) }),
       input,
       h("span", { class: "cnt", text: String(sp.count) }),
-      h("span", { class: "src", text: src })
+      h("span", { class: "src" }, [
+        src,
+        h("button", { type: "button", class: "ident", text: sp.identity ? "Change" : "Identify", title: "Match this speaker to an enrolled voice",
+          onclick: function () { openSpeakerIdentity(sp); } }),
+        sp.identity ? h("button", { type: "button", class: "danger", text: "Clear", title: "Remove the voice identification",
+          onclick: function () { identifySpeaker(sp.label, ""); } }) : null
+      ])
     ]));
   }
+}
+
+function openSpeakerIdentity(sp) {
+  openIdentityPicker({
+    title: "Identify " + sp.label,
+    hint: "Every sentence from this speaker takes the name" + (S.job && S.job.live ? ", including ones still to come." : "."),
+    current: sp.identity || null,
+    onPick: function (name) { identifySpeaker(sp.label, name); },
+    onClear: sp.identity ? function () { identifySpeaker(sp.label, ""); } : null
+  });
 }
 
 async function renameSpeaker(label, name) {
@@ -1606,7 +1972,7 @@ function jumpTo(segId) {
   if ($("follow")) $("follow").checked = false;
   el.scrollIntoView({ behavior: "smooth", block: "center" });
   el.classList.add("sel");
-  setTimeout(function () { if (S.selected !== segId) el.classList.remove("sel"); }, 1600);
+  setTimeout(function () { if (!S.sel.has(segId)) el.classList.remove("sel"); }, 1600);
 }
 
 async function stopJob() {
