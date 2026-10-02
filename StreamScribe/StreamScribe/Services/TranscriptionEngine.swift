@@ -2647,14 +2647,15 @@ final class TranscriptionEngine: ObservableObject {
                 // going to transcription. Local files skip this — the
                 // original file is already playable.
                 cacheOutputPath: source != .localFile ? try? mediaCache.prepareForRecording().path : nil,
-                liveFromStart: activeSettings.liveFromStart,
-                audioNormalization: activeSettings.audioNormalization,
                 // Honor the user's video-or-audio-only preference for the
                 // cache output. When false, yt-dlp downloads audio-only
                 // (bandwidth/disk save) and ffmpeg writes an audio-only
                 // mp4 — still plays in the miniplayer, just with no
                 // video track.
-                wantsVideoInCache: wantsVideo && !videoHandledBySeparateDownload
+                wantsVideoInCache: wantsVideo && !videoHandledBySeparateDownload,
+                // Per-session settings snapshot (see SessionSettings).
+                liveFromStart: activeSettings.liveFromStart,
+                audioNormalization: activeSettings.audioNormalization
             )
             print("[Pipeline] Audio stream open. Beginning to read frames. (cache video: \(wantsVideo)\(videoHandledBySeparateDownload ? " — pipe audio-only; video via separate download" : ""))")
 
