@@ -2803,7 +2803,9 @@ actor AudioStreamExtractor {
             // ToolManager.youtubePlayerClientArguments — web-family
             // client so the PO-token provider (WebPO-only) applies.
             args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
-            args.append(contentsOf: ToolManager.proxyArguments(sessionOverride: sessionProxyOverride))
+            // Static helper, so no per-session egress override is in
+            // scope: the configured primary proxy (or direct) is used.
+            args.append(contentsOf: ToolManager.proxyArguments())
             // Mirrors the live-pipe format selector — single muxed
             // container at ≤480p with audio-only fallback when video
             // is wanted, plain bestaudio when not. -g returns the
