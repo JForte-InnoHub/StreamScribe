@@ -62,6 +62,9 @@ final class WeSpeakerExtractor {
     /// model weights don't change.
     private var cachedModels: DiarizerModels?
     private var cachedDiarizer: DiarizerManager?
+    /// Dedups the first load when two sessions ask at once (2026-10-02):
+    /// without it both would download/initialize their own manager.
+    private var diarizerLoadTask: Task<DiarizerManager, Error>?
 
     /// Longest audio window handed to the embedding model. FluidAudio's
     /// own example sizes a single-speaker clip at 160 000 samples (10s),
@@ -151,12 +154,23 @@ final class WeSpeakerExtractor {
     /// segment is what produced the log flood.
     private func loadDiarizer() async throws -> DiarizerManager {
         if let d = cachedDiarizer { return d }
-        let models = try await loadModels()
-        let d = DiarizerManager()
-        d.initialize(models: models)
-        cachedDiarizer = d
-        print("[WeSpeaker] Diarizer initialized once for this app run (embedding extraction is stateless).")
-        return d
+        if let diarizerLoadTask { return try await diarizerLoadTask.value }
+        let task = Task<DiarizerManager, Error> {
+            let models = try await self.loadModels()
+            let d = DiarizerManager()
+            d.initialize(models: models)
+            print("[WeSpeaker] Diarizer initialized once for this app run (embedding extraction is stateless).")
+            return d
+        }
+        diarizerLoadTask = task
+        do {
+            let d = try await task.value
+            cachedDiarizer = d
+            return d
+        } catch {
+            diarizerLoadTask = nil
+            throw error
+        }
     }
 
     /// UNUSED since 2026-08-12 — retained for reference and as a quick

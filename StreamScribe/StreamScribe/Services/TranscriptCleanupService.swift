@@ -74,6 +74,17 @@ final class TranscriptCleanupService {
 
     private var container: ModelContainer?
 
+    // CONCURRENT SESSIONS (2026-10-02). This is one shared instance used by
+    // every engine's post-finish cleanup. Two sessions finishing close
+    // together must not (a) both load the 2 GB model (`loadTask` dedups the
+    // load) or (b) run two generation passes at once — the second pass
+    // waits for the first (`passTail`), and `unload()` only releases the
+    // model when no pass is active (`activePasses`), otherwise the first
+    // session's unload would pull the model out from under the second.
+    private var loadTask: Task<ModelContainer, Error>?
+    private var passTail: Task<Void, Never>?
+    private var activePasses = 0
+
     /// Repo for the CURRENTLY SELECTED mode. Fast mode has its own key so
     /// switching modes never requires retyping either repo — and, more
     /// importantly, so fast mode cannot silently load the 4B thorough
@@ -117,6 +128,25 @@ final class TranscriptCleanupService {
     func cleanTranscript(
         segments: [TranscriptSegment],
         knownNames: [String] = [],
+        progress: @escaping (Int, Int) -> Void
+    ) async throws -> CleanupResult {
+        // One pass at a time (see the note on `passTail`).
+        let previous = passTail
+        let gate = Task<Void, Never> { await previous?.value }
+        passTail = gate
+        activePasses += 1
+        defer {
+            activePasses -= 1
+            if passTail == gate { passTail = nil }
+        }
+        await previous?.value
+        try Task.checkCancellation()
+        return try await runCleanupPass(segments: segments, knownNames: knownNames, progress: progress)
+    }
+
+    private func runCleanupPass(
+        segments: [TranscriptSegment],
+        knownNames: [String],
         progress: @escaping (Int, Int) -> Void
     ) async throws -> CleanupResult {
         // Batches: greedy pack in document order until either budget
@@ -191,13 +221,31 @@ final class TranscriptCleanupService {
     /// a 4B model holds ~2.3GB that has no business staying resident
     /// between sessions.
     func unload() {
+        // Another session's pass is still using (or about to use) the
+        // model; it will unload when it finishes.
+        guard activePasses == 0 else { return }
         container = nil
+        loadTask = nil
     }
 
     // MARK: - Internals
 
     private func loadModelIfNeeded() async throws -> ModelContainer {
         if let container { return container }
+        if let loadTask { return try await loadTask.value }
+        let task = Task<ModelContainer, Error> { try await self.loadModelUncached() }
+        loadTask = task
+        do {
+            let loaded = try await task.value
+            container = loaded
+            return loaded
+        } catch {
+            loadTask = nil
+            throw error
+        }
+    }
+
+    private func loadModelUncached() async throws -> ModelContainer {
         // R2-FIRST DISTRIBUTION (2026-07-22, policy: fleet machines
         // have NO Hugging Face access; R2 is the mandatory default for
         // ALL model downloads). Loading by HF model id — the previous
