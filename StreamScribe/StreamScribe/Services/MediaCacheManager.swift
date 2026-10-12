@@ -348,6 +348,7 @@ final class VideoCacheDownloader: @unchecked Sendable {
             "-c:v", "h264_videotoolbox",
             "-b:v", "1500k",
             "-pix_fmt", "yuv420p",
+            "-a53cc", "0",   // captioned sources corrupt the encode otherwise — see AudioStreamExtractor
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",

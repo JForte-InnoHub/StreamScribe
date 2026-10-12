@@ -1276,6 +1276,19 @@ actor AudioStreamExtractor {
                     "-c:v", "h264_videotoolbox",
                     "-b:v", "1500k",
                     "-pix_fmt", "yuv420p",
+                    // No closed captions in the cache (2026-10-12). By
+                    // default the VideoToolbox encoder merges the source's
+                    // CEA-608/708 caption data (A53 SEI) into its own SEI
+                    // NAL, and on broadcast sources that carry captions
+                    // (CBS News, C-SPAN) that merge fails — ffmpeg logs
+                    // "Unexpected end of SEI NAL Unit parsing type" per
+                    // frame (820× on one 5-minute CBS clip) and writes a
+                    // corrupt access unit: a 4 KB SEI followed by a NAL of
+                    // reserved type 31. AVPlayer (err -12852/-12860), the
+                    // web player and ffprobe all then play audio over a
+                    // frozen picture. Nothing reads captions from the
+                    // cache, so leave them out of the encode.
+                    "-a53cc", "0",
                 ])
             }
             cacheArgs.append(contentsOf: [
