@@ -554,6 +554,9 @@ struct PortalJobDTO: Encodable {
     let live: Bool
     /// Web player: preparing | ready | unavailable, or nil when not applicable yet.
     let media: String?
+    /// Changes whenever the file behind /media is replaced (audio snapshot →
+    /// video); the page keys its player on it.
+    let mediaVersion: String?
     let settings: PortalJobSettings
 }
 

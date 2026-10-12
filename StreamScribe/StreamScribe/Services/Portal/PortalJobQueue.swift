@@ -1517,7 +1517,21 @@ final class PortalJobQueue: ObservableObject {
             canManage: canManage(job, who),
             live: isAttached(job),
             media: job.mediaState,
+            mediaVersion: job.mediaState == "ready" ? Self.mediaVersion(job) : nil,
             settings: job.settings)
+    }
+
+    /// Identifies the file currently behind /media. A link job's player first
+    /// serves the audio-only session snapshot and is switched to the video
+    /// when that download lands (setMedia), under the same URL — a browser
+    /// mid-playback must know the bytes changed, or its next Range request
+    /// reads a different file and fails. Size + mtime, so it survives relaunch.
+    private static func mediaVersion(_ job: PortalJob) -> String? {
+        guard let path = job.mediaPath,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = Int((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        return "\(size)-\(mtime)"
     }
 
     private func createURLJob(_ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
@@ -2190,7 +2204,9 @@ final class PortalJobQueue: ObservableObject {
         var args = ["-hide_banner", "-nostdin", "-nostats", "-loglevel", "error", "-y",
                     "-i", input.path, "-map", "0:V:0?", "-map", "0:a:0?"]
         if transcode {
-            args += ["-c:v", "h264_videotoolbox", "-b:v", "1500k", "-pix_fmt", "yuv420p",
+            // -a53cc 0: captioned sources corrupt the encode otherwise (see
+            // AudioStreamExtractor's cache arguments).
+            args += ["-c:v", "h264_videotoolbox", "-b:v", "1500k", "-pix_fmt", "yuv420p", "-a53cc", "0",
                      "-c:a", "aac", "-b:a", "128k"]
         } else {
             args += ["-c", "copy"]

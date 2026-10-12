@@ -428,6 +428,8 @@ const S = {
   dlBusy: false,
   followPlay: true,
   nowSeg: null,
+  playerResume: null,   // {t, playing} carried across a player rebuild
+  playerErrors: 0,      // consecutive media errors on the current file
   expOpen: false,
   exportPrefs: null
 };
@@ -637,7 +639,7 @@ function route() {
     S.view = "job";
     S.jobId = m[1].toUpperCase();
     S.job = null; S.epoch = ""; S.rev = 0; S.segs = new Map(); S.order = []; S.speakers = []; S.pins = [];
-    S.follow = true; S.lastRenderKey = ""; S.nowSeg = null;
+    S.follow = true; S.lastRenderKey = ""; S.nowSeg = null; S.playerResume = null; S.playerErrors = 0;
     renderJobShell();
     pollJob();
   } else {
@@ -1441,18 +1443,36 @@ function renderPlayer() {
   const slot = $("playerSlot");
   const j = S.job;
   if (!slot || !j) return;
-  const want = j.media === "ready" ? "ready:" + j.id
+  // The key includes the media file's version: a link job's player starts on
+  // the audio-only snapshot and is switched to the video when that download
+  // lands, under the same URL. Without the version the old <video> kept
+  // reading a file that had been replaced underneath it, errored, and came
+  // back from the beginning.
+  const version = j.mediaVersion || "";
+  let want = j.media === "ready" ? "ready:" + j.id + ":" + version
     : j.media === "preparing" ? "preparing"
     : (isOnEngine(j.status) || j.status === "queued") ? "later" : "none";
-  if (slot.getAttribute("data-state") === want) return;   // never rebuild a playing player
+  if (j.media === "ready" && S.playerErrors >= 2) want = "broken:" + version;
+  const have = slot.getAttribute("data-state") || "";
+  if (have === want) return;   // never rebuild a playing player
+  // Rebuilding over a live player (file swapped, or recovering from an error):
+  // remember where it was so the new one carries on from there.
+  const old = $("player");
+  if (old && (have.indexOf("ready:") === 0)) {
+    S.playerResume = { t: old.currentTime, playing: !old.paused && !old.ended };
+  }
+  if (have.indexOf("ready:") === 0 && want.indexOf("ready:") === 0) S.playerErrors = 0;  // a different file
   slot.setAttribute("data-state", want);
   slot.textContent = "";
-  if (want === "preparing") {
+  if (want.indexOf("broken:") === 0) {
+    slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "This browser can't play the recording. The transcript and downloads still work."));
+  } else if (want === "preparing") {
     slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "Preparing playback on the Mac Mini…"));
   } else if (want === "later") {
     slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "Playback will be available here when this transcript finishes."));
   } else if (want.indexOf("ready:") === 0) {
-    const video = h("video", { id: "player", controls: true, preload: "metadata", playsinline: true, src: "/api/jobs/" + j.id + "/media" });
+    const video = h("video", { id: "player", controls: true, preload: "metadata", playsinline: true,
+      src: "/api/jobs/" + j.id + "/media" + (version ? "?v=" + encodeURIComponent(version) : "") });
     const card = h("section", { class: "card player", id: "playerCard" }, [
       video,
       h("div", { class: "pc" }, [
@@ -1469,16 +1489,36 @@ function renderPlayer() {
         ])
       ])
     ]);
+    const resume = S.playerResume;
+    S.playerResume = null;
     video.addEventListener("loadedmetadata", function () {
       // Audio-only media: no picture area, just the control bar.
       if (!video.videoWidth) card.classList.add("audio");
+      if (resume && isFinite(resume.t) && resume.t > 0.5) {
+        video.currentTime = Math.min(resume.t, isFinite(video.duration) ? video.duration : resume.t);
+        if (resume.playing) { const p = video.play(); if (p && p.catch) p.catch(function () {}); }
+      }
+    });
+    // Five seconds of real playback since (re)load clears the error count,
+    // so a corrupt spot in the file can't make the player rebuild forever.
+    const startedAt = resume && isFinite(resume.t) ? resume.t : 0;
+    video.addEventListener("timeupdate", function () {
+      if (S.playerErrors && video.currentTime - startedAt > 5) S.playerErrors = 0;
     });
     video.addEventListener("timeupdate", onPlayerTime);
     video.addEventListener("seeked", onPlayerTime);
     video.addEventListener("error", function () {
+      // A mid-playback failure usually means the file changed on the Mini
+      // (see above) or the connection dropped: fetch the job again and let
+      // renderPlayer rebuild from the same position. Two failures in a row
+      // on the same file = the browser really can't play it.
+      S.playerErrors += 1;
+      S.playerResume = { t: video.currentTime, playing: !video.paused && !video.ended };
       slot.setAttribute("data-state", "error");
       slot.textContent = "";
-      slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "This browser can't play the recording. The transcript and downloads still work."));
+      slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" },
+        S.playerErrors >= 2 ? "This browser can't play the recording. The transcript and downloads still work." : "Playback was interrupted — reconnecting…"));
+      refreshNow();
     });
     slot.appendChild(card);
     // Seek links and pin buttons depend on the player existing.
