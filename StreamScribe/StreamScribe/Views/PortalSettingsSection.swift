@@ -9,6 +9,7 @@ struct PortalSettingsSection: View {
     @AppStorage(PortalJobQueue.portKey) private var port: Int = PortalJobQueue.defaultPort
     @AppStorage(PortalJobQueue.adminEmailsKey) private var adminEmails: String = ""
     @AppStorage(PortalJobQueue.retentionDaysKey) private var retentionDays: Int = PortalJobQueue.defaultRetentionDays
+    @AppStorage(PortalJobQueue.downloadRetentionDaysKey) private var downloadRetentionDays: Int = PortalJobQueue.defaultDownloadRetentionDays
     @AppStorage(PortalJobQueue.capacityKey) private var capacity: Int = 1
 
     private var isRunning: Bool {
@@ -77,6 +78,14 @@ struct PortalSettingsSection: View {
             }
             .pickerStyle(.menu)
 
+            Picker("Keep media downloads", selection: $downloadRetentionDays) {
+                Text("1 day").tag(1)
+                Text("3 days").tag(3)
+                Text("7 days").tag(7)
+                Text("30 days").tag(30)
+            }
+            .pickerStyle(.menu)
+
             HStack {
                 Button("Open Portal on This Mac") {
                     if let url = URL(string: "http://127.0.0.1:\(port)/") {
@@ -94,7 +103,7 @@ struct PortalSettingsSection: View {
         } header: {
             Text("Web Portal")
         } footer: {
-            Text("Lets people on Windows, phones and other Macs use StreamScribe from a browser, through a Cloudflare Tunnel protected by Cloudflare Access. The server listens only on this Mac (127.0.0.1) and refuses requests that reach it through Cloudflare without an Access sign-in. The first job runs on this window's engine, with the Mac's own settings restored afterwards; with Jobs at once above 1, further jobs run on extra engines in the background and appear only in the portal. Each extra job loads its own models (roughly 1–2 GB) and shares the Neural Engine, so raise this only on a Mac with memory to spare. Admins can pause the queue and stop or delete anyone's job; everyone else can manage their own. See PORTAL_SETUP.md.")
+            Text("Lets people on Windows, phones and other Macs use StreamScribe from a browser, through a Cloudflare Tunnel protected by Cloudflare Access. The server listens only on this Mac (127.0.0.1) and refuses requests that reach it through Cloudflare without an Access sign-in. The first job runs on this window's engine, with the Mac's own settings restored afterwards; with Jobs at once above 1, further jobs run on extra engines in the background and appear only in the portal. Each extra job loads its own models (roughly 1–2 GB) and shares the Neural Engine, so raise this only on a Mac with memory to spare. Admins can pause the queue and stop or delete anyone's job; everyone else can manage their own. The portal's Download media box saves a link's video or audio on this Mac (same downloader as the sidebar's Download Video button) for the browser to fetch; those files are large, so they are removed after the period above. See PORTAL_SETUP.md.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

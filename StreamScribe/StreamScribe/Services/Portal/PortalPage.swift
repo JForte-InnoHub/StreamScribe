@@ -161,6 +161,16 @@ select:disabled { opacity: .6; }
 .dl .progress { margin-top: 8px; }
 .dl.bad { background: var(--warn-soft); color: var(--warn); }
 
+.dl-list { margin-top: 12px; border-top: 1px solid var(--line); }
+.dlrow { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.dlrow .dlt { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.dlrow .dlu { font-size: 12px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dlrow .job-meta { margin-top: 4px; }
+.dlrow .progress { margin-top: 7px; }
+.dlrow .dla { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.dlrow .job-meta .x { margin-left: auto; border: 0; background: none; cursor: pointer; color: var(--faint); font-size: 16px; line-height: 1; padding: 0 4px; }
+.dlrow .msg { margin-top: 4px; font-size: 12.5px; }
+.chip.resolving, .chip.downloading { background: var(--accent-soft); color: var(--accent); }
 .drop {
   margin-top: 12px; border: 1.5px dashed var(--line); border-radius: var(--radius);
   padding: 22px 14px; text-align: center; color: var(--muted); cursor: pointer;
@@ -425,6 +435,11 @@ const S = {
   formReady: false,
   probe: null,
   probeTimer: null,
+  dlUrl: "",
+  dlProbe: null,
+  dlProbeTimer: null,
+  downloads: [],
+  dlBusy: false,
   followPlay: true,
   nowSeg: null,
   expOpen: false,
@@ -933,9 +948,27 @@ function renderHome() {
     h("ul", { class: "job-list", id: "jobList" }, h("li", { class: "empty", text: "Loading…" }))
   ]);
 
-  view.appendChild(h("div", { class: "grid-home" }, [newCard, listCard]));
+  // Download media: the Mac sidebar's "Download Video…" with its own field,
+  // so people see the option without having to read the Transcribe form.
+  const downloadCard = h("section", { class: "card", style: "margin-top:20px" }, [
+    h("div", { class: "hd" }, h("h2", { text: "Download media" })),
+    h("div", { class: "bd" }, [
+      h("label", { class: "f", for: "dlUrl", text: "Link" }),
+      h("input", { id: "dlUrl", type: "url", placeholder: "https://www.youtube.com/watch?v=…", autocomplete: "off", value: S.dlUrl,
+        oninput: function (e) { S.dlUrl = e.target.value; scheduleProbe("dl"); },
+        onkeydown: function (e) { if (e.key === "Enter") requestDownload(); } }),
+      h("div", { class: "hint", text: "Saves the video (or audio as MP3) on the Mac Mini, then gives you the file — no transcript." }),
+      h("div", { id: "dlProbe", class: "probe hidden", "aria-live": "polite" }),
+      h("button", { class: "btn block", id: "dlBtn", text: "Download", onclick: requestDownload }),
+      h("div", { class: "dl-list hidden", id: "dlList" })
+    ])
+  ]);
+
+  view.appendChild(h("div", { class: "grid-home" }, [h("div", null, [newCard, downloadCard]), listCard]));
   syncSubmit();
   renderProbe();
+  renderProbe("dl");
+  renderDownloads();
   renderJobs();
 }
 
@@ -957,45 +990,56 @@ function setMode(m) {
 // a result for a link that's no longer in the box is ignored.
 function looksLikeLink(u) { return /^https?:\/\/[^\s\/]+\.[^\s]+$/i.test(u); }
 
-function scheduleProbe() {
-  clearTimeout(S.probeTimer);
-  const u = (S.form ? S.form.url : "").trim();
-  if (!looksLikeLink(u)) { S.probe = null; renderProbe(); return; }
-  if (S.probe && S.probe.url === u && S.probe.state !== "error") { renderProbe(); return; }
-  S.probe = { url: u, state: "waiting" };
-  renderProbe();
-  S.probeTimer = setTimeout(function () { runProbe(u); }, 600);
+// Two fields share the machinery: the transcript form ("form") and the
+// Download media box ("dl"), each with its own state and result element.
+const PROBES = {
+  form: { el: "probe", key: "probe", timer: "probeTimer", url: function () { return (S.form ? S.form.url : "").trim(); } },
+  dl: { el: "dlProbe", key: "dlProbe", timer: "dlProbeTimer", url: function () { return (S.dlUrl || "").trim(); } }
+};
+
+function scheduleProbe(which) {
+  const P = PROBES[which || "form"];
+  clearTimeout(S[P.timer]);
+  const u = P.url();
+  if (!looksLikeLink(u)) { S[P.key] = null; renderProbe(which); return; }
+  if (S[P.key] && S[P.key].url === u && S[P.key].state !== "error") { renderProbe(which); return; }
+  S[P.key] = { url: u, state: "waiting" };
+  renderProbe(which);
+  S[P.timer] = setTimeout(function () { runProbe(u, which); }, 600);
 }
 
-async function runProbe(u) {
-  const current = function () { return S.form && S.form.url.trim() === u; };
+async function runProbe(u, which) {
+  const P = PROBES[which || "form"];
+  const current = function () { return P.url() === u; };
   if (!current()) return;
-  S.probe = { url: u, state: "checking" };
-  renderProbe();
+  S[P.key] = { url: u, state: "checking" };
+  renderProbe(which);
   let r;
   try {
     r = await api("/api/probe", { method: "POST", json: { url: u } });
   } catch (e) {
     if (!current()) return;
-    S.probe = { url: u, state: "error", message: e.message };
-    renderProbe();
+    S[P.key] = { url: u, state: "error", message: e.message };
+    renderProbe(which);
     return;
   }
   if (!current()) return;
   if (r.kind === "busy") {
-    S.probeTimer = setTimeout(function () { runProbe(u); }, 3000);
+    S[P.timer] = setTimeout(function () { runProbe(u, which); }, 3000);
     return;
   }
-  S.probe = { url: u, state: r.kind, data: r };
-  renderProbe();
+  S[P.key] = { url: u, state: r.kind, data: r };
+  renderProbe(which);
 }
 
-function renderProbe() {
-  const el = $("probe");
+function renderProbe(which) {
+  const P = PROBES[which || "form"];
+  const el = $(P.el);
   if (!el) return;
-  const p = S.probe;
+  const p = S[P.key];
   el.textContent = "";
-  if (!p || !S.form || p.url !== S.form.url.trim()) { el.className = "probe hidden"; return; }
+  if (which === "dl") syncDownloadButton();
+  if (!p || p.url !== P.url()) { el.className = "probe hidden"; return; }
   const d = p.data || {};
   const src = d.source && d.source !== "Unknown" ? " · " + d.source : "";
   let cls = "probe", head = [], msg = null;
@@ -1007,11 +1051,12 @@ function renderProbe() {
   } else if (p.state === "live") {
     cls += " live";
     head = ["● Live stream" + src];
+    if (which === "dl") msg = "A live stream has no file to save yet. Transcribe it instead, or come back once the broadcast has ended.";
   } else if (p.state === "failed") {
     cls += " bad";
     head = ["Couldn't read this link" + src];
     const reason = (d.message || "").trim();
-    msg = (reason ? reason + (/[.!?…]$/.test(reason) ? " " : ". ") : "") + "You can still try transcribing it.";
+    msg = (reason ? reason + (/[.!?…]$/.test(reason) ? " " : ". ") : "") + (which === "dl" ? "You can still try downloading it." : "You can still try transcribing it.");
   } else {
     cls += " bad";
     head = ["Couldn't check this link"];
@@ -1117,11 +1162,92 @@ async function upload(file, settings) {
 
 async function refreshJobs() {
   try {
-    S.jobs = await api("/api/jobs");
-    if (S.view === "home") renderJobs();
+    const both = await Promise.all([api("/api/jobs"), api("/api/downloads")]);
+    S.jobs = both[0];
+    S.downloads = both[1];
+    if (S.view === "home") { renderJobs(); renderDownloads(); }
   } catch (e) {
     if (e.network) banner(e.message);
   }
+}
+
+// ---------- media downloads ----------
+function syncDownloadButton() {
+  const btn = $("dlBtn");
+  if (!btn) return;
+  const u = (S.dlUrl || "").trim();
+  const p = S.dlProbe;
+  const live = p && p.url === u && p.state === "live";
+  btn.disabled = S.dlBusy || !u || !!live;
+}
+
+async function requestDownload() {
+  const btn = $("dlBtn");
+  if (!btn || btn.disabled) return;
+  const url = (S.dlUrl || "").trim();
+  if (!url) { toast("Paste a link first."); return; }
+  S.dlBusy = true;
+  syncDownloadButton();
+  try {
+    await api("/api/downloads", { method: "POST", json: { url: url } });
+    S.dlUrl = "";
+    S.dlProbe = null;
+    if ($("dlUrl")) $("dlUrl").value = "";
+    renderProbe("dl");
+    toast("The Mac Mini is fetching it — the file appears below when it's ready.");
+    await refreshJobs();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    S.dlBusy = false;
+    syncDownloadButton();
+  }
+}
+
+const DL_LABEL = { queued: "Queued", resolving: "Checking", downloading: "Downloading", completed: "Ready", failed: "Failed", cancelled: "Cancelled" };
+function dlActive(d) { return d.status === "queued" || d.status === "resolving" || d.status === "downloading"; }
+
+function renderDownloads() {
+  const box = $("dlList");
+  if (!box) return;
+  box.textContent = "";
+  box.classList.toggle("hidden", !S.downloads.length);
+  for (const d of S.downloads) {
+    const active = dlActive(d);
+    const meta = [
+      h("span", { class: "chip " + d.status, text: DL_LABEL[d.status] || d.status }),
+      h("span", { text: d.submittedBy === "local" ? "Mac Mini" : d.submittedBy }),
+      h("span", { text: relTime(d.createdAt) }),
+      d.sizeBytes ? h("span", { text: fmtBytes(d.sizeBytes) }) : null
+    ];
+    const pct = d.status === "downloading" && d.progress !== null && d.progress !== undefined ? d.progress * 100 : null;
+    const actions = [];
+    if (d.status === "completed") {
+      actions.push(h("a", { class: "btn sm primary", href: "/api/downloads/" + d.id + "/file", download: d.fileName || "", text: "Save file" }));
+    }
+    if (active && d.canManage) {
+      actions.push(h("button", { class: "btn sm", type: "button", text: "Cancel", onclick: function () { downloadAction(d.id, "cancel"); } }));
+    }
+    if (!active && d.canManage) {
+      meta.push(h("button", { class: "x", type: "button", title: "Remove from this list", text: "×", onclick: function () { downloadAction(d.id, "delete"); } }));
+    }
+    const showMsg = d.message && d.status !== "completed" && d.message !== DL_LABEL[d.status];
+    box.appendChild(h("div", { class: "dlrow" }, [
+      h("div", { class: "dlt", title: d.title || d.url, text: d.title || d.fileName || shortURL(d.url) }),
+      d.title ? h("div", { class: "dlu", title: d.url, text: shortURL(d.url) }) : null,
+      h("div", { class: "job-meta" }, meta),
+      d.status === "downloading" || d.status === "resolving" ? h("div", { class: "progress" + (pct === null ? " ind" : "") }, h("div", { style: pct === null ? "" : "width:" + pct.toFixed(1) + "%" })) : null,
+      showMsg ? h("div", { class: "msg" + (d.status === "failed" ? " bad" : ""), text: d.message }) : null,
+      actions.length ? h("div", { class: "dla" }, actions) : null
+    ]));
+  }
+}
+
+async function downloadAction(id, action) {
+  try {
+    await api("/api/downloads/" + id + "/" + action, { method: "POST", json: {} });
+    await refreshJobs();
+  } catch (e) { toast(e.message); }
 }
 
 function renderJobs() {
@@ -2025,7 +2151,7 @@ async function tick() {
   if (S.view === "home") await refreshJobs();
   const dls = S.status && S.status.options.downloads ? Object.values(S.status.options.downloads) : [];
   const downloading = dls.some(function (d) { return d.state === "downloading" || d.state === "loading"; });
-  const busy = S.status && (S.status.engine.active || S.status.queue.queued > 0 || downloading);
+  const busy = S.status && (S.status.engine.active || S.status.queue.queued > 0 || downloading || S.downloads.some(dlActive));
   setTimeout(tick, document.hidden ? 15000 : (busy ? 3000 : 6000));
 }
 document.addEventListener("visibilitychange", function () {

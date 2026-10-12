@@ -418,6 +418,61 @@ extension TranscriptSegment {
     }
 }
 
+// MARK: - Media downloads (the Mac's "Download Video…" from the web)
+
+enum PortalDownloadStatus: String, Codable {
+    case queued, resolving, downloading, completed, failed, cancelled
+
+    var isActive: Bool { self == .queued || self == .resolving || self == .downloading }
+}
+
+/// One web user's request to save a link's media on the Mini, so they can
+/// then fetch the file through the browser.
+struct PortalMediaDownload: Codable, Identifiable {
+    let id: UUID
+    let url: String
+    var title: String?
+    var status: PortalDownloadStatus
+    /// 0…1 while downloading (nil = unknown / not started).
+    var progress: Double?
+    /// What yt-dlp/ffmpeg is doing right now, or why it failed.
+    var message: String?
+    /// The saved file (inside Portal/downloads/<id>/), once completed.
+    var filePath: String?
+    var sizeBytes: Int64?
+    let submittedBy: String
+    let createdAt: Date
+    var startedAt: Date?
+    var finishedAt: Date?
+
+    init(url: String, submittedBy: String) {
+        self.id = UUID()
+        self.url = url
+        self.status = .queued
+        self.submittedBy = submittedBy
+        self.createdAt = Date()
+    }
+}
+
+struct PortalMediaDownloadDTO: Encodable {
+    let id: String
+    let url: String
+    let title: String?
+    let status: String
+    let progress: Double?
+    let message: String?
+    let fileName: String?
+    let sizeBytes: Int64?
+    let submittedBy: String
+    let createdAt: Date
+    let finishedAt: Date?
+    let canManage: Bool
+}
+
+struct PortalCreateDownloadBody: Decodable {
+    let url: String
+}
+
 // MARK: - Upload sessions
 
 struct PortalUploadSession {

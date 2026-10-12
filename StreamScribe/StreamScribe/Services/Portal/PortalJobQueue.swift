@@ -50,6 +50,10 @@ final class PortalJobQueue: ObservableObject {
 
     static let defaultPort: Int = 8795
     static let defaultRetentionDays: Int = 30
+    /// Media downloads (the web "Download media" box) are large; kept briefly.
+    static let downloadRetentionDaysKey = "portal.downloadRetentionDays"
+    static let defaultDownloadRetentionDays: Int = 7
+    static let maxConcurrentDownloads = 2
     static let maxUploadBytes: Int64 = 10 * 1024 * 1024 * 1024   // 10 GB
     /// Browser upload chunk. Well under Cloudflare's 100 MB request-body cap.
     static let uploadChunkBytes: Int = 16 * 1024 * 1024
@@ -139,6 +143,16 @@ final class PortalJobQueue: ObservableObject {
     private var mediaGeneration: [UUID: Int] = [:]
     private var probeCache: [String: (at: Date, result: PortalProbeDTO)] = [:]
     private var probesInFlight: [String: Task<PortalProbeDTO, Never>] = [:]
+
+    /// Media downloads requested from the web (see "MARK: - Media downloads").
+    @Published private(set) var downloads: [PortalMediaDownload] = []
+    private final class ActiveDownload {
+        var service: VideoDownloadService?
+        var cancellable: AnyCancellable?
+        var cancelRequested = false
+    }
+    private var activeDownloads: [UUID: ActiveDownload] = [:]
+    private var downloadsSaveScheduled = false
     /// At most this many link checks run at once (each is a yt-dlp or ffmpeg
     /// process). Every one is a request from the Mini's IP — the same IP a
     /// running YouTube job depends on — so they are kept few and cached.
@@ -160,6 +174,7 @@ final class PortalJobQueue: ObservableObject {
             didLoad = true
             restorePendingSettingsFromLastLaunch()
             loadJobs()
+            loadDownloads()
             cleanupStaleUploads()
             applyRetention()
             retentionTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { _ in
@@ -655,6 +670,9 @@ final class PortalJobQueue: ObservableObject {
     private static var uploadsDirectory: URL { rootDirectory.appendingPathComponent("uploads") }
     private static var mediaDirectory: URL { rootDirectory.appendingPathComponent("media") }
     private static var clipsDirectory: URL { rootDirectory.appendingPathComponent("clips") }
+    private static var downloadsDirectory: URL { rootDirectory.appendingPathComponent("downloads") }
+    private static var downloadsFile: URL { rootDirectory.appendingPathComponent("downloads.json") }
+    private static func downloadFolder(_ id: UUID) -> URL { downloadsDirectory.appendingPathComponent(id.uuidString) }
     private static func mediaFolder(_ id: UUID) -> URL { mediaDirectory.appendingPathComponent(id.uuidString) }
 
     private static func jobFile(_ id: UUID) -> URL {
@@ -758,6 +776,7 @@ final class PortalJobQueue: ObservableObject {
 
     private func applyRetention() {
         cleanupOldClips()
+        applyDownloadRetention()
         let d = UserDefaults.standard
         let days = d.object(forKey: Self.retentionDaysKey) == nil
             ? Self.defaultRetentionDays : d.integer(forKey: Self.retentionDaysKey)
@@ -803,6 +822,274 @@ final class PortalJobQueue: ObservableObject {
         if isPaused { parts.append("queue paused") }
         let text = parts.isEmpty ? "Idle — \(jobs.count) job(s) on file" : parts.joined(separator: " · ")
         if text != summary { summary = text }
+    }
+
+    // MARK: - Media downloads
+    //
+    // The web form of the Mac sidebar's "Download Video…": the Mini fetches the
+    // link's media with the same VideoDownloadService (yt-dlp / ffmpeg, same
+    // cookies, proxy and TLS settings, audio-only → mp3), keeps the file in
+    // Portal/downloads/<id>/ and the browser then fetches it from there. Each
+    // download gets its own service instance, so web downloads never block or
+    // show up in the Mac window's download row. Up to maxConcurrentDownloads
+    // run at once; the rest queue. Files are swept after a few days.
+
+    private func download(_ id: UUID) -> PortalMediaDownload? { downloads.first { $0.id == id } }
+
+    private func updateDownload(_ dl: PortalMediaDownload, save: Bool = true) {
+        if let i = downloads.firstIndex(where: { $0.id == dl.id }) { downloads[i] = dl } else { downloads.append(dl) }
+        if save { saveDownloads() }
+    }
+
+    private func downloadDTO(_ dl: PortalMediaDownload, _ who: PortalIdentity) -> PortalMediaDownloadDTO {
+        PortalMediaDownloadDTO(
+            id: dl.id.uuidString, url: dl.url, title: dl.title, status: dl.status.rawValue,
+            progress: dl.progress, message: dl.message,
+            fileName: dl.filePath.map { URL(fileURLWithPath: $0).lastPathComponent },
+            sizeBytes: dl.sizeBytes, submittedBy: dl.submittedBy, createdAt: dl.createdAt,
+            finishedAt: dl.finishedAt, canManage: isAdmin(who) || dl.submittedBy == who.email)
+    }
+
+    private func createDownload(_ request: PortalHTTPRequest, _ who: PortalIdentity) async -> PortalHTTPResponse {
+        guard let body = request.decodeBody(PortalCreateDownloadBody.self) else {
+            return .error(400, "Expected {\"url\": \"https://…\"}")
+        }
+        let checked = Self.validateSubmittedURL(body.url)
+        guard let url = checked.url else { return .error(422, checked.problem ?? "Invalid link") }
+        // Same link already queued or in progress for anyone → hand that one back.
+        if let existing = downloads.first(where: { $0.url == url.absoluteString && $0.status.isActive }) {
+            return .dto(downloadDTO(existing, who))
+        }
+        let active = downloads.filter { $0.status.isActive }.count
+        guard active < 20 else { return .error(429, "Too many downloads are waiting; try again in a few minutes") }
+        let dl = PortalMediaDownload(url: url.absoluteString, submittedBy: who.email)
+        updateDownload(dl)
+        print("[Portal] Download requested by \(who.email): \(url.absoluteString)")
+        pumpDownloads()
+        return .dto(downloadDTO(download(dl.id) ?? dl, who), status: 201)
+    }
+
+    private func pumpDownloads() {
+        let running = downloads.filter { $0.status == .resolving || $0.status == .downloading }.count
+        var free = Self.maxConcurrentDownloads - running
+        for dl in downloads where dl.status == .queued && free > 0 {
+            free -= 1
+            runDownload(dl.id)
+        }
+    }
+
+    private func runDownload(_ id: UUID) {
+        guard var dl = download(id), dl.status == .queued else { return }
+        let active = ActiveDownload()
+        activeDownloads[id] = active
+        dl.status = .resolving
+        dl.startedAt = Date()
+        dl.message = "Checking the link…"
+        updateDownload(dl)
+        let urlString = dl.url
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let url = URL(string: urlString) else { self.finishDownload(id, failed: "Invalid link"); return }
+
+            // Title for the filename and the live-vs-recording verdict, from the
+            // same cached check the form uses. A live stream never ends, so it
+            // can't be downloaded — the Mac hides its button for those too.
+            let probe = await self.probeResult(for: url, allowBusy: false)
+            guard let current = self.download(id), current.status == .resolving else { return }
+            if active.cancelRequested { self.finishDownload(id, cancelled: true); return }
+            if probe.kind == "live" {
+                self.finishDownload(id, failed: "This is a live stream, so there's no file to download yet. Transcribe it instead, or try again once the broadcast has ended.")
+                return
+            }
+            var titled = current
+            titled.title = probe.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if titled.title?.isEmpty == true { titled.title = nil }
+            titled.message = "Starting download…"
+            self.updateDownload(titled, save: false)
+
+            // Portal/player pages → direct media, as the Mac's button does.
+            let resolved = await TranscriptionEngine.resolvedMediaURL(for: url) ?? url
+            guard let again = self.download(id), again.status == .resolving else { return }
+            if active.cancelRequested { self.finishDownload(id, cancelled: true); return }
+
+            let folder = Self.downloadFolder(id)
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                self.finishDownload(id, failed: "Couldn't create the download folder: \(error.localizedDescription)")
+                return
+            }
+            let base = Self.safeFilename(titled.title ?? "Video")
+            let dest = folder.appendingPathComponent(base + ".mp4")
+
+            let service = VideoDownloadService()
+            active.service = service
+            var started = again
+            started.status = .downloading
+            started.progress = 0
+            self.updateDownload(started)
+            // The service publishes progress/status; mirror them into the
+            // record (progress isn't saved to disk — status changes are).
+            active.cancellable = service.objectWillChange
+                .throttle(for: .milliseconds(400), scheduler: DispatchQueue.main, latest: true)
+                .sink { [weak self] _ in self?.mirrorDownload(id) }
+            service.downloadVideo(from: resolved, to: dest)
+        }
+    }
+
+    private func mirrorDownload(_ id: UUID) {
+        guard let active = activeDownloads[id], let service = active.service, var dl = download(id) else { return }
+        if service.isDownloading {
+            guard dl.status == .downloading else { return }
+            let changed = dl.progress != service.progress || dl.message != service.statusText
+            dl.progress = service.progress
+            dl.message = service.statusText
+            if changed { updateDownload(dl, save: false) }
+            return
+        }
+        // Finished one way or another. (objectWillChange fires before the
+        // change lands; the main-queue hop above means we read the final state.)
+        guard dl.status == .downloading else { return }
+        if let saved = service.savedURL {
+            finishDownload(id, saved: saved)
+        } else if active.cancelRequested || service.statusText == "Cancelled" {
+            finishDownload(id, cancelled: true)
+        } else {
+            finishDownload(id, failed: service.lastError ?? "The download failed")
+        }
+    }
+
+    private func finishDownload(_ id: UUID, saved: URL? = nil, failed: String? = nil, cancelled: Bool = false) {
+        guard var dl = download(id), dl.status.isActive else { return }
+        activeDownloads[id] = nil
+        dl.finishedAt = Date()
+        if let saved {
+            dl.status = .completed
+            dl.progress = 1
+            dl.filePath = saved.path
+            dl.sizeBytes = (try? FileManager.default.attributesOfItem(atPath: saved.path))?[.size] as? Int64
+            dl.message = nil
+            print("[Portal] Download ready: \(saved.lastPathComponent)")
+        } else if cancelled {
+            dl.status = .cancelled
+            dl.message = "Cancelled"
+            try? FileManager.default.removeItem(at: Self.downloadFolder(id))
+        } else {
+            dl.status = .failed
+            dl.message = Self.friendlyDownloadError(failed ?? "The download failed")
+            try? FileManager.default.removeItem(at: Self.downloadFolder(id))
+            print("[Portal] Download failed: \(failed ?? "?")")
+        }
+        updateDownload(dl)
+        pumpDownloads()
+    }
+
+    /// yt-dlp's stderr dump is pages long; keep the line that says why.
+    private static func friendlyDownloadError(_ raw: String) -> String {
+        let lines = raw.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        if let err = lines.last(where: { $0.hasPrefix("ERROR:") }) {
+            return String(err.dropFirst("ERROR:".count)).trimmingCharacters(in: .whitespaces)
+        }
+        let flat = raw.replacingOccurrences(of: "\n", with: " ")
+        return flat.count > 300 ? String(flat.prefix(300)) + "…" : flat
+    }
+
+    private func cancelDownload(_ dl: PortalMediaDownload, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard isAdmin(who) || dl.submittedBy == who.email else { return .error(403, "You can only cancel your own downloads") }
+        guard dl.status.isActive else { return .dto(downloadDTO(dl, who)) }
+        if let active = activeDownloads[dl.id] {
+            active.cancelRequested = true
+            if let service = active.service, service.isDownloading {
+                service.cancel()   // the service's finish lands in mirrorDownload
+            } else {
+                // .resolving: runDownload checks cancelRequested after each
+                // await; the link check can take a while, so say so meanwhile.
+                var waiting = dl
+                waiting.message = "Cancelling…"
+                updateDownload(waiting, save: false)
+            }
+        } else {
+            finishDownload(dl.id, cancelled: true)   // still queued
+        }
+        return .dto(downloadDTO(download(dl.id) ?? dl, who))
+    }
+
+    private func deleteDownload(_ dl: PortalMediaDownload, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard isAdmin(who) || dl.submittedBy == who.email else { return .error(403, "You can only remove your own downloads") }
+        guard !dl.status.isActive else { return .error(409, "Cancel the download first") }
+        downloads.removeAll { $0.id == dl.id }
+        try? FileManager.default.removeItem(at: Self.downloadFolder(dl.id))
+        saveDownloads()
+        return .ok()
+    }
+
+    private func downloadFileResponse(_ dl: PortalMediaDownload, _ request: PortalHTTPRequest) -> PortalHTTPResponse {
+        guard dl.status == .completed, let path = dl.filePath else {
+            return .error(404, "That download isn't ready")
+        }
+        let url = URL(fileURLWithPath: path)
+        // Only ever serve from the downloads folder, whatever the saved record says.
+        guard url.standardizedFileURL.path.hasPrefix(Self.downloadsDirectory.standardizedFileURL.path + "/") else {
+            return .error(404, "That download isn't available")
+        }
+        return .file(url, contentType: Self.mimeType(for: url), rangeHeader: request.header("range"),
+                     downloadName: url.lastPathComponent)
+    }
+
+    private func loadDownloads() {
+        guard let data = try? Data(contentsOf: Self.downloadsFile),
+              var loaded = try? Self.makeDecoder().decode([PortalMediaDownload].self, from: data) else { return }
+        for i in loaded.indices where loaded[i].status.isActive {
+            loaded[i].status = .failed
+            loaded[i].message = "StreamScribe quit while this was downloading. Request it again."
+            loaded[i].finishedAt = loaded[i].finishedAt ?? Date()
+            try? FileManager.default.removeItem(at: Self.downloadFolder(loaded[i].id))
+        }
+        // A file removed by hand → don't offer a dead link.
+        for i in loaded.indices where loaded[i].status == .completed {
+            if let p = loaded[i].filePath, !FileManager.default.fileExists(atPath: p) {
+                loaded[i].status = .failed
+                loaded[i].message = "The file is no longer on the Mac Mini."
+                loaded[i].filePath = nil
+            }
+        }
+        downloads = loaded.sorted { $0.createdAt < $1.createdAt }
+        saveDownloads()
+    }
+
+    /// Coalesced whole-list save (the list is small; progress isn't saved).
+    private func saveDownloads() {
+        guard !downloadsSaveScheduled else { return }
+        downloadsSaveScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self else { return }
+            self.downloadsSaveScheduled = false
+            do {
+                try FileManager.default.createDirectory(at: Self.rootDirectory, withIntermediateDirectories: true)
+                let data = try Self.makeEncoder().encode(self.downloads)
+                try data.write(to: Self.downloadsFile, options: .atomic)
+            } catch {
+                print("[Portal] Could not save downloads list: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func applyDownloadRetention() {
+        let d = UserDefaults.standard
+        let days = d.object(forKey: Self.downloadRetentionDaysKey) == nil
+            ? Self.defaultDownloadRetentionDays : d.integer(forKey: Self.downloadRetentionDaysKey)
+        guard days > 0 else { return }
+        let cutoff = Date().addingTimeInterval(-Double(days) * 86_400)
+        let expired = downloads.filter { !$0.status.isActive && ($0.finishedAt ?? $0.createdAt) < cutoff }
+        guard !expired.isEmpty else { return }
+        for dl in expired {
+            downloads.removeAll { $0.id == dl.id }
+            try? FileManager.default.removeItem(at: Self.downloadFolder(dl.id))
+        }
+        saveDownloads()
+        print("[Portal] Retention: removed \(expired.count) download(s) older than \(days) day(s).")
     }
 
     // MARK: - Identity
@@ -880,6 +1167,20 @@ final class PortalJobQueue: ObservableObject {
             return await probeLink(request)
         case ("POST", 2) where r[0] == "models" && r[1] == "download":
             return startModelDownload(request, who)
+        case ("GET", 1) where r[0] == "downloads":
+            return .dto(downloads.reversed().map { downloadDTO($0, who) })
+        case ("POST", 1) where r[0] == "downloads":
+            return await createDownload(request, who)
+        case ("GET", 3) where r[0] == "downloads" && r[2] == "file", ("HEAD", 3) where r[0] == "downloads" && r[2] == "file":
+            guard let id = UUID(uuidString: r[1]), let dl = download(id) else { return .error(404, "Unknown download") }
+            return downloadFileResponse(dl, request)
+        case ("POST", 3) where r[0] == "downloads":
+            guard let id = UUID(uuidString: r[1]), let dl = download(id) else { return .error(404, "Unknown download") }
+            switch r[2] {
+            case "cancel": return cancelDownload(dl, who)
+            case "delete": return deleteDownload(dl, who)
+            default: return .error(404, "Not found")
+            }
         case ("POST", 3) where r[0] == "uploads":
             guard let id = UUID(uuidString: r[1]) else { return .error(404, "Unknown upload") }
             switch r[2] {
@@ -1026,17 +1327,23 @@ final class PortalJobQueue: ObservableObject {
         }
         let checked = Self.validateSubmittedURL(body.url)
         guard let url = checked.url else { return .error(422, checked.problem ?? "Invalid link") }
-        let key = url.absoluteString
+        return .dto(await probeResult(for: url, allowBusy: true))
+    }
 
+    /// Cached / shared link check. With `allowBusy` the caller gets a "busy"
+    /// answer (and retries) when the page-probe cap is reached; without it
+    /// the check runs regardless — used by media downloads, which wait anyway.
+    private func probeResult(for url: URL, allowBusy: Bool) async -> PortalProbeDTO {
+        let key = url.absoluteString
         if let cached = probeCache[key], Date().timeIntervalSince(cached.at) < Self.probeCacheSeconds {
-            return .dto(cached.result)
+            return cached.result
         }
         if let running = probesInFlight[key] {
-            return .dto(await running.value)
+            return await running.value
         }
-        guard probesInFlight.count < Self.maxConcurrentProbes else {
-            return .dto(PortalProbeDTO(url: key, kind: "busy", durationSeconds: nil, title: nil,
-                                       source: nil, message: "Other links are being checked; retrying shortly."))
+        if allowBusy && probesInFlight.count >= Self.maxConcurrentProbes {
+            return PortalProbeDTO(url: key, kind: "busy", durationSeconds: nil, title: nil,
+                                  source: nil, message: "Other links are being checked; retrying shortly.")
         }
 
         let task = Task { () -> PortalProbeDTO in
@@ -1066,7 +1373,7 @@ final class PortalJobQueue: ObservableObject {
             }
         }
         print("[Portal] Link check \(dto.kind)\(dto.durationSeconds.map { String(format: " %.0fs", $0) } ?? ""): \(key)")
-        return .dto(dto)
+        return dto
     }
 
     // MARK: - Model availability

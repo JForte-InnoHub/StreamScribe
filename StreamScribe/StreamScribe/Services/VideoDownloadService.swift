@@ -105,11 +105,20 @@ final class VideoDownloadService: ObservableObject {
     /// from neutral status text.
     @Published private(set) var lastError: String?
 
+    /// Where the last successful download ended up (can differ from the
+    /// requested destination by extension — audio-only sources become .mp3).
+    /// nil while downloading, after a failure, or after a cancel.
+    @Published private(set) var savedURL: URL?
+
     /// The actively-running download task. Used to support cancel().
     /// nil when no download is in flight.
     private var currentTask: Task<Void, Never>?
 
-    private init() {}
+    /// `shared` is the Mac sidebar's downloader (one at a time, status shown
+    /// inline). The web portal makes its own instance per download so web
+    /// users' downloads neither block the Mac's button nor show up in its
+    /// status row (2026-10-12).
+    init() {}
 
     // MARK: - Public API
 
@@ -124,6 +133,7 @@ final class VideoDownloadService: ObservableObject {
         progress = 0
         statusText = "Starting download…"
         lastError = nil
+        savedURL = nil
 
         currentTask = Task { [weak self] in
             guard let self else { return }
@@ -135,6 +145,7 @@ final class VideoDownloadService: ObservableObject {
                 await MainActor.run {
                     self.progress = 1.0
                     self.statusText = "Saved to \(savedURL.lastPathComponent)"
+                    self.savedURL = savedURL
                 }
             } catch is CancellationError {
                 await MainActor.run {
