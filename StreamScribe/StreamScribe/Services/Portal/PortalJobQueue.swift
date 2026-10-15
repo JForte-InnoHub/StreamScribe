@@ -1159,7 +1159,7 @@ final class PortalJobQueue: ObservableObject {
         }
         if action == "clip" {
             // Each clip runs ffmpeg; cap what people who aren't signed in can start.
-            guard shareClipsInFlight < 2 else {
+            guard shareClipsInFlight < 5 else {
                 return .error(429, "Other clips are being prepared — try again in a moment")
             }
             shareClipsInFlight += 1
@@ -1200,12 +1200,13 @@ final class PortalJobQueue: ObservableObject {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    /// Making a transcript public is the owner's (or an admin's) call. Asking
-    /// again returns the existing link rather than replacing it.
+    /// Anyone signed in can share a transcript (and turn the link off) — but
+    /// never someone who is only holding a share link. Asking again returns
+    /// the existing link rather than replacing it.
+    private func canShare(_ who: PortalIdentity) -> Bool { !who.isShareLink }
+
     private func createShareLink(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
-        guard canManage(job, who) else {
-            return .error(403, "Only the person who submitted this transcript (or an admin) can share it")
-        }
+        guard canShare(who) else { return .error(403, "Share links can't create other share links") }
         var j = self.job(job.id) ?? job
         if j.shareToken == nil {
             j.shareToken = Self.makeShareToken()
@@ -1218,9 +1219,7 @@ final class PortalJobQueue: ObservableObject {
     }
 
     private func removeShareLink(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
-        guard canManage(job, who) else {
-            return .error(403, "Only the person who submitted this transcript (or an admin) can turn off its link")
-        }
+        guard canShare(who) else { return .error(403, "Share links can't be turned off from the link itself") }
         var j = self.job(job.id) ?? job
         if j.shareToken != nil {
             j.shareToken = nil
@@ -1672,7 +1671,7 @@ final class PortalJobQueue: ObservableObject {
             media: job.mediaState,
             mediaVersion: job.mediaState == "ready" ? Self.mediaVersion(job) : nil,
             shared: job.shareToken != nil,
-            shareToken: canManage(job, who) ? job.shareToken : nil,
+            shareToken: canShare(who) ? job.shareToken : nil,
             settings: job.settings)
     }
 
@@ -2010,9 +2009,6 @@ final class PortalJobQueue: ObservableObject {
         let text = body.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count <= 20_000 else { return .error(422, "Text is too long") }
         guard latest(job).segments.contains(where: { $0.id == id }) else { return .error(404, "Sentence not found") }
-        if text.isEmpty && !canManage(job, who) {
-            return .error(403, "Only the person who submitted this transcript (or an admin) can delete sentences")
-        }
         if let engine = attachedEngine(job) {
             engine.updateSegmentText(id: id, newText: text)
             syncIfAttached(job)
@@ -2040,11 +2036,8 @@ final class PortalJobQueue: ObservableObject {
         guard let body = request.decodeBody(PortalSegmentIDsBody.self), let ids = Self.segmentIDs(body.segmentIds) else {
             return .error(400, "Expected {\"segmentIds\": [\"…\"]}")
         }
-        // Deleting is the one edit with nothing to restore from, so it is
-        // limited to the job's owner and admins (like stopping or deleting the job).
-        guard canManage(job, who) else {
-            return .error(403, "Only the person who submitted this transcript (or an admin) can delete sentences")
-        }
+        // Open to everyone who can edit (including share links): restricting
+        // deletion while allowing text edits protected nothing (2026-10-15).
         guard ids.isSubset(of: Set(latest(job).segments.map(\.id))) else {
             return .error(404, "Some of those sentences no longer exist")
         }

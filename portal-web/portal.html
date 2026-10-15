@@ -241,6 +241,7 @@ select:disabled { opacity: .6; }
 .spk { display: grid; grid-template-columns: 10px 1fr auto; gap: 8px; align-items: center; margin-top: 8px; }
 .spk .sw { width: 10px; height: 10px; border-radius: 50%; }
 .spk input { padding: 6px 9px; font-size: 14px; }
+.spk input[readonly] { background: transparent; border-color: transparent; padding-left: 0; outline: none; }
 .spk .cnt { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .spk .src { grid-column: 2 / 4; font-size: 11.5px; color: var(--faint); margin-top: -4px; }
 .pinrow { padding: 10px 0; border-top: 1px solid var(--line); }
@@ -409,6 +410,9 @@ select:disabled { opacity: .6; }
 // for that token.
 const SHARE = (location.pathname.match(/^\/s\/([A-Za-z0-9_-]{43})\/?$/) || [])[1] || null;
 const BASE = SHARE ? "/s/" + SHARE : "";
+// Signed-in users can always edit. A shared page starts read-only so a
+// visitor can't change the transcript by accident; "Edit transcript" unlocks it.
+function canEdit() { return !SHARE || S.editing; }
 if (SHARE) document.documentElement.classList.add("share");
 
 const S = {
@@ -446,6 +450,7 @@ const S = {
   dlBusy: false,
   followPlay: true,
   nowSeg: null,
+  editing: false,       // shared page: edits stay off until "Edit transcript"
   playerResume: null,   // {t, playing} carried across a player rebuild
   playerErrors: 0,      // consecutive media errors on the current file
   expOpen: false,
@@ -1446,7 +1451,7 @@ function renderJobHead() {
 
   // Rebuilt only when something it shows changes — rebuilding every poll
   // would snap shut a format dropdown someone has open.
-  const actKey = [j.id, j.status, j.canManage, S.order.length > 0, j.shared].join("|");
+  const actKey = [j.id, j.status, j.canManage, S.order.length > 0, j.shared, S.editing].join("|");
   const act = $("jobActions");
   if (act.getAttribute("data-key") !== actKey) {
   act.setAttribute("data-key", actKey);
@@ -1466,8 +1471,11 @@ function renderJobHead() {
     act.appendChild(h("button", { class: "btn", id: "expBtn", "aria-expanded": S.expOpen ? "true" : "false", text: "Export options",
       onclick: function () { S.expOpen = !S.expOpen; renderExportPanel(); } }));
   }
-  if (j.canManage && !SHARE) {
-    act.appendChild(h("button", { class: "btn", id: "shareBtn", text: j.shared ? "Shared ▾" : "Share", onclick: openShareDialog }));
+  // Anyone signed in can share (not only the owner); a link visitor can't.
+  if (!SHARE) act.appendChild(h("button", { class: "btn", id: "shareBtn", text: j.shared ? "Shared ▾" : "Share", onclick: openShareDialog }));
+  if (SHARE && S.order.length) {
+    act.appendChild(h("button", { class: "btn" + (S.editing ? " primary" : ""), id: "editModeBtn",
+      text: S.editing ? "Done editing" : "Edit transcript", onclick: toggleEditing }));
   }
   if (isTerminal(j.status) && !SHARE) {
     act.appendChild(h("button", { class: "btn", text: "Run again", onclick: retryJob }));
@@ -1819,8 +1827,9 @@ function updateActionbar() {
   $("actionText").textContent = one ? (nameFor(one.speaker) + " · " + fmtTime(one.start))
     : (segs.length + " sentences · " + fmtTime(segs[0].start) + "–" + fmtTime(segs[segs.length - 1].end));
   $("pinSelBtn").textContent = isPinned ? "Unpin" : "Pin quote";
-  $("pinSelBtn").classList.toggle("hidden", !one);
-  $("editSelBtn").classList.toggle("hidden", !one);
+  $("pinSelBtn").classList.toggle("hidden", !one || !canEdit());
+  $("editSelBtn").classList.toggle("hidden", !one || !canEdit());
+  $("spkSelBtn").classList.toggle("hidden", !canEdit());
   $("playSelBtn").classList.toggle("hidden", !playerReady());
   $("clipSelBtn").classList.toggle("hidden", !playerReady());
   $("multiSelBtn").classList.toggle("on", S.multi);
@@ -1921,13 +1930,17 @@ $("moreSelBtn").addEventListener("click", function (e) {
   const restorable = segs.some(function (s) { return s.restorable; });
   const items = [];
   if (playerReady()) items.push({ label: "Download clip", sub: fmtTime(segs[0].start) + "–" + fmtTime(segs[n - 1].end), onclick: clipSelection });
+  if (!canEdit()) {
+    items.push("-");
+    items.push({ label: "Edit transcript…", sub: "to change or delete text", onclick: toggleEditing });
+    showMenu(e.currentTarget, items);
+    return;
+  }
   items.push({ label: "Restore verbatim", sub: restorable ? "undo cleanup / edits" : "nothing to restore", disabled: !restorable, onclick: function () {
     editCall("segments/restore", { segmentIds: ids }, "Original wording restored.");
   } });
   items.push("-");
-  const mayDelete = !!(S.job && S.job.canManage);
-  items.push({ label: "Delete " + (n === 1 ? "this sentence" : n + " sentences") + "…", danger: true, disabled: !mayDelete,
-    sub: mayDelete ? null : (SHARE ? "not on a shared link" : "owner or admin only"), onclick: function () {
+  items.push({ label: "Delete " + (n === 1 ? "this sentence" : n + " sentences") + "…", danger: true, onclick: function () {
     if (!confirm("Delete " + n + " " + noun + " from the transcript? This also changes the transcript on the Mac Mini and cannot be undone.")) return;
     editCall("segments/delete", { segmentIds: ids }, (n === 1 ? "Sentence" : n + " sentences") + " deleted.");
   } });
@@ -1954,7 +1967,6 @@ function openEditDialog(seg) {
   async function save() {
     const text = ta.value.trim();
     if (text === seg.text.trim()) { dlg.close(); return; }
-    if (!text && !(S.job && S.job.canManage)) { toast("Only the person who submitted this transcript (or an admin) can delete sentences."); return; }
     if (!text && !confirm("Empty text deletes this sentence. Delete it?")) return;
     dlg.close();
     editCall("segments/text", { segmentId: seg.id, text: text }, text ? "Saved." : "Sentence deleted.");
@@ -2117,7 +2129,7 @@ function renderSpeakers() {
   for (const sp of S.speakers) {
     const input = h("input", {
       type: "text", value: sp.source === "rename" ? sp.name : "", placeholder: sp.source === "voiceprint" ? sp.name : sp.label,
-      "data-label": sp.label, "aria-label": "Name for " + sp.label,
+      "data-label": sp.label, "aria-label": "Name for " + sp.label, readonly: !canEdit(),
       onkeydown: function (e) { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") { e.target.value = sp.source === "rename" ? sp.name : ""; e.target.blur(); } },
       onchange: function (e) { renameSpeaker(sp.label, e.target.value); }
     });
@@ -2131,9 +2143,9 @@ function renderSpeakers() {
       h("span", { class: "cnt", text: String(sp.count) }),
       h("span", { class: "src" }, [
         src,
-        h("button", { type: "button", class: "ident", text: sp.identity ? "Change" : "Identify", title: "Match this speaker to an enrolled voice",
-          onclick: function () { openSpeakerIdentity(sp); } }),
-        sp.identity ? h("button", { type: "button", class: "danger", text: "Clear", title: "Remove the voice identification",
+        canEdit() ? h("button", { type: "button", class: "ident", text: sp.identity ? "Change" : "Identify", title: "Match this speaker to an enrolled voice",
+          onclick: function () { openSpeakerIdentity(sp); } }) : null,
+        canEdit() && sp.identity ? h("button", { type: "button", class: "danger", text: "Clear", title: "Remove the voice identification",
           onclick: function () { identifySpeaker(sp.label, ""); } }) : null
       ])
     ]));
@@ -2162,7 +2174,7 @@ function renderPins() {
   if (!box) return;
   box.textContent = "";
   if (!S.pins.length) {
-    box.appendChild(h("div", { class: "hint", text: "Tap any sentence in the transcript to pin it." }));
+    box.appendChild(h("div", { class: "hint", text: canEdit() ? "Tap any sentence in the transcript to pin it." : "No pinned quotes." }));
     return;
   }
   const sorted = S.pins.slice().sort(function (a, b) { return a.start - b.start; });
@@ -2172,7 +2184,7 @@ function renderPins() {
         h("span", { class: "pn " + speakerClass(p.speaker), style: "font-weight:600", text: nameFor(p.speaker) }),
         h("span", { text: fmtTime(p.start) }),
         p.keyword ? h("span", { text: "· keyword: " + p.keyword }) : null,
-        h("button", { class: "x", title: "Remove pin", text: "×", onclick: function () { unpin(p.id); } })
+        canEdit() ? h("button", { class: "x", title: "Remove pin", text: "×", onclick: function () { unpin(p.id); } }) : null
       ]),
       h("div", { class: "pt", text: p.text, onclick: function () { jumpTo(p.segmentId); } }),
       playerReady() ? h("div", { class: "pa" }, [
@@ -2207,11 +2219,12 @@ function shareURL(token) { return location.origin + "/s/" + token; }
 function openShareDialog() {
   const j = S.job;
   if (!j) return;
+  if (SHARE) return;
   const what = h("ul", { class: "can" }, [
     h("li", { text: "Opens this one transcript without signing in — never the list or anyone else's transcripts." }),
     h("li", { text: "Can play the recording, download it, download clips and export the transcript in any format." }),
-    h("li", { text: "Can rename and identify speakers, pin quotes, move sentences between speakers and edit text — changes show up here too." }),
-    h("li", { text: "Can't stop, re-run or delete the job, or delete sentences." })
+    h("li", { text: "Can edit after pressing Edit transcript: rename and identify speakers, pin quotes, move, edit and delete sentences — changes show up here too." }),
+    h("li", { text: "Can't turn the link off, or stop, re-run or delete the job." })
   ]);
   if (!j.shared || !j.shareToken) {
     const dlg = showModal({
@@ -2269,6 +2282,16 @@ function openShareDialog() {
   });
   field.focus();
   field.select();
+}
+
+function toggleEditing() {
+  S.editing = !S.editing;
+  if (!S.editing) clearSelection();
+  renderJobHead();
+  renderSpeakers();
+  renderPins();
+  updateActionbar();
+  toast(S.editing ? "Editing on — changes save to the transcript for everyone." : "Editing off.");
 }
 
 async function copyText(text) {
