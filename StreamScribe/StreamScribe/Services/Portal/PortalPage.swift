@@ -18,6 +18,8 @@ nonisolated enum PortalPage {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="same-origin">
 <title>StreamScribe</title>
 <style>
 :root {
@@ -217,6 +219,14 @@ select:disabled { opacity: .6; }
 .chip.completed { background: var(--ok-soft); color: var(--ok); }
 .chip.failed, .chip.interrupted { background: var(--bad-soft); color: var(--bad); }
 .chip.cancelled { background: var(--panel-2); color: var(--faint); }
+.chip.shared { background: var(--accent-soft); color: var(--accent); }
+.share .brand { cursor: default; }
+.player .pc .dlvid { color: var(--accent); font-weight: 600; text-decoration: none; }
+.player .pc .dlvid:hover { text-decoration: underline; }
+.sharebox { display: flex; gap: 8px; margin-top: 4px; }
+.sharebox input { flex: 1; min-width: 0; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.dlg ul.can { margin: 10px 0 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
+.dlg ul.can li { margin: 3px 0; }
 
 .job-head { margin-bottom: 16px; }
 .back { font-size: 13.5px; font-weight: 600; display: inline-block; margin-bottom: 8px; cursor: pointer; }
@@ -407,6 +417,14 @@ select:disabled { opacity: .6; }
 <script>
 "use strict";
 
+// Share mode: /s/<token> is a public link to ONE transcript (no sign-in).
+// Every request then goes under /s/<token>/… — the only paths Cloudflare
+// Access lets through without a login, and the only ones the Mini answers
+// for that token.
+const SHARE = (location.pathname.match(/^\/s\/([A-Za-z0-9_-]{43})\/?$/) || [])[1] || null;
+const BASE = SHARE ? "/s/" + SHARE : "";
+if (SHARE) document.documentElement.classList.add("share");
+
 const S = {
   status: null,
   jobs: [],
@@ -488,9 +506,10 @@ async function api(path, opts) {
   }
   let res;
   try {
-    res = await fetch(path, init);
+    res = await fetch(BASE + path, init);
   } catch (e) {
-    const err = new Error("Can't reach the Mac Mini. If this keeps happening, reload the page (your sign-in may have expired).");
+    const err = new Error(SHARE ? "Can't reach the server right now. Try reloading the page in a minute."
+      : "Can't reach the Mac Mini. If this keeps happening, reload the page (your sign-in may have expired).");
     err.network = true;
     throw err;
   }
@@ -498,6 +517,7 @@ async function api(path, opts) {
   if (!type.includes("application/json")) {
     if (!res.ok) throw Object.assign(new Error("Request failed (" + res.status + ")"), { status: res.status });
     // An HTML page where JSON was expected = Cloudflare Access login page.
+    if (SHARE) throw Object.assign(new Error("This link isn't open to the public yet — ask the person who shared it to check the portal's Cloudflare setup."), { network: true });
     throw Object.assign(new Error("Your sign-in has expired. Reload the page to sign in again."), { network: true });
   }
   const data = await res.json();
@@ -580,6 +600,7 @@ function jobProgress(j) {
 async function refreshStatus() {
   try {
     const st = await api("/api/status");
+    if (SHARE) { S.status = st; banner(null); renderHeader(); return; }
     const prevModels = S.status ? JSON.stringify([S.status.options.models, S.status.options.downloads]) : "";
     S.status = st;
     banner(null);
@@ -595,11 +616,20 @@ async function refreshStatus() {
     }
   } catch (e) {
     if (e.network) banner(e.message);
+    if (SHARE && e.status === 404) S.shareGone = true;
   }
 }
 
 function renderHeader() {
   const st = S.status;
+  if (SHARE) {
+    // A shared link shows nothing about the Mini, its queue or the team.
+    $("brand").lastChild.textContent = "Shared transcript";
+    $("enginePill").classList.add("hidden");
+    $("pauseBtn").classList.add("hidden");
+    $("who").textContent = "";
+    return;
+  }
   if (!st) return;
   $("who").textContent = st.me.isLocal ? "On the Mac Mini" : st.me.email;
   const pill = $("enginePill");
@@ -644,7 +674,11 @@ $("pauseBtn").addEventListener("click", async function () {
 
 // ---------- routing ----------
 function route() {
-  const m = location.hash.match(/^#\/job\/([0-9A-Fa-f-]{36})$/);
+  let m = location.hash.match(/^#\/job\/([0-9A-Fa-f-]{36})$/);
+  if (SHARE) {
+    if (!S.status || !S.status.jobId) { renderShareGone(); return; }
+    m = [null, S.status.jobId];
+  }
   stopJobPolling();
   closePopups();
   S.sel = new Set(); S.selAnchor = null; S.multi = false; S.identities = null;
@@ -664,8 +698,19 @@ function route() {
   }
   window.scrollTo(0, 0);
 }
-window.addEventListener("hashchange", route);
-$("brand").addEventListener("click", function () { location.hash = "#/"; });
+if (!SHARE) {
+  window.addEventListener("hashchange", route);
+  $("brand").addEventListener("click", function () { location.hash = "#/"; });
+}
+
+function renderShareGone() {
+  S.view = "gone";
+  stopJobPolling();
+  const view = $("view");
+  view.textContent = "";
+  view.appendChild(h("div", { class: "card" }, h("div", { class: "empty" },
+    "This share link has been turned off, or the transcript was removed. Ask the person who sent it for a new link.")));
+}
 
 // ---------- home ----------
 function optionSelect(id, options, value) {
@@ -1272,6 +1317,7 @@ function renderJobs() {
     const pct = jobProgress(j);
     const meta = [
       h("span", { class: "chip " + j.status, text: STATUS_LABEL[j.status] || j.status }),
+      j.shared ? h("span", { class: "chip shared", text: "Shared" }) : null,
       j.queuePosition ? h("span", { text: "#" + j.queuePosition + " in line" }) : null,
       h("span", { text: (j.submittedBy === "local" ? "Mac Mini" : j.submittedBy) }),
       h("span", { text: relTime(j.createdAt) }),
@@ -1291,7 +1337,7 @@ function renderJobShell() {
   const view = $("view");
   view.textContent = "";
   const head = h("div", { class: "job-head", id: "jobHead" }, [
-    h("a", { class: "back", href: "#/", text: "← All transcripts" }),
+    SHARE ? null : h("a", { class: "back", href: "#/", text: "← All transcripts" }),
     h("h1", { id: "jobTitle", text: "Loading…" }),
     h("div", { class: "job-meta", id: "jobMeta" }),
     h("div", { id: "jobProg" }),
@@ -1347,6 +1393,7 @@ async function pollJob() {
 }
 
 function renderMissing() {
+  if (SHARE) { renderShareGone(); return; }
   const view = $("view");
   view.textContent = "";
   view.appendChild(h("div", { class: "card" }, h("div", { class: "empty" }, [
@@ -1394,7 +1441,8 @@ function renderJobHead() {
     h("span", { class: "chip " + j.status, text: STATUS_LABEL[j.status] || j.status }),
     j.queuePosition ? h("span", { text: "#" + j.queuePosition + " in line" }) : null,
     srcNode,
-    h("span", { text: "by " + (j.submittedBy === "local" ? "Mac Mini" : j.submittedBy) }),
+    j.submittedBy ? h("span", { text: "by " + (j.submittedBy === "local" ? "Mac Mini" : j.submittedBy) }) : null,
+    j.shared && !SHARE ? h("span", { class: "chip shared", title: "Anyone with the share link can open this transcript", text: "Shared" }) : null,
     h("span", { text: relTime(j.createdAt) }),
     j.mode ? h("span", { text: j.mode === "static" ? "Recording" : "Live" }) : null,
     j.durationSeconds ? h("span", { text: fmtTime(j.durationSeconds) }) : null,
@@ -1412,7 +1460,7 @@ function renderJobHead() {
 
   // Rebuilt only when something it shows changes — rebuilding every poll
   // would snap shut a format dropdown someone has open.
-  const actKey = [j.id, j.status, j.canManage, S.order.length > 0].join("|");
+  const actKey = [j.id, j.status, j.canManage, S.order.length > 0, j.shared].join("|");
   const act = $("jobActions");
   if (act.getAttribute("data-key") !== actKey) {
   act.setAttribute("data-key", actKey);
@@ -1432,7 +1480,10 @@ function renderJobHead() {
     act.appendChild(h("button", { class: "btn", id: "expBtn", "aria-expanded": S.expOpen ? "true" : "false", text: "Export options",
       onclick: function () { S.expOpen = !S.expOpen; renderExportPanel(); } }));
   }
-  if (isTerminal(j.status)) {
+  if (j.canManage && !SHARE) {
+    act.appendChild(h("button", { class: "btn", id: "shareBtn", text: j.shared ? "Shared ▾" : "Share", onclick: openShareDialog }));
+  }
+  if (isTerminal(j.status) && !SHARE) {
     act.appendChild(h("button", { class: "btn", text: "Run again", onclick: retryJob }));
     if (j.canManage) act.appendChild(h("button", { class: "btn danger", text: "Delete", onclick: deleteJob }));
   }
@@ -1443,8 +1494,15 @@ function renderJobHead() {
 
   const msg = $("jobMsg");
   let m = j.message || "";
-  if (j.status === "queued" && !m) m = "Waiting for the Mac Mini to finish the job ahead of this one.";
-  if (j.live && isTerminal(j.status)) m = (m ? m + " · " : "") + "Still open on the Mac Mini — edits there show up here.";
+  if (SHARE) {
+    // Internal notes ("Stopped by <email>", the Mac Mini) aren't for a shared
+    // audience; keep only the explanation of a failure.
+    m = (j.status === "failed" || j.status === "interrupted") ? m : "";
+    if (j.status === "queued") m = "Waiting to start.";
+  } else {
+    if (j.status === "queued" && !m) m = "Waiting for the Mac Mini to finish the job ahead of this one.";
+    if (j.live && isTerminal(j.status)) m = (m ? m + " · " : "") + "Still open on the Mac Mini — edits there show up here.";
+  }
   msg.textContent = m;
   msg.className = "msg" + (j.status === "failed" || j.status === "interrupted" ? " bad" : "");
   $("followWrap").classList.toggle("hidden", !isOnEngine(j.status));
@@ -1486,7 +1544,7 @@ function renderPlayer() {
     slot.appendChild(h("div", { class: "card player-note", style: "margin-bottom:14px" }, "Playback will be available here when this transcript finishes."));
   } else if (want.indexOf("ready:") === 0) {
     const video = h("video", { id: "player", controls: true, preload: "metadata", playsinline: true,
-      src: "/api/jobs/" + j.id + "/media" + (version ? "?v=" + encodeURIComponent(version) : "") });
+      src: BASE + "/api/jobs/" + j.id + "/media" + (version ? "?v=" + encodeURIComponent(version) : "") });
     const card = h("section", { class: "card player", id: "playerCard" }, [
       video,
       h("div", { class: "pc" }, [
@@ -1496,6 +1554,8 @@ function renderPlayer() {
             sel.addEventListener("change", function (e) { video.playbackRate = parseFloat(e.target.value); });
             return sel;
           })()]),
+        h("a", { class: "dlvid", id: "dlVideo", href: BASE + "/api/jobs/" + j.id + "/media?download=1" + (version ? "&v=" + encodeURIComponent(version) : ""),
+          download: "", title: "Save the whole recording", text: "Download recording" }),
         h("span", { class: "grow" }),
         h("label", null, [
           h("input", { type: "checkbox", id: "followPlay", checked: S.followPlay, onchange: function (e) { S.followPlay = e.target.checked; } }),
@@ -1584,7 +1644,7 @@ function downloadClip(start, end) {
   const a = Math.max(0, start - 1), b = end + 1;
   if (b - a > 15 * 60) { toast("Clips can be up to 15 minutes long."); return; }
   toast("Preparing the clip on the Mac Mini…");
-  window.location.href = "/api/jobs/" + S.job.id + "/clip?start=" + a.toFixed(2) + "&end=" + b.toFixed(2);
+  window.location.href = BASE + "/api/jobs/" + S.job.id + "/clip?start=" + a.toFixed(2) + "&end=" + b.toFixed(2);
 }
 
 // ---------- export options ----------
@@ -1612,7 +1672,7 @@ function exportURL(jobId, format) {
   const b = function (v) { return v ? "1" : "0"; };
   q.push("ts=" + b(p.timestamps), "bold=" + b(p.bold), "placement=" + encodeURIComponent(p.placement),
          "title=" + b(p.title), "source=" + b(p.source), "generated=" + b(p.generated));
-  return "/api/jobs/" + jobId + "/export?" + q.join("&");
+  return BASE + "/api/jobs/" + jobId + "/export?" + q.join("&");
 }
 
 function renderExportPanel() {
@@ -1881,7 +1941,7 @@ $("moreSelBtn").addEventListener("click", function (e) {
   items.push("-");
   const mayDelete = !!(S.job && S.job.canManage);
   items.push({ label: "Delete " + (n === 1 ? "this sentence" : n + " sentences") + "…", danger: true, disabled: !mayDelete,
-    sub: mayDelete ? null : "owner or admin only", onclick: function () {
+    sub: mayDelete ? null : (SHARE ? "not on a shared link" : "owner or admin only"), onclick: function () {
     if (!confirm("Delete " + n + " " + noun + " from the transcript? This also changes the transcript on the Mac Mini and cannot be undone.")) return;
     editCall("segments/delete", { segmentIds: ids }, (n === 1 ? "Sentence" : n + " sentences") + " deleted.");
   } });
@@ -1972,7 +2032,7 @@ function openIdentityPicker(opts) {
       if (!first) { first = custom; b.classList.add("first"); }
       list.appendChild(b);
     } else if (!shown) {
-      list.appendChild(h("div", { class: "none", text: ids.libraryLoaded ? "No enrolled voices." : "The enrolled voices haven't loaded on the Mac Mini yet — type a name to use it anyway." }));
+      list.appendChild(h("div", { class: "none", text: SHARE ? "Type a name to use it." : ids.libraryLoaded ? "No enrolled voices." : "The enrolled voices haven't loaded on the Mac Mini yet — type a name to use it anyway." }));
     }
   }
   search.addEventListener("input", render);
@@ -2155,6 +2215,93 @@ function jumpTo(segId) {
   setTimeout(function () { if (!S.sel.has(segId)) el.classList.remove("sel"); }, 1600);
 }
 
+// ---------- public share link ----------
+function shareURL(token) { return location.origin + "/s/" + token; }
+
+function openShareDialog() {
+  const j = S.job;
+  if (!j) return;
+  const what = h("ul", { class: "can" }, [
+    h("li", { text: "Opens this one transcript without signing in — never the list or anyone else's transcripts." }),
+    h("li", { text: "Can play the recording, download it, download clips and export the transcript in any format." }),
+    h("li", { text: "Can rename and identify speakers, pin quotes, move sentences between speakers and edit text — changes show up here too." }),
+    h("li", { text: "Can't stop, re-run or delete the job, or delete sentences." })
+  ]);
+  if (!j.shared || !j.shareToken) {
+    const dlg = showModal({
+      title: "Share this transcript",
+      hint: "Creates a public link — anyone who has it can open it. Use it for clients, or for colleagues who can't sign in.",
+      body: [what],
+      buttons: [
+        h("button", { class: "btn", type: "button", text: "Cancel", onclick: function () { dlg.close(); } }),
+        h("button", { class: "btn primary", type: "button", id: "createShare", text: "Create link", onclick: async function (e) {
+          e.target.disabled = true;
+          try {
+            S.job = await api("/api/jobs/" + j.id + "/share", { method: "POST", json: {} });
+            dlg.close();
+            renderJobHead();
+            openShareDialog();
+          } catch (err) { e.target.disabled = false; toast(err.message); }
+        } })
+      ]
+    });
+    return;
+  }
+  const url = shareURL(j.shareToken);
+  const field = h("input", { type: "text", readonly: true, value: url, "aria-label": "Share link", onfocus: function (e) { e.target.select(); } });
+  const dlg = showModal({
+    title: "Share link",
+    hint: "Anyone with this link can open this transcript without signing in.",
+    body: [
+      h("div", { class: "sharebox" }, [field, h("button", { class: "btn primary", type: "button", id: "copyShare", text: "Copy", onclick: function () { copyText(url); } })]),
+      what
+    ],
+    buttons: [
+      h("button", { class: "btn danger", type: "button", id: "offShare", text: "Turn off link", onclick: async function () {
+        if (!confirm("Turn off this link? Anyone using it will lose access straight away.")) return;
+        try {
+          S.job = await api("/api/jobs/" + j.id + "/share/delete", { method: "POST", json: {} });
+          dlg.close();
+          renderJobHead();
+          toast("Link turned off.");
+        } catch (err) { toast(err.message); }
+      } }),
+      h("button", { class: "btn", type: "button", id: "newShare", text: "New link", title: "Turn this link off and make a different one", onclick: async function () {
+        if (!confirm("Replace this link? The current one stops working straight away.")) return;
+        try {
+          await api("/api/jobs/" + j.id + "/share/delete", { method: "POST", json: {} });
+          S.job = await api("/api/jobs/" + j.id + "/share", { method: "POST", json: {} });
+          dlg.close();
+          renderJobHead();
+          openShareDialog();
+          toast("New link created — the old one no longer works.");
+        } catch (err) { toast(err.message); }
+      } }),
+      h("span", { class: "grow" }),
+      h("button", { class: "btn", type: "button", text: "Done", onclick: function () { dlg.close(); } })
+    ]
+  });
+  field.focus();
+  field.select();
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Link copied.");
+  } catch (e) {
+    // Clipboard API needs a secure context and permission; fall back.
+    const t = h("textarea", { style: "position:fixed;opacity:0" });
+    t.value = text;
+    document.body.appendChild(t);
+    t.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (x) {}
+    t.remove();
+    toast(ok ? "Link copied." : "Select the link and copy it.");
+  }
+}
+
 async function stopJob() {
   const j = S.job;
   if (!j) return;
@@ -2187,6 +2334,7 @@ async function deleteJob() {
 
 // ---------- background polling ----------
 async function tick() {
+  if (SHARE) return;   // the transcript poll is all a shared page needs
   await refreshStatus();
   if (S.view === "home") await refreshJobs();
   const dls = S.status && S.status.options.downloads ? Object.values(S.status.options.downloads) : [];

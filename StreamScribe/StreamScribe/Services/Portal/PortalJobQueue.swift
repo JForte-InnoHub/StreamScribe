@@ -33,6 +33,10 @@ struct PortalIdentity {
     let email: String
     /// A browser on this Mac itself (not through Cloudflare).
     let isLocal: Bool
+    /// Someone using a job's public share link (/s/<token>), not signed in.
+    var isShareLink: Bool = false
+
+    static let shareLink = PortalIdentity(email: "share link", isLocal: false, isShareLink: true)
 }
 
 @MainActor
@@ -1092,6 +1096,142 @@ final class PortalJobQueue: ObservableObject {
         print("[Portal] Retention: removed \(expired.count) download(s) older than \(days) day(s).")
     }
 
+    // MARK: - Public share links
+    //
+    // /s/<token> serves the portal page in share mode; everything it calls is
+    // under /s/<token>/api/… so ONE Cloudflare Access app on "/s/*" with a
+    // Bypass policy opens exactly these paths and nothing else. The token is
+    // the only credential, so the router below is a whitelist: the shared
+    // job's transcript, recording, clips and exports, and the same edits a
+    // signed-in colleague who doesn't own the job could make. No job list, no
+    // other jobs, no queue, no stop/retry/delete, no sentence deletion.
+
+    private var shareClipsInFlight = 0
+
+    private func sharedJob(_ token: String) -> PortalJob? {
+        // Tokens are 43 base64url characters; reject anything else outright.
+        guard token.count == 43,
+              token.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) else { return nil }
+        return jobs.first { $0.shareToken == token }
+    }
+
+    private func handleShared(_ request: PortalHTTPRequest) async -> PortalHTTPResponse {
+        let c = request.pathComponents
+        let method = request.method
+        guard c.count >= 2 else { return .error(404, "Not found") }
+        let rest = Array(c.dropFirst(2))
+        // The page itself is static: serve it for any token and let it ask
+        // /api/status, so a turned-off link shows a friendly message.
+        if method == "GET" && (rest.isEmpty || rest == ["index.html"]) {
+            return .html(PortalPage.html)
+        }
+        guard let job = sharedJob(c[1]) else {
+            return .error(404, "This share link has been turned off or doesn't exist.")
+        }
+        guard rest.first == "api" else { return .error(404, "Not found") }
+        if method == "POST" && request.header("x-streamscribe-portal") != "1" {
+            return .error(403, "Missing portal request header")
+        }
+        let r = Array(rest.dropFirst())
+        if method == "GET" && r == ["status"] {
+            return .dto(shareStatusDTO(job))
+        }
+        guard r.count >= 2, r[0] == "jobs", UUID(uuidString: r[1]) == job.id else {
+            return .error(404, "Not found")
+        }
+        let action = r.count >= 3 ? r[2] : ""
+        let allowed: Bool
+        switch (method, action) {
+        case ("GET", ""), ("GET", "transcript"), ("GET", "export"), ("GET", "media"), ("HEAD", "media"),
+             ("GET", "clip"), ("GET", "identities"),
+             ("POST", "speakers"), ("POST", "segments"), ("POST", "pins"):
+            allowed = true
+        default:
+            allowed = false
+        }
+        guard allowed else { return .error(403, "That isn't available through a share link") }
+        if method == "POST" {
+            // Edits through a link have no signed-in name; keep a trail.
+            let ip = request.header("cf-connecting-ip") ?? "local"
+            // Fixed vocabulary only — the decoded path could carry a newline.
+            let sub = r.count >= 4 && ["identify", "reassign", "text", "delete", "restore"].contains(r[3]) ? "/" + r[3] : ""
+            print("[Portal] Share-link edit \(action)\(sub) on job \(job.id.uuidString.prefix(8)) from \(ip.filter { !$0.isNewline }).")
+        }
+        if action == "clip" {
+            // Each clip runs ffmpeg; cap what people who aren't signed in can start.
+            guard shareClipsInFlight < 2 else {
+                return .error(429, "Other clips are being prepared — try again in a moment")
+            }
+            shareClipsInFlight += 1
+            defer { shareClipsInFlight -= 1 }
+            return await handleJob(job, r, method, request, .shareLink)
+        }
+        return await handleJob(job, r, method, request, .shareLink)
+    }
+
+    /// Job notes for a public viewer: no names ("Stopped by …") and no raw
+    /// error text (local paths, tool output).
+    private static func publicMessage(_ job: PortalJob) -> String? {
+        switch job.status {
+        case .failed: return "This transcript couldn't be completed."
+        case .interrupted: return "Transcription was interrupted. The transcript up to that point is kept."
+        case .completed where job.segments.isEmpty: return "Finished — no speech was transcribed."
+        default: return nil
+        }
+    }
+
+    private func shareStatusDTO(_ job: PortalJob) -> PortalShareStatusDTO {
+        PortalShareStatusDTO(
+            shared: true,
+            jobId: job.id.uuidString,
+            options: .init(exportFormats: Self.exportFormatOptions,
+                           speakerPlacements: Self.speakerPlacementOptions),
+            defaults: .init(export: Self.macExportOptionsDTO()),
+            epoch: epoch)
+    }
+
+    /// 256 bits from the system CSPRNG, base64url without padding (43 chars).
+    private static func makeShareToken() -> String {
+        var rng = SystemRandomNumberGenerator()
+        let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max, using: &rng) }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// Making a transcript public is the owner's (or an admin's) call. Asking
+    /// again returns the existing link rather than replacing it.
+    private func createShareLink(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard canManage(job, who) else {
+            return .error(403, "Only the person who submitted this transcript (or an admin) can share it")
+        }
+        var j = self.job(job.id) ?? job
+        if j.shareToken == nil {
+            j.shareToken = Self.makeShareToken()
+            j.sharedBy = who.email
+            j.sharedAt = Date()
+            update(j, saveNow: true)
+            print("[Portal] Share link created for job \(j.id.uuidString.prefix(8)) by \(who.email).")
+        }
+        return .dto(jobDTO(j, who))
+    }
+
+    private func removeShareLink(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
+        guard canManage(job, who) else {
+            return .error(403, "Only the person who submitted this transcript (or an admin) can turn off its link")
+        }
+        var j = self.job(job.id) ?? job
+        if j.shareToken != nil {
+            j.shareToken = nil
+            j.sharedBy = nil
+            j.sharedAt = nil
+            update(j, saveNow: true)
+            print("[Portal] Share link turned off for job \(j.id.uuidString.prefix(8)) by \(who.email).")
+        }
+        return .dto(jobDTO(j, who))
+    }
+
     // MARK: - Identity
 
     private func identity(for request: PortalHTTPRequest) -> PortalIdentity? {
@@ -1118,16 +1258,24 @@ final class PortalJobQueue: ObservableObject {
     }
 
     private func isAdmin(_ who: PortalIdentity) -> Bool {
-        who.isLocal || adminEmails().contains(who.email)
+        guard !who.isShareLink else { return false }
+        return who.isLocal || adminEmails().contains(who.email)
     }
 
     private func canManage(_ job: PortalJob, _ who: PortalIdentity) -> Bool {
-        isAdmin(who) || job.submittedBy == who.email
+        guard !who.isShareLink else { return false }
+        return isAdmin(who) || job.submittedBy == who.email
     }
 
     // MARK: - HTTP routing
 
     func handle(_ request: PortalHTTPRequest) async -> PortalHTTPResponse {
+        // Public share links come first: Cloudflare Access is set to BYPASS
+        // /s/*, so these requests arrive with no signed-in identity. They are
+        // authorised by the token alone and confined to that one job.
+        if request.pathComponents.first == "s" {
+            return await handleShared(request)
+        }
         guard let who = identity(for: request) else {
             return .error(403, "This portal must be reached through Cloudflare Access. The hostname is not protected by an Access policy.")
         }
@@ -1197,6 +1345,12 @@ final class PortalJobQueue: ObservableObject {
         guard r.count >= 2, r[0] == "jobs", let id = UUID(uuidString: r[1]), let job = job(id) else {
             return .error(404, "Not found")
         }
+        return await handleJob(job, r, method, request, who)
+    }
+
+    /// Routes under /api/jobs/{id}/… — `r` is the path after /api.
+    private func handleJob(_ job: PortalJob, _ r: [String], _ method: String,
+                           _ request: PortalHTTPRequest, _ who: PortalIdentity) async -> PortalHTTPResponse {
         let action = r.count >= 3 ? r[2] : ""
         switch (method, action) {
         case ("GET", ""):
@@ -1216,12 +1370,16 @@ final class PortalJobQueue: ObservableObject {
             return retryJob(job, who)
         case ("POST", "delete"):
             return deleteJob(job, who)
+        case ("POST", "share") where r.count == 3:
+            return createShareLink(job, who)
+        case ("POST", "share") where r.count == 4 && r[3] == "delete":
+            return removeShareLink(job, who)
         case ("POST", "speakers") where r.count == 3:
             return renameSpeaker(job, request, who)
         case ("POST", "speakers") where r.count == 4 && r[3] == "identify":
             return identifySpeaker(job, request, who)
         case ("GET", "identities"):
-            return .dto(identitiesDTO(job))
+            return .dto(identitiesDTO(job, who))
         case ("POST", "segments") where r.count == 4:
             switch r[3] {
             case "reassign": return reassignSegments(job, request, who)
@@ -1254,7 +1412,6 @@ final class PortalJobQueue: ObservableObject {
         let languages = TranscriptionEngine.availableLanguages.map {
             PortalOptionDTO(id: $0.code ?? "auto", label: $0.name)
         }
-        let formats: [TranscriptFormat] = [.docx, .plainText, .markdown, .rtf, .srt, .vtt, .json]
         return PortalStatusDTO(
             me: .init(email: who.email, isLocal: who.isLocal, isAdmin: isAdmin(who)),
             engine: .init(
@@ -1279,10 +1436,10 @@ final class PortalJobQueue: ObservableObject {
                             .init(id: "sortformer", label: "Sortformer"),
                             .init(id: "off", label: "Off")],
                 languages: languages,
-                exportFormats: formats.map { .init(id: $0.fileExtension, label: $0.rawValue) },
+                exportFormats: Self.exportFormatOptions,
                 models: downloadedModels(),
                 downloads: downloadStates(),
-                speakerPlacements: SpeakerPlacement.allCases.map { PortalOptionDTO(id: $0.rawValue, label: $0.displayName) },
+                speakerPlacements: Self.speakerPlacementOptions,
                 uploadExtensions: Self.uploadExtensions,
                 maxUploadBytes: Self.maxUploadBytes,
                 chunkBytes: Self.uploadChunkBytes),
@@ -1295,12 +1452,7 @@ final class PortalJobQueue: ObservableObject {
                     "whisperKit": engine?.whisperModelName ?? TranscriptionEngine.defaultWhisperModel,
                     "parakeet": engine?.parakeetModelName ?? TranscriptionEngine.defaultParakeetModel,
                 ],
-                export: {
-                    let o = Self.macExportOptions()
-                    return PortalExportOptionsDTO(timestamps: o.includeTimestamps, bold: o.speakerLabelsBold,
-                                                  placement: o.speakerPlacement.rawValue, title: o.includeTitle,
-                                                  source: o.includeSource, generated: o.includeGenerated)
-                }(),
+                export: Self.macExportOptionsDTO(),
                 diarization: engine.map { PortalJobSettings.id(for: $0.diarizationEngine) } ?? "fluidAudio",
                 language: engine?.selectedLanguageCode ?? "auto",
                 expectedSpeakers: TranscriptionEngine.expectedSpeakerCount,
@@ -1504,8 +1656,9 @@ final class PortalJobQueue: ObservableObject {
             source: job.displaySource,
             isUpload: job.isUpload,
             status: job.status.rawValue,
-            message: job.message,
-            submittedBy: job.submittedBy,
+            message: who.isShareLink ? Self.publicMessage(job) : job.message,
+            // Internal email addresses stay internal.
+            submittedBy: who.isShareLink ? "" : job.submittedBy,
             createdAt: job.createdAt,
             startedAt: job.startedAt,
             finishedAt: job.finishedAt,
@@ -1518,6 +1671,8 @@ final class PortalJobQueue: ObservableObject {
             live: isAttached(job),
             media: job.mediaState,
             mediaVersion: job.mediaState == "ready" ? Self.mediaVersion(job) : nil,
+            shared: job.shareToken != nil,
+            shareToken: canManage(job, who) ? job.shareToken : nil,
             settings: job.settings)
     }
 
@@ -1747,10 +1902,17 @@ final class PortalJobQueue: ObservableObject {
         return "Speaker \(maxN + 1)"
     }
 
-    private func identitiesDTO(_ job: PortalJob) -> PortalIdentitiesDTO {
+    private func identitiesDTO(_ job: PortalJob, _ who: PortalIdentity) -> PortalIdentitiesDTO {
         var session = Set(job.voiceprintNames.values)
-        if let engine = attachedEngine(job) {
+        // (Session history keeps names whose identity was cleared — not for a
+        // share viewer, who should only see who is in the transcript now.)
+        if let engine = attachedEngine(job), !who.isShareLink {
             session.formUnion(engine.voiceprints.sessionSpeakerHistory)
+        }
+        // A share link gets the names already in this transcript, not the
+        // whole enrolled catalog; typing any other name still works.
+        if who.isShareLink {
+            return PortalIdentitiesDTO(session: session.sorted(), library: [], libraryLoaded: true)
         }
         let library = VoiceprintLibrary.shared
         // Templates served from the on-disk cache leave loadState at .idle.
@@ -1964,11 +2126,28 @@ final class PortalJobQueue: ObservableObject {
             }
             pins = current.pins.map {
                 PortalPinDTO(id: $0.id.uuidString, text: $0.text, speaker: $0.speaker, start: $0.start,
-                             end: $0.end, segmentId: $0.sourceSegmentID?.uuidString, keyword: $0.matchedKeyword)
+                             end: $0.end, segmentId: $0.sourceSegmentID?.uuidString,
+                             keyword: who.isShareLink ? nil : $0.matchedKeyword)
             }
         }
         return .dto(PortalTranscriptDTO(epoch: epoch, rev: index.rev, full: full, job: jobDTO(current, who),
                                          order: order, segments: segments, speakers: speakers, pins: pins))
+    }
+
+    static var exportFormatOptions: [PortalOptionDTO] {
+        let formats: [TranscriptFormat] = [.docx, .plainText, .markdown, .rtf, .srt, .vtt, .json]
+        return formats.map { PortalOptionDTO(id: $0.fileExtension, label: $0.rawValue) }
+    }
+
+    static var speakerPlacementOptions: [PortalOptionDTO] {
+        SpeakerPlacement.allCases.map { PortalOptionDTO(id: $0.rawValue, label: $0.displayName) }
+    }
+
+    static func macExportOptionsDTO() -> PortalExportOptionsDTO {
+        let o = macExportOptions()
+        return PortalExportOptionsDTO(timestamps: o.includeTimestamps, bold: o.speakerLabelsBold,
+                                      placement: o.speakerPlacement.rawValue, title: o.includeTitle,
+                                      source: o.includeSource, generated: o.includeGenerated)
     }
 
     /// The Mac's Settings → Transcript Export values (same defaults as ContentView).
@@ -2256,6 +2435,12 @@ final class PortalJobQueue: ObservableObject {
             return .error(404, "Playback isn't available for this transcript")
         }
         let url = URL(fileURLWithPath: path)
+        // ?download=1: the whole recording as a file, named after the transcript.
+        if request.query["download"] == "1" {
+            let ext = url.pathExtension.isEmpty ? "mp4" : url.pathExtension
+            return .file(url, contentType: Self.mimeType(for: url), rangeHeader: request.header("range"),
+                         downloadName: Self.safeFilename(job.title ?? "recording") + "." + ext)
+        }
         return .file(url, contentType: Self.mimeType(for: url), rangeHeader: request.header("range"))
     }
 

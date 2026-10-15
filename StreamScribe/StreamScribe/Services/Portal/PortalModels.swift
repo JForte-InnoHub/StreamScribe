@@ -188,6 +188,11 @@ struct PortalJob: Codable, Identifiable {
     var mediaPath: String?
     /// preparing | ready | unavailable (nil = not attempted yet)
     var mediaState: String?
+    /// Public share link (/s/<token>): anyone holding it can open THIS job
+    /// without signing in. nil = not shared. 256 random bits, base64url.
+    var shareToken: String?
+    var sharedBy: String?
+    var sharedAt: Date?
 
     init(id: UUID = UUID(), input: String, displaySource: String, isUpload: Bool,
          uploadDirectory: String?, settings: PortalJobSettings, submittedBy: String) {
@@ -557,6 +562,11 @@ struct PortalJobDTO: Encodable {
     /// Changes whenever the file behind /media is replaced (audio snapshot →
     /// video); the page keys its player on it.
     let mediaVersion: String?
+    /// A public share link exists for this job.
+    let shared: Bool
+    /// The link's token — only for people who can manage the job (and never
+    /// to a share-link viewer, who already has it).
+    let shareToken: String?
     let settings: PortalJobSettings
 }
 
@@ -627,6 +637,24 @@ struct PortalStatusDTO: Encodable {
     let me: Me
     let engine: Engine
     let queue: Queue
+    let options: Options
+    let defaults: Defaults
+    let epoch: String
+}
+
+/// What a share-link page gets instead of /api/status: just enough to show
+/// one transcript and its export options. Nothing about the queue, the Mac's
+/// engine or who is signed in.
+struct PortalShareStatusDTO: Encodable {
+    struct Options: Encodable {
+        let exportFormats: [PortalOptionDTO]
+        let speakerPlacements: [PortalOptionDTO]
+    }
+    struct Defaults: Encodable {
+        let export: PortalExportOptionsDTO
+    }
+    let shared: Bool
+    let jobId: String
     let options: Options
     let defaults: Defaults
     let epoch: String
