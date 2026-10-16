@@ -193,6 +193,12 @@ struct PortalJob: Codable, Identifiable {
     var shareToken: String?
     var sharedBy: String?
     var sharedAt: Date?
+    /// "Anyone with the link can edit" (true) or "…can view" (false). nil on
+    /// links made before this setting existed — those were edit links.
+    var shareCanEdit: Bool?
+
+    /// Effective permission of the share link, if there is one.
+    var shareAllowsEdits: Bool { shareCanEdit ?? true }
 
     init(id: UUID = UUID(), input: String, displaySource: String, isUpload: Bool,
          uploadDirectory: String?, settings: PortalJobSettings, submittedBy: String) {
@@ -567,6 +573,9 @@ struct PortalJobDTO: Encodable {
     /// The link's token — only for people who can manage the job (and never
     /// to a share-link viewer, who already has it).
     let shareToken: String?
+    /// Whether the link lets people edit (nil when there's no link). Sent to
+    /// link viewers too: the page shows "Edit transcript" only when true.
+    let shareCanEdit: Bool?
     let settings: PortalJobSettings
 }
 
@@ -645,6 +654,11 @@ struct PortalStatusDTO: Encodable {
 /// What a share-link page gets instead of /api/status: just enough to show
 /// one transcript and its export options. Nothing about the queue, the Mac's
 /// engine or who is signed in.
+/// POST /api/jobs/{id}/share — create the link, or change its permission.
+struct PortalShareBody: Decodable {
+    let canEdit: Bool?
+}
+
 struct PortalShareStatusDTO: Encodable {
     struct Options: Encodable {
         let exportFormats: [PortalOptionDTO]

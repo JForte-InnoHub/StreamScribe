@@ -224,7 +224,12 @@ select:disabled { opacity: .6; }
 .player .pc .dlvid { color: var(--accent); font-weight: 600; text-decoration: none; }
 .player .pc .dlvid:hover { text-decoration: underline; }
 .sharebox { display: flex; gap: 8px; margin-top: 4px; }
-.sharebox input { flex: 1; min-width: 0; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sharebox input { flex: 1; min-width: 0; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--accent-soft); border-color: var(--accent); }
+.sharebox input.fresh { animation: flash 1.2s ease-out 1; }
+@keyframes flash { 0% { box-shadow: 0 0 0 4px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+.dlg select#shareAccess { width: 100%; }
+.dlg .df > .grow { flex: 1; }
 .dlg ul.can { margin: 10px 0 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
 .dlg ul.can li { margin: 3px 0; }
 
@@ -426,7 +431,8 @@ const SHARE = (location.pathname.match(/^\/s\/([A-Za-z0-9_-]{43})\/?$/) || [])[1
 const BASE = SHARE ? "/s/" + SHARE : "";
 // Signed-in users can always edit. A shared page starts read-only so a
 // visitor can't change the transcript by accident; "Edit transcript" unlocks it.
-function canEdit() { return !SHARE || S.editing; }
+function canEdit() { return !SHARE || (S.editing && linkCanEdit()); }
+function linkCanEdit() { return !!(S.job && S.job.shareCanEdit); }
 if (SHARE) document.documentElement.classList.add("share");
 
 const S = {
@@ -1447,7 +1453,8 @@ function renderJobHead() {
     j.queuePosition ? h("span", { text: "#" + j.queuePosition + " in line" }) : null,
     srcNode,
     j.submittedBy ? h("span", { text: "by " + (j.submittedBy === "local" ? "Mac Mini" : j.submittedBy) }) : null,
-    j.shared && !SHARE ? h("span", { class: "chip shared", title: "Anyone with the share link can open this transcript", text: "Shared" }) : null,
+    j.shared && !SHARE ? h("span", { class: "chip shared", title: j.shareCanEdit ? "Anyone with the link can edit" : "Anyone with the link can view",
+      text: j.shareCanEdit ? "Shared · can edit" : "Shared · view only" }) : null,
     h("span", { text: relTime(j.createdAt) }),
     j.mode ? h("span", { text: j.mode === "static" ? "Recording" : "Live" }) : null,
     j.durationSeconds ? h("span", { text: fmtTime(j.durationSeconds) }) : null,
@@ -1465,7 +1472,15 @@ function renderJobHead() {
 
   // Rebuilt only when something it shows changes — rebuilding every poll
   // would snap shut a format dropdown someone has open.
-  const actKey = [j.id, j.status, j.canManage, S.order.length > 0, j.shared, S.editing].join("|");
+  // The link was switched to view-only while someone was editing.
+  if (SHARE && S.editing && !j.shareCanEdit) {
+    S.editing = false;
+    clearSelection();
+    renderSpeakers();
+    renderPins();
+    toast("This link is now view-only.");
+  }
+  const actKey = [j.id, j.status, j.canManage, S.order.length > 0, j.shared, j.shareCanEdit, S.editing].join("|");
   const act = $("jobActions");
   if (act.getAttribute("data-key") !== actKey) {
   act.setAttribute("data-key", actKey);
@@ -1487,7 +1502,7 @@ function renderJobHead() {
   }
   // Anyone signed in can share (not only the owner); a link visitor can't.
   if (!SHARE) act.appendChild(h("button", { class: "btn", id: "shareBtn", text: j.shared ? "Shared ▾" : "Share", onclick: openShareDialog }));
-  if (SHARE && S.order.length) {
+  if (SHARE && S.order.length && j.shareCanEdit) {
     act.appendChild(h("button", { class: "btn" + (S.editing ? " primary" : ""), id: "editModeBtn",
       text: S.editing ? "Done editing" : "Edit transcript", onclick: toggleEditing }));
   }
@@ -1945,8 +1960,10 @@ $("moreSelBtn").addEventListener("click", function (e) {
   const items = [];
   if (playerReady()) items.push({ label: "Download clip", sub: fmtTime(segs[0].start) + "–" + fmtTime(segs[n - 1].end), onclick: clipSelection });
   if (!canEdit()) {
-    items.push("-");
-    items.push({ label: "Edit transcript…", sub: "to change or delete text", onclick: toggleEditing });
+    if (linkCanEdit()) {
+      items.push("-");
+      items.push({ label: "Edit transcript…", sub: "to change or delete text", onclick: toggleEditing });
+    }
     showMenu(e.currentTarget, items);
     return;
   }
@@ -2230,72 +2247,157 @@ function jumpTo(segId) {
 // ---------- public share link ----------
 function shareURL(token) { return location.origin + "/s/" + token; }
 
+// One dialog, Google-Docs style: choose what the link allows, create it (the
+// link is shown selected and copied to the clipboard straight away), and on
+// later visits the same dialog shows the link again with its permission.
 function openShareDialog() {
-  const j = S.job;
-  if (!j) return;
-  if (SHARE) return;
-  const what = h("ul", { class: "can" }, [
-    h("li", { text: "Opens this one transcript without signing in — never the list or anyone else's transcripts." }),
-    h("li", { text: "Can play the recording, download it, download clips and export the transcript in any format." }),
-    h("li", { text: "Can edit after pressing Edit transcript: rename and identify speakers, pin quotes, move, edit and delete sentences — changes show up here too." }),
-    h("li", { text: "Can't turn the link off, or stop, re-run or delete the job." })
-  ]);
-  if (!j.shared || !j.shareToken) {
-    const dlg = showModal({
-      title: "Share this transcript",
-      hint: "Creates a public link — anyone who has it can open it. Use it for clients, or for colleagues who can't sign in.",
-      body: [what],
-      buttons: [
-        h("button", { class: "btn", type: "button", text: "Cancel", onclick: function () { dlg.close(); } }),
-        h("button", { class: "btn primary", type: "button", id: "createShare", text: "Create link", onclick: async function (e) {
-          e.target.disabled = true;
-          try {
-            S.job = await api("/api/jobs/" + j.id + "/share", { method: "POST", json: {} });
-            dlg.close();
-            renderJobHead();
-            openShareDialog();
-          } catch (err) { e.target.disabled = false; toast(err.message); }
-        } })
-      ]
+  if (SHARE || !S.job) return;
+  const jobId = S.job.id;
+  let busy = false;
+  const body = h("div");
+  const foot = h("div", { class: "df" });
+  const dlg = showModal({ title: "Share this transcript", body: [body], buttons: [foot] });
+  // showModal wraps buttons in its own footer; let ours be the footer.
+  foot.parentNode.replaceWith(foot);
+
+  function access() { return $("shareAccess") ? $("shareAccess").value : "view"; }
+
+  function paint(justCreated, copied) {
+    const j = S.job;
+    const shared = !!(j && j.shared && j.shareToken);
+    const canEdit = shared ? !!j.shareCanEdit : access() === "edit";
+    busy = false;
+    body.textContent = "";
+    foot.textContent = "";
+
+    const sel = h("select", { id: "shareAccess", "aria-label": "Link access" }, [
+      h("option", { value: "view", text: "Anyone with the link can view" }),
+      h("option", { value: "edit", text: "Anyone with the link can edit" })
+    ]);
+    sel.value = canEdit ? "edit" : "view";
+    sel.addEventListener("change", function () {
+      if (shared) setAccess(sel.value === "edit"); else paint();
     });
-    return;
+
+    if (shared) {
+      const url = shareURL(j.shareToken);
+      const field = h("input", { type: "text", readonly: true, value: url, id: "shareURL", class: justCreated ? "fresh" : null,
+        "aria-label": "Share link", onfocus: function (e) { e.target.select(); }, onclick: function (e) { e.target.select(); } });
+      body.appendChild(h("label", { class: "f", for: "shareURL",
+        text: justCreated ? (copied ? "Link created — copied to your clipboard" : "Link created — copy it below") : "Link" }));
+      body.appendChild(h("div", { class: "sharebox" }, [field,
+        h("button", { class: "btn primary", type: "button", id: "copyShare", text: "Copy", onclick: function () { copyText(url); } })]));
+      setTimeout(function () { if (field.isConnected) { field.focus(); field.select(); } }, 0);
+    }
+    body.appendChild(h("label", { class: "f", for: "shareAccess", text: "General access" }));
+    body.appendChild(sel);
+    body.appendChild(h("ul", { class: "can" }, [
+      h("li", { text: "Opens this one transcript without signing in — never the transcript list or anyone else's transcripts." }),
+      h("li", { text: "Can play the recording, download it, download clips and export the transcript in any format." }),
+      canEdit
+        ? h("li", { text: "Can edit after pressing Edit transcript: speakers, pins and the text itself, including deleting sentences. Changes show up here too." })
+        : h("li", { text: "Can't change anything in the transcript." }),
+      h("li", { text: "Can't turn the link off, or stop, re-run or delete the job." })
+    ]));
+
+    if (!shared) {
+      foot.appendChild(h("span", { class: "grow" }));
+      foot.appendChild(h("button", { class: "btn", type: "button", text: "Cancel", onclick: function () { dlg.close(); } }));
+      foot.appendChild(h("button", { class: "btn primary", type: "button", id: "createShare", text: "Create link", onclick: create }));
+    } else {
+      foot.appendChild(h("button", { class: "btn danger", type: "button", id: "offShare", text: "Turn off link", onclick: turnOff }));
+      foot.appendChild(h("button", { class: "btn", type: "button", id: "newShare", text: "New link", title: "Turn this link off and make a different one", onclick: replace }));
+      foot.appendChild(h("span", { class: "grow" }));
+      foot.appendChild(h("button", { class: "btn", type: "button", id: "doneShare", text: "Done", onclick: function () { dlg.close(); } }));
+    }
   }
-  const url = shareURL(j.shareToken);
-  const field = h("input", { type: "text", readonly: true, value: url, "aria-label": "Share link", onfocus: function (e) { e.target.select(); } });
-  const dlg = showModal({
-    title: "Share link",
-    hint: "Anyone with this link can open this transcript without signing in.",
-    body: [
-      h("div", { class: "sharebox" }, [field, h("button", { class: "btn primary", type: "button", id: "copyShare", text: "Copy", onclick: function () { copyText(url); } })]),
-      what
-    ],
-    buttons: [
-      h("button", { class: "btn danger", type: "button", id: "offShare", text: "Turn off link", onclick: async function () {
-        if (!confirm("Turn off this link? Anyone using it will lose access straight away.")) return;
-        try {
-          S.job = await api("/api/jobs/" + j.id + "/share/delete", { method: "POST", json: {} });
-          dlg.close();
-          renderJobHead();
-          toast("Link turned off.");
-        } catch (err) { toast(err.message); }
-      } }),
-      h("button", { class: "btn", type: "button", id: "newShare", text: "New link", title: "Turn this link off and make a different one", onclick: async function () {
-        if (!confirm("Replace this link? The current one stops working straight away.")) return;
-        try {
-          await api("/api/jobs/" + j.id + "/share/delete", { method: "POST", json: {} });
-          S.job = await api("/api/jobs/" + j.id + "/share", { method: "POST", json: {} });
-          dlg.close();
-          renderJobHead();
-          openShareDialog();
-          toast("New link created — the old one no longer works.");
-        } catch (err) { toast(err.message); }
-      } }),
-      h("span", { class: "grow" }),
-      h("button", { class: "btn", type: "button", text: "Done", onclick: function () { dlg.close(); } })
-    ]
-  });
-  field.focus();
-  field.select();
+
+  function setBusy() {
+    busy = true;
+    foot.querySelectorAll("button").forEach(function (b) { b.disabled = true; });
+    if ($("shareAccess")) $("shareAccess").disabled = true;
+  }
+
+  // Must start inside the click: browsers only allow a clipboard write during
+  // the user's gesture, and the link doesn't exist until the Mini answers.
+  // ClipboardItem accepts a promise, so the write starts now and is filled in
+  // when the link arrives; otherwise fall back to writeText afterwards.
+  function createAndCopy(canEdit, before) {
+    const req = (before || Promise.resolve()).then(function () {
+      return api("/api/jobs/" + jobId + "/share", { method: "POST", json: { canEdit: canEdit } });
+    });
+    let copied = Promise.resolve(false);
+    try {
+      if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+        const blob = req.then(function (job) { return new Blob([shareURL(job.shareToken)], { type: "text/plain" }); });
+        copied = navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })])
+          .then(function () { return true; }, function () { return false; });
+      }
+    } catch (e) { copied = Promise.resolve(false); }
+    return req.then(async function (job) {
+      let ok = await copied;
+      if (!ok) {
+        try { await navigator.clipboard.writeText(shareURL(job.shareToken)); ok = true; } catch (e) { ok = false; }
+      }
+      return { job: job, copied: ok };
+    });
+  }
+
+  async function create() {
+    if (busy) return;
+    const canEdit = access() === "edit";
+    setBusy();
+    try {
+      const r = await createAndCopy(canEdit);
+      S.job = r.job;
+      renderJobHead();
+      paint(true, r.copied);
+      toast(r.copied ? "Link copied to your clipboard." : "Link created — select it and copy.");
+    } catch (err) {
+      toast(err.message);
+      paint();
+    }
+  }
+
+  async function setAccess(canEdit) {
+    setBusy();
+    try {
+      S.job = await api("/api/jobs/" + jobId + "/share", { method: "POST", json: { canEdit: canEdit } });
+      renderJobHead();
+      paint();
+      toast(canEdit ? "Anyone with the link can now edit." : "Anyone with the link can now only view.");
+    } catch (err) {
+      toast(err.message);
+      paint();
+    }
+  }
+
+  async function turnOff() {
+    if (busy || !confirm("Turn off this link? Anyone using it will lose access straight away.")) return;
+    setBusy();
+    try {
+      S.job = await api("/api/jobs/" + jobId + "/share/delete", { method: "POST", json: {} });
+      renderJobHead();
+      paint();
+      toast("Link turned off.");
+    } catch (err) { toast(err.message); paint(); }
+  }
+
+  async function replace() {
+    if (busy || !confirm("Replace this link? The current one stops working straight away.")) return;
+    const canEdit = !!S.job.shareCanEdit;
+    setBusy();
+    try {
+      const off = api("/api/jobs/" + jobId + "/share/delete", { method: "POST", json: {} });
+      const r = await createAndCopy(canEdit, off);
+      S.job = r.job;
+      renderJobHead();
+      paint(true, r.copied);
+      toast(r.copied ? "New link copied — the old one no longer works." : "New link created — the old one no longer works.");
+    } catch (err) { toast(err.message); paint(); }
+  }
+
+  paint();
 }
 
 function toggleEditing() {

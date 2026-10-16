@@ -1150,6 +1150,10 @@ final class PortalJobQueue: ObservableObject {
             allowed = false
         }
         guard allowed else { return .error(403, "That isn't available through a share link") }
+        // View-only links: every POST on the whitelist is an edit.
+        if method == "POST" && !job.shareAllowsEdits {
+            return .error(403, "This link is view-only")
+        }
         if method == "POST" {
             // Edits through a link have no signed-in name; keep a trail.
             let ip = request.header("cf-connecting-ip") ?? "local"
@@ -1205,15 +1209,29 @@ final class PortalJobQueue: ObservableObject {
     /// the existing link rather than replacing it.
     private func canShare(_ who: PortalIdentity) -> Bool { !who.isShareLink }
 
-    private func createShareLink(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
+    /// Creates the link, or — when one exists — changes what it allows.
+    /// Body {"canEdit": true|false}; a new link without one is view-only.
+    private func createShareLink(_ job: PortalJob, _ request: PortalHTTPRequest, _ who: PortalIdentity) -> PortalHTTPResponse {
         guard canShare(who) else { return .error(403, "Share links can't create other share links") }
+        var wanted: Bool? = nil
+        if !request.body.isEmpty {
+            guard let body = request.decodeBody(PortalShareBody.self) else {
+                return .error(400, "Expected {\"canEdit\": true|false}")
+            }
+            wanted = body.canEdit
+        }
         var j = self.job(job.id) ?? job
         if j.shareToken == nil {
             j.shareToken = Self.makeShareToken()
             j.sharedBy = who.email
             j.sharedAt = Date()
+            j.shareCanEdit = wanted ?? false
             update(j, saveNow: true)
-            print("[Portal] Share link created for job \(j.id.uuidString.prefix(8)) by \(who.email).")
+            print("[Portal] Share link (\(j.shareAllowsEdits ? "can edit" : "view only")) created for job \(j.id.uuidString.prefix(8)) by \(who.email).")
+        } else if let wanted, wanted != j.shareAllowsEdits {
+            j.shareCanEdit = wanted
+            update(j, saveNow: true)
+            print("[Portal] Share link for job \(j.id.uuidString.prefix(8)) set to \(wanted ? "can edit" : "view only") by \(who.email).")
         }
         return .dto(jobDTO(j, who))
     }
@@ -1225,6 +1243,7 @@ final class PortalJobQueue: ObservableObject {
             j.shareToken = nil
             j.sharedBy = nil
             j.sharedAt = nil
+            j.shareCanEdit = nil
             update(j, saveNow: true)
             print("[Portal] Share link turned off for job \(j.id.uuidString.prefix(8)) by \(who.email).")
         }
@@ -1370,7 +1389,7 @@ final class PortalJobQueue: ObservableObject {
         case ("POST", "delete"):
             return deleteJob(job, who)
         case ("POST", "share") where r.count == 3:
-            return createShareLink(job, who)
+            return createShareLink(job, request, who)
         case ("POST", "share") where r.count == 4 && r[3] == "delete":
             return removeShareLink(job, who)
         case ("POST", "speakers") where r.count == 3:
@@ -1672,6 +1691,7 @@ final class PortalJobQueue: ObservableObject {
             mediaVersion: job.mediaState == "ready" ? Self.mediaVersion(job) : nil,
             shared: job.shareToken != nil,
             shareToken: canShare(who) ? job.shareToken : nil,
+            shareCanEdit: job.shareToken == nil ? nil : job.shareAllowsEdits,
             settings: job.settings)
     }
 
