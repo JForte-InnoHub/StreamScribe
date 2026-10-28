@@ -106,6 +106,13 @@ final class StreamScribeLogger: ObservableObject {
     private var partialBuffers: [LogSource: String] = [.stdout: "", .stderr: ""]
     private let partialQueue = DispatchQueue(label: "logger.partial-buffers")
 
+    /// yt-dlp download-noise throttle state (see `throttleDownloadNoise`).
+    /// Touched from both capture pipes' background queues, hence the lock.
+    private let noiseLock = NSLock()
+    private var lastProgressKept: Date = .distantPast
+    private var hiddenProgress = 0
+    private static let progressInterval: TimeInterval = 5
+
     private init() {}
 
     // MARK: - Capture lifecycle
@@ -261,12 +268,13 @@ final class StreamScribeLogger: ObservableObject {
             // shape (with optional leading spaces) to avoid suppressing
             // anything else that legitimately includes "files".
             if Self.isLibraryProgressSpam(trimmed) { return nil }
+            guard let text = self.throttleDownloadNoise(trimmed, now: now) else { return nil }
             return LogEntry(
                 id: UUID(),
                 timestamp: now,
-                level: LogLevel.detect(from: trimmed),
+                level: LogLevel.detect(from: text),
                 source: source,
-                text: trimmed
+                text: text
             )
         }
         guard !entries.isEmpty else { return }
@@ -318,6 +326,48 @@ final class StreamScribeLogger: ObservableObject {
         let parts = prefix.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2 else { return false }
         return parts[0].allSatisfy(\.isNumber) && parts[1].allSatisfy(\.isNumber)
+    }
+
+    /// Keeps yt-dlp's per-fragment chatter from flushing whole jobs out of the
+    /// 5,000-line buffer (2026-10-28: a just-ended YouTube stream fetched 8
+    /// fragments at a time printed several progress lines per fragment, plus
+    /// ten 403 retries for each of ~350 refused fragments, and the job's start
+    /// — the `[yt-dlp] Invoking` and `[Probe]` lines — was evicted within two
+    /// minutes, so the log couldn't show what had been run).
+    ///
+    /// - Progress ticks (`[download]  9.3% of ~ 183MiB at … (frag 217/2357)`):
+    ///   at most one every 5 s across all processes, suffixed with how many
+    ///   were hidden. The final `100% of … in …` summary is always kept.
+    /// - Fragment retries (`Retrying fragment 337 (4/10)`): only the first
+    ///   attempt per fragment. yt-dlp's own "Skipping fragment" / ERROR line
+    ///   still reports the outcome.
+    /// Everything else passes through untouched. Returns the text to log, or
+    /// nil to drop the line.
+    private func throttleDownloadNoise(_ line: String, now: Date) -> String? {
+        guard line.contains("[download]") else { return line }
+        if line.contains("Retrying fragment"), !line.contains("(1/") {
+            return nil
+        }
+        guard Self.isDownloadProgressTick(line) else { return line }
+        noiseLock.lock(); defer { noiseLock.unlock() }
+        guard now.timeIntervalSince(lastProgressKept) >= Self.progressInterval else {
+            hiddenProgress += 1
+            return nil
+        }
+        lastProgressKept = now
+        let hidden = hiddenProgress
+        hiddenProgress = 0
+        return hidden > 0 ? line + "  [+\(hidden) progress lines hidden]" : line
+    }
+
+    /// `[download]  12.5% of ~ 183.37MiB at 1.19MiB/s ETA 02:01 (frag 217/2357)`
+    /// — but not the completion summary `[download] 100% of 184.12MiB in 00:03:16 …`.
+    private static func isDownloadProgressTick(_ line: String) -> Bool {
+        guard let r = line.range(of: "[download]") else { return false }
+        let rest = line[r.upperBound...].drop(while: { $0 == " " })
+        let digits = rest.prefix(while: { $0.isNumber || $0 == "." })
+        guard !digits.isEmpty, rest.dropFirst(digits.count).hasPrefix("% of") else { return false }
+        return !(rest.contains(" in ") && digits.hasPrefix("100"))
     }
 
     // MARK: - Public API for the viewer
