@@ -9080,6 +9080,12 @@ final class TranscriptionEngine: ObservableObject {
                     duration = nil
                     liveSignalConfirmed = true
                 case "was_live", "post_live", "not_live":
+                    // A just-ended livestream downloads as a recording but
+                    // must not get --http-chunk-size (see PostLiveRegistry).
+                    if liveStatusStr == "post_live" {
+                        PostLiveRegistry.mark(url)
+                        print("[Probe] yt-dlp live_status='post_live' — just-ended livestream; fragment downloads will skip --http-chunk-size.")
+                    }
                     // Fall through to duration parsing.
                     if let seconds = Double(durationStr), seconds > 0 {
                         duration = seconds

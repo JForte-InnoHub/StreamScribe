@@ -1672,11 +1672,17 @@ actor AudioStreamExtractor {
             let formatSelector = wantsVideoInCacheFlag
                 ? "bestvideo[height<=480][vcodec*=avc]+bestaudio[acodec*=mp4a]/best[height<=480][ext=mp4]/best[height<=480]/bestvideo+bestaudio/best"
                 : "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio/best"
+            // Range-request chunking for non-fragmented downloads — except
+            // for a just-ended livestream; see PostLiveRegistry.
+            if PostLiveRegistry.contains(url) {
+                print("[Extractor] Just-ended livestream (post_live): downloading fragments without --http-chunk-size.")
+            } else {
+                args.append(contentsOf: ["--http-chunk-size", "10M"])
+            }
             args.append(contentsOf: [
                 "-f", formatSelector,
                 "--merge-output-format", "mp4",     // force MP4 container on merge
                 "-N", "8",                          // parallel fragments where applicable
-                "--http-chunk-size", "10M",         // range-request chunking for non-fragmented
                 "--no-part",                        // skip .part tempfile dance
                 "--progress",                       // emit progress lines on stderr
                 "--newline",                        // one progress line per update, not \r overwrites
@@ -2340,7 +2346,13 @@ actor AudioStreamExtractor {
         // around a per-request throttle. Not worth removing from a path that
         // demonstrably works; very much worth removing from the one it
         // kills.
-        if !useLiveFromStart {
+        // Same trap for a just-ended livestream (post_live) — see
+        // PostLiveRegistry: chunked fragment requests stall to ~2 KB/s.
+        let postLive = PostLiveRegistry.contains(url)
+        if postLive {
+            print("[Extractor] Just-ended livestream (post_live): piping fragments without --http-chunk-size.")
+        }
+        if !useLiveFromStart && !postLive {
             args.append(contentsOf: ["--http-chunk-size", "10M"])
         }
         if isStaticSession {
@@ -2992,5 +3004,49 @@ actor AudioStreamExtractor {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Just-ended livestreams
+
+/// YouTube livestreams that ended recently and haven't been processed into a
+/// normal video yet (`live_status == "post_live"`).
+///
+/// FIELD DIAGNOSIS 2026-10-28 (3 h 16 min post_live stream on the Mac Mini):
+/// YouTube serves these only as ~5 s DASH fragments (2,357 of them), and
+/// `--http-chunk-size 10M` makes yt-dlp request each fragment as Range
+/// slices, which googlevideo accepts and then never answers. Measured with
+/// StreamScribe's exact arguments: 1.9 KB/s and frag 0 never completing
+/// with the flag; 592 KB/s without it (the whole stream in ~5 minutes).
+/// Same mechanism as the `--live-from-start` stall fixed 2026-09-29.
+/// Ordinary videos keep the flag (it works around a per-request throttle on
+/// single-file downloads).
+///
+/// The yt-dlp probe records the URL here when it sees `post_live`; the two
+/// places that add `--http-chunk-size` check it. A shared list rather than
+/// a new parameter because the probe result reaches the download through
+/// several layers (Mac window engine, portal engines, cached eager probes).
+/// Entries expire after 6 h — by then YouTube has usually finished
+/// processing, and a stale entry only means one video skips the flag.
+nonisolated enum PostLiveRegistry {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var marked: [String: Date] = [:]
+    private static let lifetime: TimeInterval = 6 * 3600
+
+    private static func key(_ url: URL) -> String {
+        url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func mark(_ url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        marked = marked.filter { now.timeIntervalSince($0.value) < lifetime }
+        marked[key(url)] = now
+    }
+
+    static func contains(_ url: URL) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let at = marked[key(url)] else { return false }
+        return Date().timeIntervalSince(at) < lifetime
     }
 }
