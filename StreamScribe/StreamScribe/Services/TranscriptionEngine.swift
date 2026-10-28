@@ -9084,7 +9084,7 @@ final class TranscriptionEngine: ObservableObject {
                     // must not get --http-chunk-size (see PostLiveRegistry).
                     if liveStatusStr == "post_live" {
                         PostLiveRegistry.mark(url)
-                        print("[Probe] yt-dlp live_status='post_live' — just-ended livestream; fragment downloads will skip --http-chunk-size.")
+                        print("[Probe] yt-dlp live_status='post_live' — just-ended livestream; downloads skip --http-chunk-size, and the PO token when no cookies are set.")
                     }
                     // Fall through to duration parsing.
                     if let seconds = Double(durationStr), seconds > 0 {

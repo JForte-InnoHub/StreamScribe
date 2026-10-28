@@ -240,7 +240,8 @@ final class VideoCacheDownloader: @unchecked Sendable {
         var args: [String] = ["--ignore-config", "--no-mark-watched"]
         if let denoPath = tools.denoPath {
             args.append(contentsOf: ["--js-runtimes", "deno:\(denoPath)"])
-            args.append(contentsOf: PotProviderManager.shared.potArguments())
+            args.append(contentsOf: PotProviderManager.shared.potArguments(
+                for: url, hasCookies: tools.cookieBrowser.ytDlpArgument != nil))
         }
         args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
         args.append(contentsOf: ToolManager.proxyArguments())

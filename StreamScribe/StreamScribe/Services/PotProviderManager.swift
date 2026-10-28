@@ -123,6 +123,25 @@ final class PotProviderManager: @unchecked Sendable {
         ]
     }
 
+    /// `potArguments()` for one download. Sends NO PO token for a just-ended
+    /// YouTube livestream (post_live) when no browser cookies are being sent.
+    ///
+    /// FIELD DIAGNOSIS 2026-10-28 (3 h 16 min post_live stream, Mac Mini, cookie
+    /// browser = None): with a PO token and no cookies, googlevideo starts
+    /// answering every fragment with HTTP 403 a few minutes in (fragment 185-337
+    /// across runs) and never recovers — reproduced in Terminal both piped and to
+    /// a plain file. The same stream downloaded cleanly with no token and no
+    /// cookies (piped exactly as the app does), and with token + cookies. Normal
+    /// videos keep the token: it was added to get past YouTube's bot checks and
+    /// nothing so far shows it hurting them.
+    func potArguments(for url: URL, hasCookies: Bool) -> [String] {
+        if !hasCookies && PostLiveRegistry.contains(url) {
+            print("[PoT] Just-ended livestream with no cookies: not sending a PO token (YouTube refuses these fragments mid-download with one).")
+            return []
+        }
+        return potArguments()
+    }
+
     // MARK: - Provisioning
 
     /// Idempotent; concurrent callers share one in-flight task. `denoPath` is the

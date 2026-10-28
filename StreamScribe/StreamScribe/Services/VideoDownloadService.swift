@@ -593,7 +593,8 @@ final class VideoDownloadService: ObservableObject {
                 // via the --js-runtimes flag above. Empty until
                 // PotProviderManager finishes provisioning, so appending
                 // unconditionally is safe.
-                args.append(contentsOf: PotProviderManager.shared.potArguments())
+                args.append(contentsOf: PotProviderManager.shared.potArguments(
+                    for: sourceURL, hasCookies: tools.cookieBrowser.ytDlpArgument != nil))
             }
             // YouTube player-client override (Settings). See
             // ToolManager.youtubePlayerClientArguments — web-family

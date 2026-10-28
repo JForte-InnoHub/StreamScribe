@@ -1625,7 +1625,8 @@ actor AudioStreamExtractor {
                 // via the --js-runtimes flag above. Empty until
                 // PotProviderManager finishes provisioning, so appending
                 // unconditionally is safe.
-                args.append(contentsOf: PotProviderManager.shared.potArguments())
+                args.append(contentsOf: PotProviderManager.shared.potArguments(
+                    for: url, hasCookies: tools.cookieBrowser.ytDlpArgument != nil))
             }
             // YouTube player-client override (Settings). See
             // ToolManager.youtubePlayerClientArguments — web-family
@@ -2183,7 +2184,8 @@ actor AudioStreamExtractor {
             // via the --js-runtimes flag above. Empty until
             // PotProviderManager finishes provisioning, so appending
             // unconditionally is safe.
-            args.append(contentsOf: PotProviderManager.shared.potArguments())
+            args.append(contentsOf: PotProviderManager.shared.potArguments(
+                for: url, hasCookies: tools.cookieBrowser.ytDlpArgument != nil))
         }
         // YouTube player-client override. Normally the Settings value
         // (see ToolManager.youtubePlayerClientArguments); during a
@@ -2822,7 +2824,8 @@ actor AudioStreamExtractor {
                 // via the --js-runtimes flag above. Empty until
                 // PotProviderManager finishes provisioning, so appending
                 // unconditionally is safe.
-                args.append(contentsOf: PotProviderManager.shared.potArguments())
+                args.append(contentsOf: PotProviderManager.shared.potArguments(
+                    for: url, hasCookies: tools.cookieBrowser.ytDlpArgument != nil))
             }
             // YouTube player-client override (Settings). See
             // ToolManager.youtubePlayerClientArguments — web-family
@@ -3022,8 +3025,13 @@ actor AudioStreamExtractor {
 /// Ordinary videos keep the flag (it works around a per-request throttle on
 /// single-file downloads).
 ///
+/// A second trap, found the same day: with a PO token but NO cookies, YouTube
+/// starts refusing these fragments with 403 a few minutes in — see
+/// `PotProviderManager.potArguments(for:hasCookies:)`, which also checks here.
+///
 /// The yt-dlp probe records the URL here when it sees `post_live`; the two
-/// places that add `--http-chunk-size` check it. A shared list rather than
+/// places that add `--http-chunk-size` and the download sites that add the PO
+/// token check it. A shared list rather than
 /// a new parameter because the probe result reaches the download through
 /// several layers (Mac window engine, portal engines, cached eager probes).
 /// Entries expire after 6 h — by then YouTube has usually finished
