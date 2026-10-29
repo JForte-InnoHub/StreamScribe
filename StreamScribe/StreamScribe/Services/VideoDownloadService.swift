@@ -379,6 +379,50 @@ final class VideoDownloadService: ObservableObject {
         return mp3URL
     }
 
+    /// What ffmpeg reads for an HLS download and which streams it keeps.
+    nonisolated private struct HLSDownloadPlan: Sendable {
+        let inputs: [URL]
+        let mapArguments: [String]
+    }
+
+    /// For a master playlist, download ONE variant (plus its separate audio
+    /// rendition, if it has one) instead of letting ffmpeg mix streams from
+    /// different variants — which put a Critical Mention clip's audio 1.2 s
+    /// out of sync. Anything that isn't a master playlist, or can't be
+    /// fetched, keeps the old single-input command unchanged.
+    nonisolated private static func hlsDownloadPlan(for url: URL) async -> HLSDownloadPlan {
+        let unchanged = HLSDownloadPlan(inputs: [url], mapArguments: [])
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue(AudioStreamExtractor.manifestUserAgent, forHTTPHeaderField: "User-Agent")
+        if let origin = AudioStreamExtractor.playerOriginForManifestHost(url.absoluteString) {
+            request.setValue(origin + "/", forHTTPHeaderField: "Referer")
+            request.setValue(origin, forHTTPHeaderField: "Origin")
+        }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            print("[Download] Couldn't read the HLS playlist up front — letting ffmpeg choose streams.")
+            return unchanged
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        guard text.contains("#EXT-X-STREAM-INF") else { return unchanged }  // single rendition already
+        guard let choice = HLSMasterPlaylist.choose(in: text, base: http.url ?? url) else {
+            print("[Download] HLS master playlist had no usable variants — letting ffmpeg choose streams.")
+            return unchanged
+        }
+
+        let v = choice.variant
+        let size = v.width > 0 ? "\(v.width)x\(v.height)" : "no resolution listed"
+        let rate = v.bandwidth > 0 ? String(format: " @ %.1f Mb/s", Double(v.bandwidth) / 1_000_000) : ""
+        if let audio = choice.audioURL {
+            print("[Download] HLS master: \(choice.variantCount) variant(s); downloading \(size)\(rate) with its separate audio track.")
+            return HLSDownloadPlan(inputs: [v.url, audio], mapArguments: ["-map", "0:V:0?", "-map", "1:a:0"])
+        }
+        print("[Download] HLS master: \(choice.variantCount) variant(s); downloading \(size)\(rate) with its own audio.")
+        return HLSDownloadPlan(inputs: [v.url], mapArguments: ["-map", "0:V:0?", "-map", "0:a:0?"])
+    }
+
     /// Download an HLS stream via ffmpeg. Used for Critical Mention
     /// clips (and potentially any other future source whose stream
     /// URL we know but yt-dlp doesn't handle). Emits mp4 with copied
@@ -406,6 +450,8 @@ final class VideoDownloadService: ObservableObject {
             if case .finite(let s) = result { return s }
             return nil
         }()
+
+        let plan = await Self.hlsDownloadPlan(for: streamURL)
 
         let processBox = RunningProcessBox()
         return try await withTaskCancellationHandler {
@@ -437,10 +483,17 @@ final class VideoDownloadService: ObservableObject {
             // that transcribed fine would fail to download — the transcribe
             // path has sent headers since Frame.io support landed, this one
             // had not. Shared helper, so the two paths cannot drift.
-            var arguments = AudioStreamExtractor.networkRetryArguments
-            arguments.append(contentsOf: AudioStreamExtractor.refererHardenedInputArguments(for: streamURL.absoluteString))
+            //
+            // One variant only (see HLSMasterPlaylist): input options are
+            // per-input, so retry + headers repeat before each `-i`.
+            var arguments: [String] = []
+            for input in plan.inputs {
+                arguments.append(contentsOf: AudioStreamExtractor.networkRetryArguments)
+                arguments.append(contentsOf: AudioStreamExtractor.refererHardenedInputArguments(for: input.absoluteString))
+                arguments.append(contentsOf: ["-i", input.absoluteString])
+            }
+            arguments.append(contentsOf: plan.mapArguments)
             arguments.append(contentsOf: [
-                "-i", streamURL.absoluteString,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
                 "-y",
