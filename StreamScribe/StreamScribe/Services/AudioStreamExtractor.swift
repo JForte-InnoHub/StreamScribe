@@ -984,6 +984,31 @@ actor AudioStreamExtractor {
     private func escalateLivePipe(measuredRatio: Double) async {
         guard !botWallDetected else { return }
         guard let ctx = liveEscalationContext, let continuation = continuation else { return }
+
+        // BROADCAST OVER? (field log 2026-11-05, video 8_MywwZYqvE.) A live
+        // stream that ENDS looks exactly like starvation from here: the
+        // playlist stops growing, delivery drops to 0x. The ladder then
+        // "rejoined at the live edge" four times, but by rung 3 YouTube had
+        // turned the broadcast into a recording, so yt-dlp picked DASH 140
+        // and began the WHOLE 4 h 50 m recording from fragment 0
+        // ("Total fragments: 3479") — content that would have been
+        // transcribed again onto the end of the live timeline, at 0 B/s
+        // because of the post_live stall. Ask YouTube first; if the
+        // broadcast is over, finish the session like any stream that ends.
+        if ctx.source == .youtube, let status = await youtubeBroadcastStatus(ctx.url),
+           status != "is_live", status != "is_upcoming" {
+            if status == "post_live" { PostLiveRegistry.mark(ctx.url) }
+            print("[Watchdog] Delivery stopped and YouTube reports the broadcast has ended (\(status)) — finishing the session instead of reconnecting.")
+            watchdogTask?.cancel()
+            watchdogTask = nil
+            liveEscalationContext = nil
+            // No suppressFinishOnce: ffmpeg's exit finishes the stream and
+            // the session completes normally with what it has.
+            if let p = ytDlpStreamProcess, p.isRunning { p.terminate() }
+            if let p = ffmpegProcess, p.isRunning { p.terminate() } else { continuation.finish() }
+            return
+        }
+
         let ladder: [(client: String?, cookies: Bool, label: String)] = [
             (nil, true, "configured client, cookies kept, rejoin at live edge"),
             (nil, false, "configured client, cookies dropped"),
@@ -1059,6 +1084,64 @@ actor AudioStreamExtractor {
             }
         } catch {
             print("[Watchdog] Escalation respawn failed: \(error.localizedDescription) — will re-evaluate on the next window.")
+        }
+    }
+
+    /// yt-dlp's `live_status` for a YouTube URL right now: "is_live",
+    /// "post_live", "was_live", … — or "post_live" when extraction itself
+    /// fails with "This live event has ended" (some clients refuse a
+    /// just-ended broadcast outright). nil when it can't tell (timeout,
+    /// network error, bot wall): the caller then carries on as before.
+    /// No cookies — status doesn't need an account, and it keeps a
+    /// keychain prompt out of a mid-session check.
+    private func youtubeBroadcastStatus(_ url: URL) async -> String? {
+        guard let tools = try? await Self.resolveYTDlpTools() else { return nil }
+        var args = ["--ignore-config", "--no-mark-watched", "--no-warnings", "--skip-download"]
+        if tools.disableTLSCheck { args.append("--no-check-certificate") }
+        if let deno = tools.denoPath {
+            args.append(contentsOf: ["--js-runtimes", "deno:\(deno)"])
+            args.append(contentsOf: PotProviderManager.shared.potArguments(for: url, hasCookies: false))
+        }
+        args.append(contentsOf: ToolManager.youtubePlayerClientArguments())
+        args.append(contentsOf: ToolManager.proxyArguments(sessionOverride: sessionProxyOverride))
+        args.append(contentsOf: ["--print", "%(live_status)s", url.absoluteString])
+        let ytDlpPath = tools.ytDlpPath
+        let env = tools.childEnvironment
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            let process = Process()
+            let out = Pipe(), err = Pipe()
+            process.executableURL = URL(fileURLWithPath: ytDlpPath)
+            if let env { process.environment = env }
+            process.arguments = args
+            process.standardOutput = out
+            process.standardError = err
+            do { try process.run() } catch {
+                cont.resume(returning: nil)
+                return
+            }
+            let timeoutTask = Task {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                if process.isRunning { process.terminate() }
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let outText = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let errText = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                process.waitUntilExit()
+                timeoutTask.cancel()
+                let status = outText.split(whereSeparator: \.isNewline).last
+                    .map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+                if process.terminationStatus == 0, !status.isEmpty, status != "na" {
+                    print("[Watchdog] Broadcast check: live_status=\(status).")
+                    cont.resume(returning: status)
+                } else if errText.localizedCaseInsensitiveContains("live event has ended") {
+                    print("[Watchdog] Broadcast check: \"This live event has ended.\"")
+                    cont.resume(returning: "post_live")
+                } else {
+                    print("[Watchdog] Broadcast check inconclusive (exit \(process.terminationStatus)) — continuing the reconnect ladder.")
+                    cont.resume(returning: nil)
+                }
+            }
         }
     }
 
