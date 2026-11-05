@@ -2284,8 +2284,21 @@ actor AudioStreamExtractor {
         // that does publish audio-only — every VOD — selects exactly what
         // it selected before. The height caps are reached only when
         // audio-only genuinely does not exist.
+        //
+        // SPLIT LIVE HLS (field failure 2026-11-05, video 8_MywwZYqvE).
+        // Some livestreams now publish NO muxed variants — only video-only
+        // HLS (229-231, 311) plus audio-only HLS 233/234, and yt-dlp lists
+        // those audio formats as `mp4` with acodec "unknown". Every clause
+        // above misses them (codec filters, ext=m4a, muxed `best`), so the
+        // session died at once with "Requested format is not available".
+        // `bestaudio[protocol^=m3u8]` takes them: an HLS audio-only
+        // rendition is real audio, not the SABR fake-muxed class the
+        // unknown-codec exclusions exist to avoid. It sits after the
+        // filtered audio clauses and before any muxed fallback, so streams
+        // that matched before still select exactly what they did.
+        let splitLiveAudio = "bestaudio[protocol^=m3u8]"
         let liveAudioOnlySelector =
-            "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]"
+            "bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/\(splitLiveAudio)"
             + "/best[height<=360]/best[height<=480]/best[vcodec!*=unknown]/best"
 
         let liveFormatSelector: String
@@ -2300,7 +2313,10 @@ actor AudioStreamExtractor {
             // actually played back in the miniplayer, so the bitrate buys
             // something there, unlike in the audio-only case.
             liveFormatSelector = wantsVideoInCacheFlag
-                ? "best[height<=480][vcodec*=avc]/best[height<=480][ext=mp4]/best[height<=480][vcodec!*=unknown]/bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/best"
+                // Split live HLS: no muxed format, so this transcribes from
+                // the audio-only rendition and the miniplayer gets an
+                // audio-only cache (`-map 0:v?`) — see `splitLiveAudio`.
+                ? "best[height<=480][vcodec*=avc]/best[height<=480][ext=mp4]/best[height<=480][vcodec!*=unknown]/bestaudio[acodec*=mp4a]/bestaudio[ext=m4a]/bestaudio[acodec!*=unknown]/\(splitLiveAudio)/best"
                 : liveAudioOnlySelector
         }
         // HLS / fragmented-stream staging directory. yt-dlp's HLS
