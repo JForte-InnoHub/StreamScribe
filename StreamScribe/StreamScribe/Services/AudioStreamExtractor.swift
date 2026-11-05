@@ -45,7 +45,7 @@ private final class MutableByteBuffer {
 /// `mlxCacheLimitMBKey` and `mediaCacheIncludeVideoKey` follow. Both sides
 /// MUST use these; a hardcoded string on either side drifts silently.
 let liveFromStartDefaultsKey = "live.transcribeBacklogFromStart"
-let liveFromStartDefaultValue = false
+let liveFromStartDefaultValue = true
 
 extension AudioStreamExtractor {
     /// Page origin a signed-manifest CDN expects, or nil when we have no
@@ -78,16 +78,18 @@ extension AudioStreamExtractor {
     /// spawn that consults it is the first one; retries and every
     /// escalation rung rejoin at the edge by construction.
     ///
-    /// **Default OFF, deliberately.** `--live-from-start` requires
-    /// fragment 1 of the stream to still be retrievable, and YouTube's DVR
-    /// window does not reach back indefinitely — on a stream that has been
-    /// live for hours the beginning has expired and yt-dlp fails with
-    /// "fragment 1 not found, unable to continue" having written nothing.
-    /// Defaulting it on meant every live session took that risk
-    /// unasked. With it off, a live session starts immediately; with it on,
-    /// the request is made and a refusal falls back to the edge through
-    /// `liveExtractionFailurePatterns`, so the worst case is a slower start
-    /// rather than a dead session.
+    /// **Default ON (2026-11-05).** It was off because `--live-from-start`
+    /// needs fragment 1 to still be retrievable — on a stream live for hours
+    /// YouTube's DVR window may have dropped the beginning, and yt-dlp fails
+    /// with "fragment 1 not found, unable to continue". But that refusal
+    /// falls back to the live edge (`liveExtractionFailurePatterns` +
+    /// `liveFromStartOnlyFailurePatterns`), so the cost of trying is a
+    /// slower start, while the cost of NOT trying showed up in the field: a
+    /// portal job started four hours into a Senate of Virginia stream
+    /// joined at the edge, transcribed an hour of standby slate, and missed
+    /// the hearing at the start of the broadcast entirely. Only an UNSET
+    /// value takes this default; a Mac where the checkbox was ever
+    /// switched keeps its stored choice.
     static var liveFromStartEnabled: Bool {
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: liveFromStartDefaultsKey) != nil else {
@@ -2082,8 +2084,8 @@ actor AudioStreamExtractor {
             // user wanted it — and on any stream older than YouTube's
             // retention window that fails outright, starving the pipe for
             // 30 s before the watchdog escalated its way to the live edge.
-            // Joining the edge is now the default and the backlog is
-            // opt-in; see `liveFromStartEnabled`.
+            // It's a setting now — on by default again since 2026-11-05,
+            // with the edge as the fallback; see `liveFromStartEnabled`.
             useLiveFromStart: !isStaticSession && sessionLiveFromStart,
             useCookies: true
         )

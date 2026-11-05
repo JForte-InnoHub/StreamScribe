@@ -752,7 +752,7 @@ function initForm() {
     diarization: d ? d.diarization : "fluidAudio",
     language: d ? d.language : "en",
     expectedSpeakers: d && d.expectedSpeakers > 0 ? String(d.expectedSpeakers) : "",
-    liveFromStart: d ? !!d.liveFromStart : false,
+    liveFromStart: d ? !!d.liveFromStart : true,
     cleanup: d ? !!d.cleanup : false,
     optsOpen: prev ? prev.optsOpen : false,
     advOpen: prev ? prev.advOpen : false
