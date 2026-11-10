@@ -92,7 +92,7 @@ Everything a share link touches lives under `/s/`, so one extra Access applicati
 3. **Access policies:** a policy named *Share links*, action **Bypass**, **Include → Everyone**.
 4. **Create**. Cloudflare applies the most specific path first, so `/s/…` is public while the rest of the site still asks for the emailed code.
 
-Check it from a private window: `https://transcripts.yourdomain.com/s/test` should load the portal page saying the link has been turned off. If you see the Cloudflare login page instead, the Bypass app isn't matching. Without this step share links still work, but only for people who can sign in. The Bypass doesn't loosen anything else: outside `/s/` the portal still refuses any request without an Access identity, and inside `/s/` it answers only for a valid link's own transcript.
+Check it from a private window: `https://transcripts.yourdomain.com/s/test` should load the portal page saying the link has been turned off. If you see the Cloudflare login page instead, the Bypass app isn't matching. Without this step share links still work, but only for people who can sign in. The Bypass doesn't loosen anything else: outside `/s/` the portal still refuses any request without an Access identity, and inside `/s/` it answers only for a valid link's own transcript. The portal also refuses any path containing `.`/`..` segments or backslashes. Cloudflare decides Bypass on the cleaned-up path, so such a path could otherwise look like `/s/…` to Cloudflare and like a protected route to the Mac.
 
 **4d. Let agents through** (only if you'll use the Agent API)
 
@@ -125,7 +125,13 @@ Lets an agent (Claude, a clips pipeline, a script) request a transcript of a lin
 1. On the Mini: **Settings → Agent API → New key name → Create Key**, then **Copy**. The key is shown once; only a hash is kept. Make one key per agent or pipeline so each can be revoked on its own.
 2. Add the Cloudflare Bypass for `api/agent/*` (step 4d).
 
-Each key sees only the transcripts it requested. Those jobs also appear in the portal list for everyone, as submitted by `agent: <key name>`. A key can have at most 10 transcripts waiting or running at once.
+Each key sees only the transcripts it requested. Those jobs also appear in the portal list for everyone, as submitted by `agent: <key name>`.
+
+Limits per key:
+- **Transcripts:** at most 10 waiting or running at once.
+- **Waits:** at most 4 calls holding open for a result at once.
+- **Request size:** bodies up to 256 KB.
+- **Links:** the link's host can't point at this Mac or its local network (loopback, private, link-local and similar addresses). Redirects followed during download aren't re-checked.
 
 **MCP (Claude Code, Claude Agent SDK, other MCP clients)**
 
@@ -159,7 +165,7 @@ curl -s -X POST "$BASE/transcripts/<id>/share" -H "Authorization: Bearer $KEY" -
 
 Text comes back as one paragraph per speaker turn, `[HH:MM:SS] Speaker: text`, in pages of up to 50,000 characters (`max_chars` up to 200,000); pass `text.next_offset` as `offset` for the next page. Asking again for a link this key already transcribed returns the existing transcript (`"reused": true`) unless you send `"reuse": false`. Livestreams run until the broadcast ends; their text is available while they run.
 
-**Revoking:** Settings → Agent API → **Revoke**. It stops working on the next request; its transcripts stay in the portal.
+**Revoking:** Settings → Agent API → **Revoke**. It stops working on the next request, and its waiting or running transcripts are cancelled (text so far is kept). Its finished transcripts stay in the portal.
 
 ## If the Mini moves onto the Netskope-managed network
 

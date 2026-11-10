@@ -266,7 +266,10 @@ nonisolated struct PortalRequestParser {
     }
 
     let maxHeaderBytes: Int
-    let maxBodyBytes: Int
+    private(set) var maxBodyBytes: Int
+    /// Agent routes take small JSON only; anyone on the internet can reach
+    /// them, so their bodies are capped before the key is even checked.
+    static let agentMaxBodyBytes = 256 * 1024
 
     /// True once a parsed head carried `Expect: 100-continue`. The connection
     /// answers with an interim 100 before the body arrives.
@@ -340,6 +343,10 @@ nonisolated struct PortalRequestParser {
         }
         let method = parts[0].uppercased()
         let target = String(parts[1])
+        let decodedPath = Self.splitTarget(target).0.lowercased()
+        if decodedPath == "/api/agent" || decodedPath.hasPrefix("/api/agent/") {
+            maxBodyBytes = min(maxBodyBytes, Self.agentMaxBodyBytes)
+        }
         guard parts[2].hasPrefix("HTTP/1.") else {
             return .failure(HeadFailure(status: 505, message: "Only HTTP/1.x is supported"))
         }
@@ -372,7 +379,7 @@ nonisolated struct PortalRequestParser {
                 return .failure(HeadFailure(status: 400, message: "Invalid Content-Length"))
             }
             guard n <= maxBodyBytes else {
-                return .failure(HeadFailure(status: 413, message: "Request body too large (limit \(maxBodyBytes / (1024 * 1024)) MB)"))
+                return .failure(HeadFailure(status: 413, message: "Request body too large (limit \(Self.limitText(maxBodyBytes)))"))
             }
             mode = .length(n)
         } else {
@@ -404,7 +411,7 @@ nonisolated struct PortalRequestParser {
                     chunkState = .trailers
                 } else {
                     guard chunkedBody.count + size <= maxBodyBytes else {
-                        return fail(413, "Request body too large (limit \(maxBodyBytes / (1024 * 1024)) MB)")
+                        return fail(413, "Request body too large (limit \(Self.limitText(maxBodyBytes)))")
                     }
                     chunkState = .data(size)
                 }
@@ -443,6 +450,10 @@ nonisolated struct PortalRequestParser {
     private mutating func fail(_ status: Int, _ message: String) -> Outcome {
         done = true
         return .failed(status, message)
+    }
+
+    static func limitText(_ bytes: Int) -> String {
+        bytes >= 1024 * 1024 ? "\(bytes / (1024 * 1024)) MB" : "\(bytes / 1024) KB"
     }
 
     static func splitTarget(_ target: String) -> (String, [String: String]) {

@@ -1177,7 +1177,7 @@ final class PortalJobQueue: ObservableObject {
 
     /// Job notes for a public viewer: no names ("Stopped by …") and no raw
     /// error text (local paths, tool output).
-    private static func publicMessage(_ job: PortalJob) -> String? {
+    static func publicMessage(_ job: PortalJob) -> String? {
         switch job.status {
         case .failed: return "This transcript couldn't be completed."
         case .interrupted: return "Transcription was interrupted. The transcript up to that point is kept."
@@ -1274,8 +1274,33 @@ final class PortalJobQueue: ObservableObject {
             || request.header("x-forwarded-for") != nil {
             return nil
         }
-        // The listener is loopback-only, so this is a browser on the Mac itself.
+        // The listener is loopback-only, so this is a browser on the Mac itself
+        // — but only if it ASKED for this Mac by name. A page on another site
+        // that DNS-rebinds its own hostname to 127.0.0.1 arrives with that
+        // hostname in Host, and must not be treated as the local admin.
+        guard Self.isLoopbackHost(request.header("host")) else { return nil }
         return PortalIdentity(email: "local", isLocal: true)
+    }
+
+    /// "." / ".." segments or backslashes anywhere in the decoded path.
+    static func unsafePathProblem(_ path: String) -> String? {
+        if path.contains("\\") { return "Backslashes aren't allowed in paths" }
+        for segment in path.split(separator: "/", omittingEmptySubsequences: true) where segment == "." || segment == ".." {
+            return "Relative path segments aren't allowed"
+        }
+        return nil
+    }
+
+    /// Host header names this Mac's loopback interface (any port).
+    static func isLoopbackHost(_ header: String?) -> Bool {
+        guard var host = header?.trimmingCharacters(in: .whitespaces).lowercased(), !host.isEmpty else { return false }
+        if host.hasPrefix("[") {
+            guard let close = host.firstIndex(of: "]") else { return false }
+            host = String(host[host.index(after: host.startIndex)..<close])
+        } else if let colon = host.lastIndex(of: ":") {
+            host = String(host[..<colon])
+        }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
     }
 
     private func adminEmails() -> Set<String> {
@@ -1298,6 +1323,15 @@ final class PortalJobQueue: ObservableObject {
     // MARK: - HTTP routing
 
     func handle(_ request: PortalHTTPRequest) async -> PortalHTTPResponse {
+        // PATH CONFUSION GUARD. Cloudflare decides Access vs. Bypass on the
+        // NORMALIZED path (dot segments removed, backslashes turned into
+        // slashes), but we receive the raw one. "/api/jobs/x/../../agent/y"
+        // is a bypassed /api/agent/y to Cloudflare and an Access-protected
+        // /api/jobs/… route here. Nothing legitimate sends such paths, so
+        // refuse them outright rather than try to normalize the same way.
+        if let problem = Self.unsafePathProblem(request.path) {
+            return .error(400, problem)
+        }
         // Public share links come first: Cloudflare Access is set to BYPASS
         // /s/*, so these requests arrive with no signed-in identity. They are
         // authorised by the token alone and confined to that one job.

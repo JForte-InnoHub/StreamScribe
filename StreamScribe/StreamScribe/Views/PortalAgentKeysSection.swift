@@ -71,7 +71,7 @@ struct PortalAgentKeysSection: View {
         } header: {
             Text("Agent API")
         } footer: {
-            Text("Lets AI agents and scripts request transcripts of links, wait for them to finish, read them and create share links. Agents send a key as \"Authorization: Bearer <key>\" (or \"X-API-Key\") to https://<portal address>/api/agent/v1 (REST) or /api/agent/mcp (MCP). Each key only sees the transcripts it requested; those jobs also appear in the portal under \"agent: <name>\". Cloudflare needs a Bypass rule for api/agent/* — see PORTAL_SETUP.md. Revoking a key stops it at once.")
+            Text("Lets AI agents and scripts request transcripts of links, wait for them to finish, read them and create share links. Agents send a key as \"Authorization: Bearer <key>\" (or \"X-API-Key\") to https://<portal address>/api/agent/v1 (REST) or /api/agent/mcp (MCP). Each key only sees the transcripts it requested; those jobs also appear in the portal under \"agent: <name>\". Cloudflare needs a Bypass rule for api/agent/* — see PORTAL_SETUP.md. Revoking a key stops it at once and cancels its unfinished transcripts.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -82,7 +82,7 @@ struct PortalAgentKeysSection: View {
         ) { key in
             Button("Revoke", role: .destructive) { store.revoke(key.id) }
         } message: { _ in
-            Text("Anything using it stops working straight away. Transcripts it requested stay in the portal.")
+            Text("Anything using it stops working straight away, and its waiting or running transcripts are cancelled. Finished transcripts stay in the portal.")
         }
     }
 }

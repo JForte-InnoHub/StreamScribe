@@ -70,6 +70,9 @@ final class PortalAgentKeyStore: ObservableObject {
         keys.removeAll { $0.id == id }
         save()
         print("[Portal] Agent API key revoked: \(k.label) (\(k.prefix)…).")
+        // A revoked key's queued and running jobs stop too — otherwise a
+        // leaked key's livestreams would keep their engines after revoking.
+        PortalJobQueue.shared.cancelAgentJobs(of: k)
     }
 
     func record(_ id: UUID) -> PortalAgentKey? { keys.first { $0.id == id } }

@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 // MARK: - StreamScribe Web Portal — Agent API (REST + MCP)
 //
@@ -92,6 +97,7 @@ extension PortalJobQueue {
 
     static let agentMaxActiveJobsPerKey = 10
     static let agentMaxWaitSeconds = 55          // Cloudflare cuts origin responses at 100 s
+    static let agentMaxOpenWaitsPerKey = 4
     static let agentDefaultMaxChars = 50_000
     static let agentMaxMaxChars = 200_000
 
@@ -134,7 +140,7 @@ extension PortalJobQueue {
                 guard let body = try? Self.agentDecoder.decode(PortalAgentCreateBody.self, from: request.body) else {
                     throw AgentError(400, "Expected JSON like {\"url\": \"https://…\"}")
                 }
-                let (dto, created) = try agentCreate(body, key: key, who: who, base: agentBaseURL(request))
+                let (dto, created) = try await agentCreate(body, key: key, who: who, base: agentBaseURL(request))
                 return agentJSON(dto, status: created ? 201 : 200)
             default:
                 break
@@ -149,7 +155,7 @@ extension PortalJobQueue {
                 let includeText = ["1", "true", "yes"].contains((request.query["text"] ?? "").lowercased())
                 let offset = Int(request.query["offset"] ?? "") ?? 0
                 let maxChars = Int(request.query["max_chars"] ?? "") ?? Self.agentDefaultMaxChars
-                await agentWait(job.id, seconds: wait)
+                try await agentWait(job.id, seconds: wait, key: key)
                 return agentJSON(agentDTO(latestAgentJob(job), base: agentBaseURL(request),
                                           text: includeText ? (offset, maxChars) : nil))
             case ("GET", "export", 3):
@@ -179,9 +185,16 @@ extension PortalJobQueue {
     // MARK: Operations (shared by REST and MCP)
 
     private func agentCreate(_ body: PortalAgentCreateBody, key: PortalAgentKey, who: PortalIdentity,
-                             base: String) throws -> (PortalAgentTranscriptDTO, Bool) {
+                             base: String) async throws -> (PortalAgentTranscriptDTO, Bool) {
         let checked = Self.validateSubmittedURL(body.url)
         guard let url = checked.url else { throw AgentError(422, checked.problem ?? "Invalid link") }
+        // Anyone holding a key can make the Mac fetch a link, so — unlike a
+        // signed-in colleague — an agent may not point it at this Mac or the
+        // network around it. (Redirects are followed by the downloaders and
+        // aren't re-checked; this stops the direct case.)
+        if let host = url.host, let problem = await Self.agentHostProblem(host) {
+            throw AgentError(422, problem)
+        }
 
         let share = (body.share ?? "none").lowercased()
         guard ["none", "view", "edit"].contains(share) else {
@@ -247,15 +260,109 @@ extension PortalJobQueue {
         return agentDTO(self.job(job.id) ?? job, base: base)
     }
 
-    /// Holds the request until the job stops, up to `seconds` (capped).
-    private func agentWait(_ id: UUID, seconds: Double) async {
-        let limit = min(max(seconds, 0), Double(Self.agentMaxWaitSeconds))
+    /// Holds the request until the job stops, up to `seconds` (capped). A key
+    /// may hold only a few of these open at once.
+    private func agentWait(_ id: UUID, seconds: Double, key: PortalAgentKey) async throws {
+        let limit = min(max(seconds.isFinite ? seconds : 0, 0), Double(Self.agentMaxWaitSeconds))
         guard limit > 0 else { return }
+        guard Self.agentOpenWaits[key.id, default: 0] < Self.agentMaxOpenWaitsPerKey else {
+            throw AgentError(429, "This key already has \(Self.agentMaxOpenWaitsPerKey) waits open. Wait on fewer transcripts at once.")
+        }
+        Self.agentOpenWaits[key.id, default: 0] += 1
+        defer {
+            Self.agentOpenWaits[key.id, default: 1] -= 1
+            if Self.agentOpenWaits[key.id] ?? 0 <= 0 { Self.agentOpenWaits[key.id] = nil }
+        }
         let deadline = Date().addingTimeInterval(limit)
         while Date() < deadline, !Task.isCancelled {
             guard let j = job(id), !j.status.isTerminal else { return }
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
+    }
+
+    private static var agentOpenWaits: [UUID: Int] = [:]
+
+    /// Revoking a key stops its queued and running jobs (Settings → Agent API).
+    func cancelAgentJobs(of key: PortalAgentKey) {
+        let who = PortalIdentity(email: key.submitterName, isLocal: false, agentKeyID: key.id)
+        for job in jobs where job.agentKeyID == key.id && !job.status.isTerminal {
+            _ = stopJob(job, who)
+        }
+    }
+
+    /// Why an agent may not submit a link to `host`, or nil. Resolves the
+    /// name (off the main thread) and refuses loopback, private, link-local,
+    /// carrier-grade NAT, multicast and other non-public addresses, in both
+    /// IPv4 and IPv6, including numeric spellings like 0x7f000001.
+    static func agentHostProblem(_ host: String) async -> String? {
+        let name = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        // Numeric addresses are checked as written — a resolver may refuse an
+        // IPv6 literal on a machine without IPv6, which must not mean "allowed".
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, name, &v6) == 1 {
+            return isPublicAddress(withUnsafeBytes(of: &v6) { Array($0) }) ? nil : "Links to this Mac or its local network aren't allowed"
+        }
+        var v4 = in_addr()
+        if inet_pton(AF_INET, name, &v4) == 1 {
+            return isPublicAddress(withUnsafeBytes(of: &v4) { Array($0) }) ? nil : "Links to this Mac or its local network aren't allowed"
+        }
+        let addresses = await Task.detached(priority: .userInitiated) { () -> [[UInt8]] in
+            var hints = addrinfo()
+            var res: UnsafeMutablePointer<addrinfo>?
+            guard getaddrinfo(name, nil, &hints, &res) == 0, let first = res else { return [] }
+            defer { freeaddrinfo(first) }
+            var out: [[UInt8]] = []
+            var cur: UnsafeMutablePointer<addrinfo>? = first
+            while let ai = cur {
+                if let sa = ai.pointee.ai_addr {
+                    if Int32(sa.pointee.sa_family) == AF_INET {
+                        sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { p in
+                            var a = p.pointee.sin_addr
+                            out.append(withUnsafeBytes(of: &a) { Array($0) })
+                        }
+                    } else if Int32(sa.pointee.sa_family) == AF_INET6 {
+                        sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p in
+                            var a = p.pointee.sin6_addr
+                            out.append(withUnsafeBytes(of: &a) { Array($0) })
+                        }
+                    }
+                }
+                cur = ai.pointee.ai_next
+            }
+            return out
+        }.value
+        // An unresolvable name can't be fetched either; let the job fail normally.
+        for a in addresses where !isPublicAddress(a) {
+            return "Links to this Mac or its local network aren't allowed"
+        }
+        return nil
+    }
+
+    static func isPublicAddress(_ a: [UInt8]) -> Bool {
+        if a.count == 4 {
+            let (b0, b1) = (a[0], a[1])
+            if b0 == 0 || b0 == 10 || b0 == 127 || b0 >= 224 { return false }          // this-net, private, loopback, multicast/reserved
+            if b0 == 100 && (b1 & 0xC0) == 64 { return false }                          // 100.64/10 carrier-grade NAT
+            if b0 == 169 && b1 == 254 { return false }                                  // link-local
+            if b0 == 172 && (b1 & 0xF0) == 16 { return false }                          // 172.16/12
+            if b0 == 192 && b1 == 168 { return false }                                  // 192.168/16
+            if b0 == 192 && b1 == 0 && a[2] == 0 { return false }                       // 192.0.0/24 protocol assignments
+            if b0 == 198 && (b1 & 0xFE) == 18 { return false }                          // 198.18/15 benchmarking
+            return true
+        }
+        guard a.count == 16 else { return false }
+        if a.allSatisfy({ $0 == 0 }) { return false }                                    // ::
+        if a[0..<15].allSatisfy({ $0 == 0 }) && a[15] == 1 { return false }             // ::1
+        if a[0..<10].allSatisfy({ $0 == 0 }) && a[10] == 0xFF && a[11] == 0xFF {        // ::ffff:v4
+            return isPublicAddress(Array(a[12..<16]))
+        }
+        if a[0] == 0xFF { return false }                                                 // multicast
+        if a[0] == 0xFE && (a[1] & 0xC0) == 0x80 { return false }                        // fe80::/10 link-local
+        if (a[0] & 0xFE) == 0xFC { return false }                                        // fc00::/7 unique local
+        if a[0] == 0x00 && a[1] == 0x64 && a[2] == 0xFF && a[3] == 0x9B {                // 64:ff9b::/96 NAT64
+            return isPublicAddress(Array(a[12..<16]))
+        }
+        return true
     }
 
     private func latestAgentJob(_ job: PortalJob) -> PortalJob {
@@ -293,7 +400,8 @@ extension PortalJobQueue {
             createdAt: job.createdAt, startedAt: job.startedAt, finishedAt: job.finishedAt,
             durationSeconds: job.durationSeconds.flatMap { $0.isFinite ? $0 : nil },
             processedSeconds: job.processedSeconds.flatMap { $0.isFinite ? $0 : nil },
-            progress: progress, queuePosition: position, message: job.message,
+            // Generic notes only: raw errors carry local paths, and "Stopped by" an email.
+            progress: progress, queuePosition: position, message: Self.publicMessage(job),
             segmentCount: job.segments.count, speakers: speakers,
             portalUrl: base + "/#/job/" + job.id.uuidString,
             shareUrl: job.shareToken.map { base + "/s/" + $0 },
@@ -358,7 +466,8 @@ extension PortalJobQueue {
     /// arrived on (Cloudflare passes the public hostname through), https when
     /// it came through Cloudflare.
     func agentBaseURL(_ request: PortalHTTPRequest) -> String {
-        let raw = (request.header("x-forwarded-host") ?? request.header("host") ?? "")
+        // Host only: Cloudflare passes a client's own X-Forwarded-Host through.
+        let raw = (request.header("host") ?? "")
             .split(separator: ",").first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
         let hostOK = !raw.isEmpty && raw.count <= 253
             && raw.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || ".-:[]".contains($0)) }
@@ -402,7 +511,9 @@ extension PortalJobQueue {
 
     // MARK: - MCP (Streamable HTTP, JSON responses)
 
-    private static let mcpProtocolVersions = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+    /// Only versions whose Streamable HTTP transport this matches (no SSE
+    /// transport, no batches).
+    private static let mcpProtocolVersions = ["2025-11-25", "2025-06-18"]
 
     private func handleMCP(_ request: PortalHTTPRequest, key: PortalAgentKey, who: PortalIdentity) async -> PortalHTTPResponse {
         guard request.method == "POST" else {
@@ -413,8 +524,18 @@ extension PortalJobQueue {
         }
         // DNS-rebinding guard from the MCP spec: a browser page may only talk
         // to us from our own origin. Agents send no Origin at all.
-        if let origin = request.header("origin"), !origin.isEmpty, origin.lowercased() != agentBaseURL(request) {
-            return .error(403, "Cross-origin MCP requests aren't allowed")
+        // Rebinding pages arrive with their own hostname in both Origin and
+        // Host, so a match alone proves nothing off Cloudflare: there, only
+        // the Mac's own loopback names count. (The API key is still required.)
+        if let origin = request.header("origin"), !origin.isEmpty {
+            let viaCloudflare = request.header("cf-ray") != nil
+            guard origin.lowercased() == agentBaseURL(request),
+                  viaCloudflare || Self.isLoopbackHost(request.header("host")) else {
+                return .error(403, "Cross-origin MCP requests aren't allowed")
+            }
+        }
+        if let v = request.header("mcp-protocol-version"), !v.isEmpty, !Self.mcpProtocolVersions.contains(v) {
+            return .error(400, "Unsupported MCP-Protocol-Version \(v.prefix(32)); this server speaks \(Self.mcpProtocolVersions.joined(separator: ", "))")
         }
         guard let parsed = try? JSONSerialization.jsonObject(with: request.body) else {
             return mcpReply(["jsonrpc": "2.0", "id": NSNull(),
@@ -428,9 +549,13 @@ extension PortalJobQueue {
             // A response or something unrecognisable from the client: nothing to answer.
             return PortalHTTPResponse(status: 202, headers: [], body: Data())
         }
-        guard let id = msg["id"], !(id is NSNull) else {
+        guard let id = msg["id"] else {
             // Notifications (initialized, cancelled, …) get 202 and no body.
             return PortalHTTPResponse(status: 202, headers: [], body: Data())
+        }
+        guard id is String || id is NSNumber else {
+            return mcpReply(["jsonrpc": "2.0", "id": NSNull(),
+                             "error": ["code": -32600, "message": "Request id must be a string or number"]])
         }
         let params = msg["params"] as? [String: Any] ?? [:]
 
@@ -451,6 +576,9 @@ extension PortalJobQueue {
         case "tools/call":
             guard let name = params["name"] as? String else {
                 return mcpReply(["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "Missing tool name"]])
+            }
+            guard Self.mcpTools.contains(where: { $0["name"] as? String == name }) else {
+                return mcpReply(["jsonrpc": "2.0", "id": id, "error": ["code": -32602, "message": "Unknown tool: \(name.prefix(64))"]])
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
             let result = await mcpCall(name, args, key: key, who: who, base: agentBaseURL(request))
@@ -479,18 +607,19 @@ extension PortalJobQueue {
                 let body = PortalAgentCreateBody(url: url, title: str("title"), language: str("language"),
                                                  expectedSpeakers: int("expected_speakers"), mode: str("mode"),
                                                  share: str("share"), reuse: bool("reuse"))
-                let (dto, _) = try agentCreate(body, key: key, who: who, base: base)
+                let (dto, _) = try await agentCreate(body, key: key, who: who, base: base)
                 return try mcpResult(dto)
             case "get_transcript":
                 let job = try agentJob(str("id") ?? "", key: key)
-                await agentWait(job.id, seconds: Double(int("wait_seconds") ?? 0))
+                try await agentWait(job.id, seconds: Double(int("wait_seconds") ?? 0), key: key)
                 let includeText = bool("include_text") ?? true
                 let dto = agentDTO(latestAgentJob(job), base: base,
                                    text: includeText ? (int("text_offset") ?? 0, int("max_chars") ?? Self.agentDefaultMaxChars) : nil)
                 return try mcpResult(dto)
             case "create_share_link":
                 let job = try agentJob(str("id") ?? "", key: key)
-                let j = setShareLink(job.id, canEdit: bool("can_edit") ?? false, by: who) ?? job
+                // Omitted can_edit keeps an existing link's permission (new links are view-only).
+                let j = setShareLink(job.id, canEdit: bool("can_edit"), by: who) ?? job
                 return try mcpResult(agentDTO(j, base: base))
             case "list_transcripts":
                 let limit = min(max(int("limit") ?? 10, 1), 50)
@@ -525,8 +654,9 @@ extension PortalJobQueue {
         let meta = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
         content.append(["type": "text", "text": String(decoding: meta, as: UTF8.self)])
         if let transcript { content.append(["type": "text", "text": transcript.isEmpty ? "(no speech transcribed yet)" : transcript]) }
-        let structured = try JSONSerialization.jsonObject(with: data)
-        return ["content": content, "structuredContent": structured, "isError": false]
+        // structuredContent mirrors the first block (metadata); the transcript
+        // itself is sent once, in the second block, not twice.
+        return ["content": content, "structuredContent": object, "isError": false]
     }
 
     private static let mcpInstructions = """
@@ -584,7 +714,7 @@ extension PortalJobQueue {
                 "type": "object",
                 "properties": [
                     "id": ["type": "string", "description": "Transcript id."],
-                    "can_edit": ["type": "boolean", "description": "Default false (view-only)."],
+                    "can_edit": ["type": "boolean", "description": "true = anyone with the link can edit; false = view only. Omit to keep an existing link's setting (new links are view-only)."],
                 ] as [String: Any],
                 "required": ["id"],
             ] as [String: Any],
