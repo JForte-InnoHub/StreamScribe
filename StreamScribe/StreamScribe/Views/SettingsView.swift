@@ -462,6 +462,8 @@ struct SettingsView: View {
             }
 
             PortalSettingsSection()
+
+            PortalAgentKeysSection()
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 600)

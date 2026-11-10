@@ -94,6 +94,17 @@ Everything a share link touches lives under `/s/`, so one extra Access applicati
 
 Check it from a private window: `https://transcripts.yourdomain.com/s/test` should load the portal page saying the link has been turned off. If you see the Cloudflare login page instead, the Bypass app isn't matching. Without this step share links still work, but only for people who can sign in. The Bypass doesn't loosen anything else: outside `/s/` the portal still refuses any request without an Access identity, and inside `/s/` it answers only for a valid link's own transcript.
 
+**4d. Let agents through** (only if you'll use the Agent API)
+
+Agents can't type in an emailed code, so they use an API key instead, under `/api/agent/`. A second Bypass application opens exactly that path:
+
+1. **Zero Trust → Access controls → Applications → Create new application → Self-hosted and private → Add public hostname.**
+2. Hostname: the same `transcripts.yourdomain.com`, with **Path** `api/agent/*`.
+3. **Access policies:** a policy named *Agent API*, action **Bypass**, **Include → Everyone**.
+4. **Create.**
+
+Check it from a terminal: `curl https://transcripts.yourdomain.com/api/agent/v1` should answer `{"error":"Missing or unknown API key…"}`. If you get Cloudflare's login page HTML instead, the Bypass app isn't matching. Inside `/api/agent/` every request needs a valid key and only sees that key's own transcripts; nothing else in the portal is reachable from there.
+
 **Fail-safe:** if a request reaches the portal through Cloudflare *without* an Access identity (for example, the Access application is missing or its hostname has a typo), the portal refuses it with *"This portal must be reached through Cloudflare Access."* Seeing that message means Access isn't covering the hostname yet.
 
 ## 5. Check it end to end
@@ -104,6 +115,51 @@ Check it from a private window: `https://transcripts.yourdomain.com/s/test` shou
 - On a finished transcript, **Share → Create link → Copy**, open the link in a private window (not signed in), and check it plays and downloads. Then **Turn off link** and reload it: it should say the link has been turned off.
 - Paste a link into **Download media** and press Download; when the row says Ready, **Save file** should start a browser download.
 - Upload a file larger than 100 MB. Uploads are sent in 16 MB pieces because Cloudflare rejects any single request over 100 MB. An interrupted piece is retried automatically.
+
+## Agent API (for AI agents and scripts)
+
+Lets an agent (Claude, a clips pipeline, a script) request a transcript of a link, wait for it, read it and get a share link.
+
+**Set up**
+
+1. On the Mini: **Settings → Agent API → New key name → Create Key**, then **Copy**. The key is shown once; only a hash is kept. Make one key per agent or pipeline so each can be revoked on its own.
+2. Add the Cloudflare Bypass for `api/agent/*` (step 4d).
+
+Each key sees only the transcripts it requested. Those jobs also appear in the portal list for everyone, as submitted by `agent: <key name>`. A key can have at most 10 transcripts waiting or running at once.
+
+**MCP (Claude Code, Claude Agent SDK, other MCP clients)**
+
+The endpoint is `https://transcripts.yourdomain.com/api/agent/mcp` (Streamable HTTP). For Claude Code:
+
+```bash
+claude mcp add --transport http streamscribe https://transcripts.yourdomain.com/api/agent/mcp \
+  --header "Authorization: Bearer ssk_…"
+```
+
+In claude.ai or Claude Desktop, add it as a custom connector and enter the key as an `Authorization` request header. That option is currently in beta for some organizations; without it, use Claude Code or the Agent SDK.
+
+Tools: `request_transcript`, `get_transcript` (with `wait_seconds` up to 55, paged text), `create_share_link`, `list_transcripts`, `cancel_transcript`.
+
+**REST**
+
+The OpenAPI description is at `/api/agent/v1/openapi.json`. Typical flow:
+
+```bash
+KEY=ssk_…; BASE=https://transcripts.yourdomain.com/api/agent/v1
+# 1. Request (share: none | view | edit)
+curl -s -X POST "$BASE/transcripts" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" -d '{"url":"https://www.youtube.com/watch?v=…","share":"view"}'
+# 2. Wait up to 55 s per call until "done": true, with the text
+curl -s "$BASE/transcripts/<id>?wait=55&text=1" -H "Authorization: Bearer $KEY"
+# 3. A file instead (docx, txt, md, rtf, srt, vtt, json)
+curl -s -OJ "$BASE/transcripts/<id>/export?format=docx" -H "Authorization: Bearer $KEY"
+# 4. Share link (returns share_url)
+curl -s -X POST "$BASE/transcripts/<id>/share" -H "Authorization: Bearer $KEY" -d '{"can_edit":false}'
+```
+
+Text comes back as one paragraph per speaker turn, `[HH:MM:SS] Speaker: text`, in pages of up to 50,000 characters (`max_chars` up to 200,000); pass `text.next_offset` as `offset` for the next page. Asking again for a link this key already transcribed returns the existing transcript (`"reused": true`) unless you send `"reuse": false`. Livestreams run until the broadcast ends; their text is available while they run.
+
+**Revoking:** Settings → Agent API → **Revoke**. It stops working on the next request; its transcripts stay in the portal.
 
 ## If the Mini moves onto the Netskope-managed network
 
@@ -139,6 +195,8 @@ For a dashboard-managed tunnel, you can instead set the protocol in `/Library/La
 | Job sits at *Waiting for a session started on the Mac to finish* | Someone is running a session on the Mac. It starts automatically when that ends. |
 | Job failed with a model error | That engine's model isn't downloaded on the Mini. Download it in the Mac app. |
 | "Your sign-in has expired" banner | The Access session timed out. Reload the page. |
+| Agent gets Cloudflare's login page HTML | The `api/agent/*` Bypass app is missing or doesn't match. See step 4d. |
+| Agent gets *Missing or unknown API key* | Wrong or revoked key, or it isn't sent as `Authorization: Bearer …` / `X-API-Key`. |
 | Anything else | StreamScribe's log viewer: every portal line starts with `[Portal]`. |
 
 ## What changed in the code
@@ -150,6 +208,9 @@ New files (add to the StreamScribe target):
 - `Services/Portal/PortalJobQueue.swift` — the queue that drives the engine, persistence, identity, and all API routes. Share links (`/s/<token>/…`) are routed before the Access identity check to a whitelist confined to the token's job (`handleShared`); tokens are 256 random bits. Media downloads (`/api/downloads`) run one `VideoDownloadService` instance each (its `init` is now internal; the Mac keeps `.shared`). Transcript edits (`/api/jobs/{id}/speakers/identify`, `/segments/reassign|text|delete|restore`, `GET …/identities`) call the engine's own methods (`reassignSpeaker`, `updateSegmentText`, `deleteSegments`, `restoreVerbatim`, `VoiceprintService.setManualIdentification/clearIdentification`) while the engine holds the session, and otherwise apply the same rules to the saved snapshot.
 - `Services/Portal/PortalPage.swift` — the web page, generated from `portal-web/portal.html` by `python3 portal-web/gen_page.py`. Edit the HTML and regenerate rather than editing the Swift string.
 - `Views/PortalSettingsSection.swift` — Settings → Web Portal.
+- `Services/Portal/PortalAgentAPI.swift` — the Agent API: REST under `/api/agent/v1` and an MCP endpoint at `/api/agent/mcp`, routed before the Access identity check and confined to the calling key's own jobs (`PortalJob.agentKeyID`).
+- `Services/Portal/PortalAgentKeys.swift` — API keys (`ssk_` + 256 random bits), stored as SHA-256 hashes in `Portal/agent-keys.json`.
+- `Views/PortalAgentKeysSection.swift` — Settings → Agent API.
 
 Small edits to existing files:
 
@@ -161,4 +222,4 @@ Small edits to existing files:
 - `StreamScribeApp.swift` — `.task { PortalJobQueue.shared.attach(engine:) }`.
 - `ContentView.swift` — mirrors the portal's current job into the URL field.
 - `SidebarView.swift` — Start, the URL field and Choose File are disabled while the portal is starting a job (`ContentView`'s file drop too), so the Mac can't re-probe a different input mid-dispatch.
-- `SettingsView.swift` — adds `PortalSettingsSection()`.
+- `SettingsView.swift` — adds `PortalSettingsSection()` and `PortalAgentKeysSection()`.

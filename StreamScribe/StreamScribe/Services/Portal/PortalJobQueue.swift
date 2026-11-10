@@ -35,6 +35,8 @@ struct PortalIdentity {
     let isLocal: Bool
     /// Someone using a job's public share link (/s/<token>), not signed in.
     var isShareLink: Bool = false
+    /// An agent using an API key (Settings → Agent API); `email` is "agent: <name>".
+    var agentKeyID: UUID? = nil
 
     static let shareLink = PortalIdentity(email: "share link", isLocal: false, isShareLink: true)
 }
@@ -133,7 +135,7 @@ final class PortalJobQueue: ObservableObject {
     private var primary: EngineSlot? { slots.first }
     private let server = PortalServer()
     private var cancellables = Set<AnyCancellable>()
-    private var jobs: [PortalJob] = []                 // oldest first
+    private(set) var jobs: [PortalJob] = []            // oldest first
     private var indexes: [UUID: PortalTranscriptIndex] = [:]
     private var uploads: [UUID: PortalUploadSession] = [:]
     private var pendingSaves: Set<UUID> = []
@@ -310,7 +312,7 @@ final class PortalJobQueue: ObservableObject {
 
     // MARK: - Queue runner
 
-    private func pump() {
+    func pump() {
         guard !isPaused, primary != nil else { return }
         // Jobs behind one that can't start yet still start when a slot is free:
         // the queue is FIFO per slot, not strictly global.
@@ -602,7 +604,7 @@ final class PortalJobQueue: ObservableObject {
     }
 
     /// Sync whichever slot holds this job (used before exports/transcripts).
-    private func syncIfAttached(_ job: PortalJob) {
+    func syncIfAttached(_ job: PortalJob) {
         if let slot = slot(for: job), isAttached(job) { syncAttached(slot) }
     }
 
@@ -644,9 +646,9 @@ final class PortalJobQueue: ObservableObject {
 
     // MARK: - Job storage
 
-    private func job(_ id: UUID) -> PortalJob? { jobs.first { $0.id == id } }
+    func job(_ id: UUID) -> PortalJob? { jobs.first { $0.id == id } }
 
-    private func update(_ job: PortalJob, saveNow now: Bool = false) {
+    func update(_ job: PortalJob, saveNow now: Bool = false) {
         if let i = jobs.firstIndex(where: { $0.id == job.id }) {
             jobs[i] = job
         } else {
@@ -1220,7 +1222,15 @@ final class PortalJobQueue: ObservableObject {
             }
             wanted = body.canEdit
         }
-        var j = self.job(job.id) ?? job
+        let j = setShareLink(job.id, canEdit: wanted, by: who) ?? job
+        return .dto(jobDTO(j, who))
+    }
+
+    /// Creates the job's share link if it has none (view-only unless
+    /// `canEdit`), or changes what an existing one allows. Shared by the
+    /// portal and the agent API; callers check `canShare` first.
+    func setShareLink(_ id: UUID, canEdit wanted: Bool?, by who: PortalIdentity) -> PortalJob? {
+        guard var j = self.job(id) else { return nil }
         if j.shareToken == nil {
             j.shareToken = Self.makeShareToken()
             j.sharedBy = who.email
@@ -1233,7 +1243,7 @@ final class PortalJobQueue: ObservableObject {
             update(j, saveNow: true)
             print("[Portal] Share link for job \(j.id.uuidString.prefix(8)) set to \(wanted ? "can edit" : "view only") by \(who.email).")
         }
-        return .dto(jobDTO(j, who))
+        return j
     }
 
     private func removeShareLink(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
@@ -1293,6 +1303,12 @@ final class PortalJobQueue: ObservableObject {
         // authorised by the token alone and confined to that one job.
         if request.pathComponents.first == "s" {
             return await handleShared(request)
+        }
+        // Agents: Cloudflare Access is bypassed for /api/agent/* too; an API
+        // key authorises them, confined to the jobs that key created.
+        if request.pathComponents.count >= 2, request.pathComponents[0] == "api",
+           request.pathComponents[1] == "agent" {
+            return await handleAgent(request)
         }
         guard let who = identity(for: request) else {
             return .error(403, "This portal must be reached through Cloudflare Access. The hostname is not protected by an Access policy.")
@@ -1643,7 +1659,7 @@ final class PortalJobQueue: ObservableObject {
 
     /// Refuse a job whose engine or model isn't on the Mini. "auto" always
     /// passes: it uses the Mini's current model for whichever engine it picks.
-    private func modelProblem(_ settings: PortalJobSettings) -> String? {
+    func modelProblem(_ settings: PortalJobSettings) -> String? {
         guard settings.engine != "auto" else { return nil }
         let models = downloadedModels(forceRefresh: true)[settings.engine] ?? []
         let engineName: String
@@ -1749,7 +1765,7 @@ final class PortalJobQueue: ObservableObject {
 
     // MARK: - Endpoints: job actions
 
-    private func stopJob(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
+    func stopJob(_ job: PortalJob, _ who: PortalIdentity) -> PortalHTTPResponse {
         guard canManage(job, who) else { return .error(403, "Only the person who submitted this job (or an admin) can stop it") }
         var j = job
         switch job.status {
@@ -2197,7 +2213,7 @@ final class PortalJobQueue: ObservableObject {
         return o
     }
 
-    private func exportResponse(_ job: PortalJob, _ request: PortalHTTPRequest) -> PortalHTTPResponse {
+    func exportResponse(_ job: PortalJob, _ request: PortalHTTPRequest) -> PortalHTTPResponse {
         let id = request.query["format"] ?? "docx"
         syncIfAttached(job)
         let current = self.job(job.id) ?? job

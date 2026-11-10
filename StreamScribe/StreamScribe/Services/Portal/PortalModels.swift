@@ -196,6 +196,9 @@ struct PortalJob: Codable, Identifiable {
     /// "Anyone with the link can edit" (true) or "…can view" (false). nil on
     /// links made before this setting existed — those were edit links.
     var shareCanEdit: Bool?
+    /// The agent API key that requested this job (Settings → Agent API);
+    /// nil for jobs people submitted. Agents only see their own key's jobs.
+    var agentKeyID: UUID?
 
     /// Effective permission of the share link, if there is one.
     var shareAllowsEdits: Bool { shareCanEdit ?? true }
