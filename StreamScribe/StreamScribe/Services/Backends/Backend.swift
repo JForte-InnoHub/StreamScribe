@@ -40,6 +40,17 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
+    /// The engine a session gets when nobody picked one: Canary for
+    /// recordings (2026-11-11 — more reliable than Whisper in the field),
+    /// Parakeet for live. Recordings fall back to WhisperKit on a Mac where
+    /// Canary's model isn't downloaded, so "auto" never starts a surprise
+    /// multi-GB download or fails for want of it. One rule for the Mac's
+    /// per-mode default and the web portal's Auto engine.
+    static func autoDefault(isStatic: Bool) -> TranscriptionEngineKind {
+        guard isStatic else { return .parakeet }
+        return CanaryBackend.isModelCached() ? .canary : .whisperKit
+    }
+
     /// Compact label for space-constrained UI (the sidebar's segmented
     /// picker). Segmented controls can't compress below their labels'
     /// intrinsic width — three full-length names ("Parakeet EOU

@@ -281,7 +281,11 @@ enum PortalSettingsApplier {
             default: isStatic = resolvedStatic
             }
             if let isStatic {
-                engineID = (isStatic ? TranscriptionEngineKind.whisperKit : .parakeet).rawValue
+                // A specific language is a WhisperKit-only setting; a job
+                // that asks for one keeps WhisperKit for recordings.
+                let wantsLanguage = isStatic && !["default", "auto"].contains(settings.language)
+                engineID = (wantsLanguage ? TranscriptionEngineKind.whisperKit
+                                          : TranscriptionEngineKind.autoDefault(isStatic: isStatic)).rawValue
             }
         }
         if let engineID {

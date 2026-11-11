@@ -125,8 +125,8 @@ final class TranscriptionEngine: ObservableObject {
     /// read.
     private var engineAutoChangedTranscription = false
 
-    /// Apply the per-mode engine default (Whisper static / Parakeet
-    /// live) unless the user explicitly picked an engine this launch.
+    /// Apply the per-mode engine default (Canary static, WhisperKit if
+    /// Canary isn't downloaded / Parakeet live) unless the user explicitly picked an engine this launch.
     /// FIRES AT PROBE COMPLETION (2026-07-29, user request): the
     /// original Start-time-only application meant users saw the auto
     /// choice only AFTER committing — overriding it cost cancel →
@@ -138,7 +138,7 @@ final class TranscriptionEngine: ObservableObject {
     /// application is a no-op.
     func applyPerModeEngineDefault(isStatic: Bool) {
         guard !userPinnedTranscriptionEngine, !portalEngineChoiceActive else { return }
-        let auto: TranscriptionEngineKind = isStatic ? .whisperKit : .parakeet
+        let auto = TranscriptionEngineKind.autoDefault(isStatic: isStatic)
         guard transcriptionEngine != auto else { return }
         engineAutoChangedTranscription = true
         transcriptionEngine = auto

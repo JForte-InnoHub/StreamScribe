@@ -371,7 +371,12 @@ select:disabled { opacity: .6; }
 .block .name, .pinrow .pn { color: var(--spk); }
 .spk .sw { background: var(--spk); }
 
+/* Phone/tablet only: the job's own Share button scrolls away with the
+   header row (and at once while a live job auto-follows), so the sticky top
+   bar carries one too. Desktop keeps the row pinned beside the transcript. */
+#topShare { display: none; }
 @media (max-width: 900px) {
+  #topShare:not(.hidden) { display: inline-flex; }
   .grid-home, .grid-job { grid-template-columns: minmax(0, 1fr); }
   .player { top: 52px; }
   .player video { max-height: 30vh; }
@@ -402,6 +407,7 @@ select:disabled { opacity: .6; }
   <div class="spacer"></div>
   <span class="pill" id="enginePill"><span class="dot"></span><span id="engineText">Connecting…</span></span>
   <button class="btn sm hidden" id="pauseBtn"></button>
+  <button class="btn sm hidden" id="topShare" type="button">Share</button>
   <span class="who" id="who"></span>
 </header>
 <main id="main">
@@ -694,6 +700,7 @@ function route() {
   closePopups();
   S.sel = new Set(); S.selAnchor = null; S.multi = false; S.identities = null;
   updateActionbar();
+  $("topShare").classList.add("hidden");
   if (m) {
     S.view = "job";
     S.jobId = m[1].toUpperCase();
@@ -709,6 +716,7 @@ function route() {
   }
   window.scrollTo(0, 0);
 }
+$("topShare").addEventListener("click", openShareDialog);
 if (!SHARE) {
   window.addEventListener("hashchange", route);
   $("brand").addEventListener("click", function () { location.hash = "#/"; });
@@ -735,7 +743,7 @@ function optionSelect(id, options, value) {
 }
 
 const ENGINE_HINT = {
-  auto: "WhisperKit for recordings, Parakeet for live streams.",
+  auto: "Canary for recordings, Parakeet for live streams.",
   whisperKit: "Accurate and multilingual. Best for recordings.",
   parakeet: "Fastest, English only. Best for keeping up with live streams.",
   canary: "Highest accuracy, multilingual, punctuated. Slower than Parakeet."
@@ -860,7 +868,7 @@ function modelControl() {
     const p = downloaded("parakeet").find(function (o) { return o.id === f.models.parakeet; });
     return [
       h("select", { id: "o-model", disabled: true }, h("option", { text: "Chosen with the engine" })),
-      h("div", { class: "hint", text: "Recordings: " + (w ? w.label : "WhisperKit default") + ". Live: " + (p ? p.label : "Parakeet default") + "." })
+      h("div", { class: "hint", text: "Recordings: Canary (" + (w ? w.label : "WhisperKit") + " if a language is chosen or Canary isn't downloaded). Live: " + (p ? p.label : "Parakeet default") + "." })
     ];
   }
   const list = downloaded(f.engine);
@@ -1442,6 +1450,9 @@ function nameFor(label) {
 function renderJobHead() {
   const j = S.job;
   if (!j) return;
+  const ts = $("topShare");
+  ts.classList.toggle("hidden", !!SHARE);
+  ts.textContent = j.shared ? "Shared" : "Share";
   $("jobTitle").textContent = j.title || j.source;
   document.title = (j.title || "Transcript") + " · StreamScribe";
   const meta = $("jobMeta");
