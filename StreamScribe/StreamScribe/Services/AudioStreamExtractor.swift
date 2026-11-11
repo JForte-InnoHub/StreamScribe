@@ -2434,6 +2434,22 @@ actor AudioStreamExtractor {
             "--paths", "temp:\(fragmentScratchDir)",
         ])
 
+        // LIVE HLS THE EXTRACTOR DOESN'T FLAG AS LIVE (field log 2026-11-11,
+        // play.zype.com → an Amagi linear channel). yt-dlp's Zype extractor
+        // returns is_live=NA, so yt-dlp picked its native HLS downloader,
+        // which reads the playlist ONCE: "[hlsnative] Total fragments: 10",
+        // 60 s of audio, exit 0 — and the live session ended after a minute.
+        // When yt-dlp KNOWS a stream is live it hands HLS to ffmpeg, which
+        // keeps re-reading the playlist; force that for every live session
+        // so it no longer depends on the extractor's flag. Reproduced both
+        // ways with these same options: native stopped at 60.06 s, ffmpeg
+        // was still delivering when stopped at 100 s. YouTube is left alone:
+        // its live paths (DASH from-start, flagged HLS) already work and
+        // have their own tuning. No effect on non-HLS formats.
+        if !isStaticSession && source != .youtube {
+            args.append(contentsOf: ["--downloader", "m3u8:ffmpeg"])
+        }
+
         // `--http-chunk-size 10M` USED TO BE UNCONDITIONAL HERE, and it is
         // what broke `--live-from-start` (2026-09-29). It makes yt-dlp issue
         // 10 MB HTTP Range requests, and a TLS-intercepting proxy buffers
