@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import CryptoKit
 
 // MARK: - StreamScribe Web Portal — API keys for agents
