@@ -267,7 +267,7 @@ enum PortalSettingsApplier {
             change(sessionModeKey, to: settings.mode)
         }
 
-        // Engine. "auto" mirrors the Mac's per-mode default (Whisper for
+        // Engine. "auto" mirrors the Mac's per-mode default (Canary for
         // recordings, Parakeet for live) but is applied EXPLICITLY, so it holds
         // even when someone has pinned an engine on the Mac this launch.
         var engineID: String? = nil
@@ -281,10 +281,15 @@ enum PortalSettingsApplier {
             default: isStatic = resolvedStatic
             }
             if let isStatic {
-                // A specific language is a WhisperKit-only setting; a job
-                // that asks for one keeps WhisperKit for recordings.
-                let wantsLanguage = isStatic && !["default", "auto"].contains(settings.language)
-                engineID = (wantsLanguage ? TranscriptionEngineKind.whisperKit
+                // Canary for recordings. The one exception is a job that
+                // asks for a NON-English language, which only WhisperKit
+                // honours. English must not count: the page always sends
+                // the Mac's current language (usually "en"), and treating
+                // that as "a language was chosen" kept every Auto job on
+                // WhisperKit (2026-11-12).
+                let wantsOtherLanguage = isStatic
+                    && !["default", "auto", "en"].contains(settings.language.lowercased())
+                engineID = (wantsOtherLanguage ? TranscriptionEngineKind.whisperKit
                                           : TranscriptionEngineKind.autoDefault(isStatic: isStatic)).rawValue
             }
         }

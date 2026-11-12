@@ -854,7 +854,7 @@ function modelControl() {
     const p = downloaded("parakeet").find(function (o) { return o.id === f.models.parakeet; });
     return [
       h("select", { id: "o-model", disabled: true }, h("option", { text: "Chosen with the engine" })),
-      h("div", { class: "hint", text: "Recordings: Canary (" + (w ? w.label : "WhisperKit") + " if a language is chosen or Canary isn't downloaded). Live: " + (p ? p.label : "Parakeet default") + "." })
+      h("div", { class: "hint", text: "Recordings: Canary. Live: " + (p ? p.label : "Parakeet default") + ". (A non-English language uses " + (w ? w.label : "WhisperKit") + ".)" })
     ];
   }
   const list = downloaded(f.engine);
